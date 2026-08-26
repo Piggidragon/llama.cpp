@@ -364,7 +364,28 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // A host-resident KV cache reaches attention as a scheduler copy, named
+    // "<backend>#cache_k_l0 (view) (permuted)#0". Undecorate that back to the cache name.
+    // Only a cache name is undecorated, so every other copy keeps the mirrored fallback.
+    const std::string tensor_name = [&]() {
+        const std::string raw = tensor->name;
+        std::string name = raw;
+        const size_t first = name.find('#');
+        const size_t last  = name.rfind('#');
+        if (first == std::string::npos || last <= first) {
+            return raw;
+        }
+        name = name.substr(first + 1, last - first - 1);
+        while (!name.empty() && name.back() == ')') {
+            const size_t paren = name.rfind(" (");
+            if (paren == std::string::npos) {
+                break;
+            }
+            name.erase(paren);
+        }
+        static const std::regex pattern_cache_copy("cache_(k|v)_l\\d+");
+        return std::regex_match(name, pattern_cache_copy) ? name : raw;
+    }();
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -461,6 +482,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // the recorded axis describes the cache tensor, which folds the heads into its first dimension.
+    // A host-resident cache reaches attention permuted, as [head_dim, n_kv, n_head_kv, n_stream],
+    // where the heads are an axis of their own, so the axis and the granularity have to follow.
+    const bool kv_cache_head_axis = [&]() {
+        if (is_dsv4 || !std::regex_match(tensor_name, pattern_kv_cache)) {
+            return false;
+        }
+        const size_t layer_index_start = tensor_name.find("_l", 6);
+        if (layer_index_start == std::string::npos) {
+            return false;
+        }
+        const uint32_t il       = std::stoul(tensor_name.substr(layer_index_start + 2));
+        const int64_t  head_dim = tensor_name[6] == 'k' ? hparams.n_embd_head_k(il) : hparams.n_embd_head_v(il);
+        return hparams.n_head_kv(il) > 1 && tensor->ne[0] == head_dim && tensor->ne[2] == (int64_t) hparams.n_head_kv(il);
+    }();
+
     auto get_tensor_config = [&]() -> tensor_config {
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
@@ -505,7 +542,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            return get_tensor_config_impl(
+                    kv_cache_head_axis ? GGML_BACKEND_SPLIT_AXIS_2 : GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -732,6 +770,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            if (kv_cache_head_axis) {
+                // on the head axis the unit is a whole KV head, and granularity_kv is a multiple
+                // of the query head size by construction
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_kv / hparams.n_embd_head_k(il)};
+            }
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
