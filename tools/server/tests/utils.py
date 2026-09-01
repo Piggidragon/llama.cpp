@@ -123,6 +123,7 @@ class ServerProcess:
     cache_disk: str | None = None
     cache_disk_size: int | None = None
     cache_block_size: int | None = None
+    cache_reuse: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -307,6 +308,8 @@ class ServerProcess:
             server_args.extend(["--cache-disk-size", self.cache_disk_size])
         if self.cache_block_size is not None:
             server_args.extend(["--cache-block-size", self.cache_block_size])
+        if self.cache_reuse is not None:
+            server_args.extend(["--cache-reuse", self.cache_reuse])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
