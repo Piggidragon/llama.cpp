@@ -378,9 +378,11 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
-// with offload_kqv=false the cache lives in host memory
+// with offload_kqv=false the cache lives in host memory; attn_split gives the heads a share of
+// their own
 struct kv_config {
-    bool offload_kqv = true;
+    bool               offload_kqv = true;
+    std::vector<float> attn_split;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -393,6 +395,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    std::vector<float> attn_split = kvc.attn_split;
+    if (!attn_split.empty()) {
+        attn_split.resize(llama_max_devices(), 0.0f);
+        model_params.attn_split = attn_split.data();
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1312,6 +1319,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         kv_config kvc_host;
         kvc_host.offload_kqv = false;
         dev_configs.emplace_back(devices_meta, "Meta -nkvo", LLAMA_SPLIT_MODE_TENSOR, kvc_host);
+
+        // the same, with all attention heads on the first device
+        if (devices_meta.size() > 1) {
+            kv_config kvc_attn;
+            kvc_attn.offload_kqv = false;
+            kvc_attn.attn_split.assign(devices_meta.size(), 0.0f);
+            kvc_attn.attn_split[0] = 1.0f;
+            dev_configs.emplace_back(devices_meta, "Meta -nkvo -as", LLAMA_SPLIT_MODE_TENSOR, kvc_attn);
+        }
 
         for (const device_config & dc : dev_configs) {
             max_device_label_length = std::max(max_device_label_length, dc.label.length());
