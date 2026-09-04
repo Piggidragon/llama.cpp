@@ -2368,16 +2368,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // budget instead of giving each of them the full count. An offloaded cache is device-resident
     // already, so it needs no set and must not pay for measuring the links.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-        placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
+        placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
                 params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
-        if (placement.gpu_resident_ils.empty()) {
-            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
-        } else {
-            LLAMA_LOG_INFO("%s: partial GPU KV residency: %zu of %u requested attention layers device-resident\n",
-                    __func__, placement.gpu_resident_ils.size(), cparams.kv_gpu_layers);
-        }
-        // the attention compute follows the cache, so report back what the cache got
-        cparams.kv_gpu_layers = (uint32_t) placement.gpu_resident_ils.size();
+        placement.gpu_resident_done = std::make_shared<std::set<uint32_t>>();
     }
 
     switch (arch) {
@@ -2832,6 +2825,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // Report what the caches did rather than what was picked: a cache filter can drop a picked
+    // layer, and a model without a standard attention cache keeps none. The attention compute
+    // follows the cache, so cparams must carry the count the caches reached.
+    if (placement.gpu_resident_done) {
+        const uint32_t n_resident = (uint32_t) placement.gpu_resident_done->size();
+        if (n_resident == 0) {
+            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested attention layers device-resident\n",
+                    __func__, n_resident, cparams.kv_gpu_layers);
+        }
+        cparams.kv_gpu_layers = n_resident;
     }
 
     return res;
