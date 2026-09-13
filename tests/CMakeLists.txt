@@ -221,6 +221,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-meta-alloc-failure
     )
 
+    llama_test(
+        test-llama-archs
+        NAME test-tied-output-split
+        LABEL main
+        ARGS --test-tied-output-split
+    )
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
