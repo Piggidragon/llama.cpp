@@ -105,6 +105,9 @@ extern "C" {
     // the alias must be freed before the source buffer
     GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_alias(ggml_backend_buffer_t buffer);
 
+    // a meta backend without a communicator, for moving data on streams of its own: a graph it computes reduces through copies
+    GGML_API ggml_backend_t ggml_backend_meta_init_transfer(ggml_backend_dev_t meta_dev);
+
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 
