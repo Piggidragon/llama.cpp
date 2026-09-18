@@ -478,6 +478,9 @@ struct ggml_backend_meta_buffer_context {
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
     std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
 
+    // bumped on every clear of the cache, so a caller can tell that the entries it filled are gone
+    uint64_t split_state_cache_generation = 0;
+
     // an alias shares the simple buffers of another meta buffer and does not free them
     bool owns_bufs = true;
 
@@ -1186,6 +1189,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
         buf_ctx->split_state_cache.clear();
+        buf_ctx->split_state_cache_generation++;
         it = buf_ctx->split_state_cache.end();
     }
 
@@ -1243,9 +1247,80 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     return ret;
 }
 
+// A stale entry makes ggml_backend_meta_get_split_state clear the whole cache. Clear it here
+// instead, before the walk below fills entries that the clear would drop again.
+static bool ggml_backend_meta_split_state_cached(
+        ggml_backend_meta_buffer_context * buf_ctx, const ggml_tensor * tensor, bool assume_sync) {
+    const auto it = buf_ctx->split_state_cache.find(std::make_pair(tensor, assume_sync));
+    if (it == buf_ctx->split_state_cache.end()) {
+        return false;
+    }
+    if (memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
+        buf_ctx->split_state_cache.clear();
+        buf_ctx->split_state_cache_generation++;
+        return false;
+    }
+    return true;
+}
+
+// ggml_backend_meta_get_split_state reads the state of the sources of a tensor, so on a cold cache it
+// walks the whole graph in one recursion and needs one large stack frame per node. Fill the sources
+// from the leaves up first, iteratively, so that the recursion finds them and stays one level deep.
+// The walk reaches what the recursion reaches: a leaf holds its own state and has no sources.
+static void ggml_backend_meta_warm_split_states(
+        ggml_backend_meta_simple_tensor_container & stc, const ggml_tensor * tensor, bool assume_sync) {
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+
+    // a clear drops what the walk filled, but it leaves the cache empty, so a second walk cannot hit one
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const uint64_t generation = buf_ctx->split_state_cache_generation;
+        if (ggml_backend_meta_split_state_cached(buf_ctx, tensor, assume_sync)) {
+            return; // the caller reads the cache and never recurses
+        }
+
+        std::vector<std::pair<const ggml_tensor *, bool>> stack; // tensor, sources already pushed
+        std::set<const ggml_tensor *> pushed;
+        stack.emplace_back(tensor, false);
+        pushed.insert(tensor);
+
+        while (!stack.empty()) {
+            const ggml_tensor * node = stack.back().first;
+            if (!stack.back().second) {
+                stack.back().second = true;
+                if (ggml_nelements(node) == 0) {
+                    continue; // the state does not come from the sources
+                }
+                for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                    const ggml_tensor * src = node->src[i];
+                    if (src == nullptr || src == node || pushed.count(src) > 0) {
+                        continue;
+                    }
+                    // a cached source covers its own sources as well
+                    if (ggml_backend_meta_split_state_cached(buf_ctx, src, /*assume_sync =*/ true)) {
+                        continue;
+                    }
+                    pushed.insert(src);
+                    stack.emplace_back(src, false);
+                }
+                continue;
+            }
+            stack.pop_back();
+            if (node != tensor) {
+                ggml_backend_meta_get_split_state(stc, node, /*assume_sync =*/ true);
+            }
+        }
+
+        if (buf_ctx->split_state_cache_generation == generation) {
+            return;
+        }
+    }
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
-    return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+    ggml_backend_meta_warm_split_states(stc, tensor, assume_sync);
+    return ggml_backend_meta_get_split_state(stc, tensor, assume_sync);
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1290,6 +1365,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
+    ggml_backend_meta_warm_split_states(stc, tensor, /*assume_sync =*/ true);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
