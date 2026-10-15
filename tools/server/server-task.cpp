@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-cache-disk.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1691,6 +1692,13 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+}
+
+server_prompt_cache::~server_prompt_cache() = default;
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1730,11 +1738,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
+    // skip over-limit entries to avoid disturbing the cache, or send them to the disk level
+    const bool over_limit = limit_size > 0 && state_size_new > limit_size;
+    if (over_limit) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, %s\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), disk ? "writing it to disk" : "skipping");
+        if (!disk) {
+            return nullptr;
+        }
     }
 
     // remove any cached prompts that are fully contained in the current prompt
@@ -1750,13 +1761,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    if (limit_size > 0) {
+    if (limit_size > 0 && !over_limit) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_oldest();
         }
     }
 
@@ -1779,7 +1790,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    states.push_back({
+    server_prompt_cache_state state = {
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
@@ -1788,53 +1799,47 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-    });
+    };
+
+    if (over_limit) {
+        // as the oldest entry, the next update() hands it to the disk level without touching the others
+        states.push_front(std::move(state));
+
+        return &states.front();
+    }
+
+    states.push_back(std::move(state));
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+// restore a cached state into the sequence of a slot, the prompt takes its tokens and checkpoints
+static bool prompt_cache_restore(server_prompt_cache_state & state, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    {
+        auto & data = state.data.main;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
+            return false;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-
-            it_best = it;
-        }
+        data.clear();
+        data.shrink_to_fit();
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    {
+        auto & data = state.data.drft;
 
-        {
-            auto & data = it_best->data.main;
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
             }
@@ -1842,27 +1847,89 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             data.clear();
             data.shrink_to_fit();
         }
+    }
 
-        {
-            auto & data = it_best->data.drft;
+    prompt = std::move(state.prompt);
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+    return true;
+}
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+// a cached prompt is used only if the new prompt keeps at least 1/4 of it (don't trash large prompts)
+static bool prompt_cache_keeps(size_t lcp, size_t n_tokens) {
+    return float(lcp) / n_tokens >= 0.25f;
+}
+
+size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max) const {
+    size_t lcp_best = 0;
+
+    for (const auto & state : states) {
+        const size_t lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
+
+        if (prompt_cache_keeps(lcp_cur, state.prompt.tokens.size())) {
+            lcp_best = std::max(lcp_best, lcp_cur);
+        }
+    }
+
+    if (disk) {
+        disk->find(tokens_new, n_tokens_max, lcp_best);
+    }
+
+    return lcp_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    size_t lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+
+    SRV_TRC(" - looking for better prompt, base lcp = %zu, f_sim = %.3f\n", lcp_best, float(lcp_best) / tokens_new.size());
+
+    auto it_best = states.end();
+
+    // find the cached prompt that shares the longest prefix with the new prompt
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur,
+                float(lcp_cur) / it->prompt.tokens.size(), float(lcp_cur) / tokens_new.size());
+
+        if (!prompt_cache_keeps(lcp_cur, it->prompt.tokens.size())) {
+            continue;
+        }
+
+        if (lcp_cur > lcp_best) {
+            lcp_best = lcp_cur;
+            it_best  = it;
+        }
+    }
+
+    // a prompt on disk is used only if it shares a longer prefix than the best one in RAM
+    if (disk) {
+        const int64_t id = disk->find(tokens_new, llama_n_ctx_seq(ctx_tgt), lcp_best);
+
+        if (id >= 0) {
+            SRV_TRC(" - found better prompt on disk with lcp = %zu\n", lcp_best);
+
+            server_prompt_cache_state state;
+
+            if (disk->fetch(id, state)) {
+                if (!prompt_cache_restore(state, prompt, ctx_tgt, ctx_dft, id_slot)) {
+                    disk->remove(id);
 
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                return true;
             }
-        }
 
-        prompt = std::move(it_best->prompt);
+            // the file could not be read, fall back to the best prompt in RAM
+        }
+    }
+
+    if (it_best != states.end()) {
+        SRV_TRC(" - found better prompt with lcp = %zu\n", it_best->prompt.tokens.get_common_prefix(tokens_new));
+
+        if (!prompt_cache_restore(*it_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
+            return false;
+        }
 
         states.erase(it_best);
     }
@@ -1870,12 +1937,36 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+void server_prompt_cache::evict_oldest() {
+    GGML_ASSERT(!states.empty());
+
+    if (disk) {
+        disk->put(std::move(states.front()));
+    }
+
+    states.pop_front();
+}
+
+void server_prompt_cache::flush_to_disk() {
+    if (!disk) {
+        return;
+    }
+
+    // newest first, and one at a time so that put() does not drop states waiting to be written
+    while (!states.empty()) {
+        disk->put(std::move(states.back()));
+        states.pop_back();
+
+        disk->flush();
+    }
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_oldest();
         }
     }
 
@@ -1890,7 +1981,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_oldest();
         }
     }
 

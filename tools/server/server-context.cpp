@@ -4,6 +4,7 @@
 #include "server-decision.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-cache-disk.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -327,6 +328,29 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        return true;
+    }
+
+    // copy the prompt and its state in the form the prompt cache stores
+    bool prompt_copy(server_prompt_cache_state & out) const {
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        try {
+            out.data.main.resize(size_tgt);
+            out.data.drft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_WRN(*this, "failed to allocate memory for prompt state: %s\n", e.what());
+            return false;
+        }
+
+        llama_state_seq_get_data_ext(ctx_tgt, out.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        out.prompt = prompt.clone();
 
         return true;
     }
@@ -1060,6 +1084,42 @@ private:
         mctx = nullptr;
     }
 
+    // write the idle slots and the RAM level of the prompt cache to the disk level, before the context is freed
+    void prompt_cache_persist() {
+        if (!prompt_cache || !prompt_cache->disk || ctx_tgt == nullptr) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // the slots hold the newest prompts, most recently used first
+        std::vector<server_slot *> order;
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && !slot.prompt.tokens.empty()) {
+                order.push_back(&slot);
+            }
+        }
+        std::sort(order.begin(), order.end(), [](const server_slot * a, const server_slot * b) {
+            return a->t_last_used > b->t_last_used;
+        });
+
+        for (auto * slot : order) {
+            if (prompt_cache->disk->contains(slot->prompt.tokens)) {
+                continue;
+            }
+
+            server_prompt_cache_state state;
+            if (slot->prompt_copy(state)) {
+                prompt_cache->disk->put(std::move(state));
+                prompt_cache->disk->flush();
+            }
+        }
+
+        prompt_cache->flush_to_disk();
+
+        SRV_INF("prompt cache written to disk in %.2f s\n", (ggml_time_us() - t_start) / 1e6);
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1068,6 +1128,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            prompt_cache_persist();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1498,7 +1559,41 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (!params_base.cache_disk_path.empty()) {
+                // states are only valid for the same model files
+                std::vector<std::string> files = { params_base.model.path };
+                if (mctx) {
+                    files.push_back(params_base.mmproj.path);
+                }
+                if (params_base.speculative.has_dft()) {
+                    files.push_back(params_base.speculative.draft.mparams.path);
+                }
+
+                std::string config = common_speculative_type_name_str(params_base.speculative.types) + (ctx_dft ? " +dft" : "");
+                for (const auto & la : params_base.lora_adapters) {
+                    files.push_back(la.path);
+                    config += string_format(" lora %g", la.scale);
+                }
+
+                const uint64_t fingerprint = server_prompt_cache_disk::compute_fingerprint(files, config);
+
+                if (fingerprint == 0) {
+                    SRV_WRN("%s", "disk prompt cache disabled: cannot fingerprint the model files\n");
+                } else {
+                    const size_t limit_disk = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*params_base.cache_disk_mib;
+
+                    // states waiting to be written may hold up to half of the RAM limit on top of it
+                    const size_t limit_pending = prompt_cache->limit_size / 2;
+
+                    prompt_cache->disk = std::make_unique<server_prompt_cache_disk>(
+                            params_base.cache_disk_path, limit_disk, limit_pending, fingerprint, mctx != nullptr);
+                }
+            }
         } else {
+            if (!params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-disk requires --cache-ram, disabling it\n");
+            }
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
@@ -1751,6 +1846,17 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                } else if (prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+                    // the slot keeps most of its prompt, but a cached prompt may share a much longer prefix with the task
+                    // (e.g. the slot holds another conversation with the same system prompt)
+                    const size_t lcp_slot  = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    const size_t lcp_cache = prompt_cache->n_lcp_best(task.tokens, llama_n_ctx_seq(ctx_tgt));
+
+                    if (lcp_cache >= lcp_slot + n_lcp_cache_min) {
+                        SLT_INF(*ret, "prompt cache shares a longer prefix with the task (%zu > %zu tokens)\n", lcp_cache, lcp_slot);
+
+                        update_cache = true;
+                    }
                 }
             }
         }
@@ -1773,7 +1879,14 @@ private:
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                // longest common prefix with any slot, tells a new prompt from a changed one
+                size_t lcp_max = 0;
+                for (const server_slot & slot : slots) {
+                    lcp_max = std::max(lcp_max, slot.prompt.tokens.get_common_prefix(task.tokens));
+                }
+
+                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 ", longest common prefix with a slot = %zu of %zu tokens\n",
+                        t_last, lcp_max, task.tokens.size());
 
                 update_cache = true;
             }
@@ -1804,6 +1917,9 @@ private:
 
         return ret;
     }
+
+    // gain in tokens for which a slot swaps its prompt for a cached one with a longer common prefix
+    static constexpr size_t n_lcp_cache_min = 256;
 
     // return true if at least one slot has been cleared
     // TODO: improve logic
@@ -3782,6 +3898,12 @@ private:
                                     }
 
                                     if (do_reset) {
+                                        // a warning only when a real part of the prompt is lost, not for a new prompt
+                                        const int64_t n_ckpt_first = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.front().n_tokens;
+                                        if (n_past >= 256) {
+                                            SLT_WRN(slot, "forcing full prompt re-processing: no context checkpoint before the common prefix (n_past = %d, %zu checkpoints, first at n_tokens = %" PRId64 ")\n",
+                                                    n_past, slot.prompt.checkpoints.size(), n_ckpt_first);
+                                        }
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -4689,6 +4811,10 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    if (!impl->sleeping) {
+        impl->prompt_cache_persist();
+    }
 }
 
 void server_context::terminate() {
