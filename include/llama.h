@@ -955,6 +955,38 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Ranges of a sequence state, to store a growing sequence piece by piece.
+    // A range holds the KV cells of a position range that can be rolled back: the ones that
+    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY skips. A sequence is restored from its ranges in position order
+    // (the first replaces the cells of the sequence, the next ones append) and then from its partial state
+    // (llama_state_seq_set_data_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY).
+
+    // false if the memory of the context cannot write ranges
+    LLAMA_API bool llama_state_seq_range_supported(const struct llama_context * ctx);
+
+    // the cells of seq_id with a position in [p0, p1), p1 < 0 for no upper bound
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
+    // append = false replaces the cells of dest_seq_id, append = true adds the cells after its last position
+    LLAMA_API size_t llama_state_seq_set_data_range(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                            bool   append);
+
     //
     // Decoding
     //

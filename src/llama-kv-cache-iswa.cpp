@@ -264,6 +264,17 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_swa ->state_read(io, seq_id, flags);
 }
 
+// the SWA cache is part of the partial state, its ranges are empty
+void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    kv_base->state_write_range(io, seq_id, p0, p1);
+    kv_swa ->state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_kv_cache_iswa::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, bool append) {
+    kv_base->state_read_range(io, seq_id, append);
+    kv_swa ->state_read_range(io, seq_id, append);
+}
+
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
     return kv_base.get();
 }

@@ -72,6 +72,9 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // the indexer cache mirrors the attention cells, which a range restore does not keep: no ranges
+    bool state_range_supported() const override { return false; }
+
     //
     // llama_memory_hybrid_idx specific API
     //

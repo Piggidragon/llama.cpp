@@ -307,53 +307,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
-            return false;
-        }
-
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
-    }
-
-    // copy the prompt and its state in the form the prompt cache stores
-    bool prompt_copy(server_prompt_cache_state & out) const {
-        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        try {
-            out.data.main.resize(size_tgt);
-            out.data.drft.resize(size_dft);
-        } catch (const std::bad_alloc & e) {
-            SLT_WRN(*this, "failed to allocate memory for prompt state: %s\n", e.what());
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, out.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        out.prompt.tokens      = prompt.tokens.clone();
-        out.prompt.checkpoints = server_prompt_cache::newest_checkpoints(prompt.checkpoints);
-
-        return true;
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1106,6 +1060,13 @@ private:
                 params_base.yarn_ext_factor, params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow,
                 params_base.yarn_orig_ctx);
 
+        // the layout of the stored state: KV streams, V transposition (flash attention), SWA cache size and
+        // Hadamard rotation of quantized K/V (the block size is part of the block keys instead)
+        const char * rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+        config += string_format(" seq %u unified %d fa %s swa-full %d rot-disable %s state-version %d %d",
+                llama_n_seq_max(ctx_tgt), params_base.kv_unified ? 1 : 0, llama_flash_attn_type_name(params_base.flash_attn_type),
+                params_base.swa_full ? 1 : 0, rot_disable ? rot_disable : "", LLAMA_STATE_SEQ_VERSION, LLAMA_SESSION_VERSION);
+
         for (const auto & la : params_base.lora_adapters) {
             files.push_back(la.path);
             config += string_format(" lora %g", la.scale);
@@ -1162,8 +1123,8 @@ private:
             }
 
             server_prompt_cache_state state;
-            if (slot->prompt_copy(state)) {
-                prompt_cache->disk->put(std::move(state), t_used, false);
+            if (prompt_cache->copy_state(slot->prompt, ctx_tgt, ctx_dft, slot->id, state)) {
+                prompt_cache->disk->put(std::move(state).at_checkpoint(), t_used, false);
 
                 // one copy in memory at a time
                 if (wait) {
@@ -1628,6 +1589,22 @@ private:
             std::unique_ptr<server_prompt_cache_disk> disk_prev = prompt_cache ? std::move(prompt_cache->disk) : nullptr;
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->n_block = params_base.cache_block_size;
+
+            prompt_cache->kv_unified = params_base.kv_unified;
+
+            // see the checkpoint rule in update_slots()
+            prompt_cache->needs_checkpoints =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                n_swa > 0;
+
+            // the transposed V cache of a context without flash attention is copied row by row per range,
+            // which takes many small transfers per block on a GPU: such a context stores whole states
+            if (params_base.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED && prompt_cache->n_block > 0) {
+                SRV_INF("%s", "prompt cache stores whole states: flash attention is disabled\n");
+                prompt_cache->n_block = 0;
+            }
 
             if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
                 SRV_INF("%s", "disk prompt cache disabled by --cache-disk-size 0\n");
@@ -1639,12 +1616,15 @@ private:
                 } else if (disk_prev && disk_prev->get_fingerprint() == fingerprint && disk_prev->get_dir() == params_base.cache_disk_path) {
                     prompt_cache->disk = std::move(disk_prev);
                 } else {
+                    // write what the previous one holds and release its lock first
+                    disk_prev.reset();
+
                     const size_t limit_disk = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*params_base.cache_disk_mib;
 
                     // states waiting to be written may hold up to half of the RAM limit on top of it
                     const size_t limit_pending = prompt_cache->limit_size / 2;
 
-                    prompt_cache->disk = std::make_unique<server_prompt_cache_disk>(
+                    prompt_cache->disk = server_prompt_cache_disk::create(
                             params_base.cache_disk_path, limit_disk, limit_pending, fingerprint, mctx != nullptr);
                 }
             }

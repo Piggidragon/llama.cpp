@@ -582,6 +582,65 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// a sequence restored from two state ranges (replace, then append) and its partial state continues like the original
+// returns false on a mismatch, status stays unchanged if the memory does not support ranges
+static bool check_state_ranges(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, std::string & status) {
+    llama_memory_t mem = llama_get_memory(lctx);
+    if (mem == nullptr || !llama_state_seq_range_supported(lctx)) {
+        return true;
+    }
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n       = tokens.size();
+
+    // the last tokens are decoded after the restore (16, as a single token batch trips the tensor split of some archs)
+    const uint32_t n_saved = n - 16;
+
+    const llama_pos p_split = n_saved/3;
+
+    auto decode = [&](uint32_t i0, uint32_t i1) {
+        common_batch batch(lctx);
+        for (uint32_t pos = i0; pos < i1; pos++) {
+            batch.add(tokens[pos], pos, 0, pos == i1 - 1);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode batch");
+        }
+        const float * logits = llama_get_logits_ith(lctx, -1);
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+
+    auto get_range = [&](llama_pos p0, llama_pos p1) {
+        std::vector<uint8_t> buf(llama_state_seq_get_size_range(lctx, 0, p0, p1));
+        GGML_ASSERT(llama_state_seq_get_data_range(lctx, buf.data(), buf.size(), 0, p0, p1) == buf.size());
+        return buf;
+    };
+
+    llama_memory_clear(mem, true);
+    decode(0, n_saved);
+
+    const std::vector<uint8_t> range0 = get_range(0, p_split);
+    const std::vector<uint8_t> range1 = get_range(p_split, -1);
+
+    std::vector<uint8_t> partial(llama_state_seq_get_size_ext(lctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    GGML_ASSERT(llama_state_seq_get_data_ext(lctx, partial.data(), partial.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == partial.size());
+
+    const std::vector<float> logits_ref = decode(n_saved, n);
+
+    llama_memory_seq_rm(mem, 0, -1, -1);
+
+    bool ok =
+        llama_state_seq_set_data_range(lctx, range0.data(),  range0.size(),  0, false) == range0.size() &&
+        llama_state_seq_set_data_range(lctx, range1.data(),  range1.size(),  0, true)  == range1.size() &&
+        llama_state_seq_set_data_ext  (lctx, partial.data(), partial.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == partial.size();
+
+    ok = ok && decode(n_saved, n) == logits_ref;
+
+    status = ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m";
+
+    return ok;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -955,15 +1014,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|%12s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|%23s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch", "State range");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -972,7 +1031,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|---------------|\n");
+    LOG("|------|---------------|---------|---------------|------------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1017,6 +1076,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
+                std::string status_range     = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
@@ -1075,6 +1135,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                         }
 
+                        if (!encode && !check_state_ranges(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, status_range)) {
+                            test_ok = false;
+                        }
+
                         // runs after the mixed batch check, as it leaves the context with non-causal attention
                         if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
@@ -1120,7 +1184,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str, status_range.c_str());
             }
         }
     }

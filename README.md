@@ -1,3 +1,58 @@
+# What this fork adds
+
+Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the two features below. The rest of this file is the upstream README.
+
+## Quantized-native CUDA FlashAttention
+
+The CUDA MMA FlashAttention kernel reads a quantized K/V cache in place, instead of casting the visible attention window to F16 first.
+
+- It is opt-in with `--flash-attn-native-quants` (`-fanq 1` in `llama-bench`). Without the flag everything runs as upstream.
+- Cache types: `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0`, the same type for K and V. Head sizes 64, 128, 256 and 512, at every query batch size, on Turing (`sm_75`) and newer.
+- Decode and the small batches of speculative decoding take tiles of 8 Q heads, so each K/V row is read once per KV head instead of once per Q head.
+- It is faster at long context. Qwen3.8-27B at 16k context:
+  - token generation +6-11% on an RTX 3060 or 4070;
+  - 2-token speculative steps +14-31%.
+
+  On both GPUs at 64k context the gain is up to +39%. On D=128 models, 4-token batches run up to twice as fast.
+- The F16 copy of the window no longer takes compute buffer: 1.6 GiB less for Qwen3.8-27B at 262k context.
+- `q4_0` and `q8_0` are always compiled. `q4_1`, `q5_0` and `q5_1` are compiled with their pair in `GGML_CUDA_FA_QUANTS` (for example `-DGGML_CUDA_FA_QUANTS="q5_1-q5_1"`) or with `all`.
+- Results differ from the F16 path in rounding only.
+
+Details, validation and all measurements: [docs/quantized-native-flash-attention.md](docs/quantized-native-flash-attention.md).
+
+## Prompt cache hierarchy: slots, RAM, disk
+
+`--cache-disk PATH` adds a disk level below the RAM prompt cache (`--cache-ram`).
+
+- Prompts that RAM evicts are written to disk in the background, and are loaded back when a later request shares their prefix.
+- On exit and before sleeping, the server also writes its slots and RAM entries. Conversations survive restarts and model swaps.
+
+How prompts are stored:
+
+- A prompt is stored as KV blocks of `--cache-block-size` tokens (default 2048), keyed by a hash of their prefix.
+- Prompts that share a prefix share its blocks, in RAM and on disk.
+- A growing conversation writes only its new blocks. In one 25k-token conversation with Qwen3.8-27B, the next turn wrote 0.16 GB instead of 2.3 GB.
+
+The new libllama functions `llama_state_seq_get_data_range()` and `llama_state_seq_set_data_range()` provide the blocks. All model types are supported:
+
+- Attention, sliding-window, recurrent and hybrid models work.
+- Models that roll back only to context checkpoints (hybrid, recurrent, sliding-window) are stored at their newest checkpoint.
+- Caches without state ranges store whole states.
+
+Size limit and sharing:
+
+- `--cache-disk-size` caps the directory (default 32 GiB). The least recently used prompt is removed first, and 5% of the file system always stays free.
+- File names carry a fingerprint of the model files and the KV settings, so several models can share one directory.
+
+Two more server changes come with the disk level:
+
+- Slot selection: if a cached prompt shares at least 256 more tokens with a request than the most similar slot does, the server restores the cached prompt instead of processing those tokens again. One case is a slot that holds another conversation with the same system prompt.
+- SIGINT and SIGTERM are handled on their own thread. A sleeping server now stops cleanly and writes its cache.
+
+Details: [tools/server/README.md](tools/server/README.md#prompt-cache-on-disk).
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
