@@ -636,3 +636,128 @@ def test_hybrid_head_not_read_for_earlier_divergence():
     content = log.drain()
     assert "disk prompt cache: read prompt" not in content
     assert "no context checkpoint before the common prefix" not in content
+
+
+def test_running_server_keeps_its_blocks():
+    # the blocks of another fingerprint whose server runs are never removed: it may list them in a prompt it
+    # writes later, here the conversation in its slot that shares the system prompt with its head on disk
+    global server
+
+    def other_server():
+        srv = make_server()
+        srv.cache_block_size = 32
+        srv.n_ctx = 2048
+        srv.ctk = "f32"
+        srv.server_port = server.server_port + 1
+        return srv
+
+    system = tokens_of(0, 256)
+
+    b = other_server()
+    b.start()
+    res = b.make_request("POST", "/completion", data={"prompt": system + tokens_of(1, 64), "cache_prompt": True})
+    assert res.status_code == 200
+    b.stop()
+    other_blocks = set(block_files())
+
+    b = other_server()
+    b.start()
+    c2 = system + tokens_of(2, 64)
+    res = b.make_request("POST", "/completion", data={"prompt": c2, "cache_prompt": True})
+    assert res.status_code == 200
+
+    # this server needs room while the other one runs
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.cache_disk_size = 1
+    server.start()
+    complete_tokens(tokens_of(3, 1200))
+    server.stop()
+    assert other_blocks <= set(block_files())
+
+    # the other server writes C2 on exit, its next run continues it
+    b.stop()
+    b = other_server()
+    b.start()
+    log = LogReader(b.log_path)
+    res = b.make_request("POST", "/completion", data={"prompt": c2 + tokens_of(4, 20), "cache_prompt": True})
+    b.stop()
+    assert "is missing" not in log.drain()
+    assert res.body["timings"]["cache_n"] > 300
+
+
+def test_same_fingerprint_server_refused():
+    # a second server with the same model and settings would remove the files of the first one
+    global server
+    server.start()
+    complete(make_prompt(0))
+
+    other = make_server()
+    other.n_ctx = 1024
+    other.server_port = server.server_port + 1
+    other.start()
+    log = LogReader(other.log_path)
+    assert "disk prompt cache disabled: another server uses" in log.drain()
+    res = other.make_request("POST", "/completion", data={"prompt": make_prompt(1), "cache_prompt": True})
+    assert res.status_code == 200
+    other.stop()
+    assert len(cache_files()) == 0
+
+    # the first server still owns the directory
+    server.stop()
+    assert len(head_files()) == 1
+
+
+def test_unified_restore_failure_keeps_blocks():
+    # with unified KV a head fails to restore while other slots hold the cells: it is skipped, but the blocks
+    # that it shares with other heads stay
+    global server
+
+    def unified_server():
+        srv = make_server()
+        srv.n_slots = 2
+        srv.kv_unified = True
+        srv.n_ctx = 2048
+        srv.n_predict = 1
+        srv.ctk = "f32"
+        srv.cache_block_size = 32
+        srv.no_cache_idle_slots = True
+        return srv
+
+    def req(prompt, slot):
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "id_slot": slot})
+        assert res.status_code == 200
+        return res.body
+
+    system = tokens_of(0, 640)
+    c1 = system + tokens_of(1, 260)
+    c2 = system + tokens_of(2, 260)
+    other = tokens_of(9, 1300)
+
+    server = unified_server()
+    server.start()
+    req(c1, 0)
+    req(c2, 1)
+    server.stop()
+
+    # slot 1 holds a long prompt, the head of C1 does not fit into the free cells, twice
+    server = unified_server()
+    server.start()
+    log = LogReader(server.log_path)
+    req(other, 1)
+    req(c1 + [5, 6], 0)
+    req(other, 1)
+    req(c1 + [7, 8], 0)
+    server.stop()
+    content = log.drain()
+    assert "did not restore (2 time(s)), not using it any more" in content
+    assert "removing it and its KV blocks" not in content
+
+    # C2 still restores
+    server = unified_server()
+    server.start()
+    log = LogReader(server.log_path)
+    res = req(c2 + [9, 10], 0)
+    server.stop()
+    assert "is corrupt" not in log.drain()
+    assert res["timings"]["cache_n"] > 800

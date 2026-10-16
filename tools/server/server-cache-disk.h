@@ -30,17 +30,40 @@
 //
 // file names start with a fingerprint of the model files and of the settings that change the KV contents or the
 // state format, so several models and configurations can share one directory. files of other fingerprints are
-// never loaded, but they count toward the size limit: their heads are evicted by LRU like the own ones, with the
-// blocks that no other head of their fingerprint holds.
+// never loaded, but they count toward the size limit: their heads are evicted by LRU like the own ones. their
+// blocks are evicted with the last head that holds them, and only while no server of their fingerprint runs: it
+// may hold them in memory. a server holds a lock file for its fingerprint, so only one server of a fingerprint
+// uses the directory at a time.
 struct server_prompt_cache_disk {
     using time_point = std::filesystem::file_time_type;
 
     // KV blocks that the RAM level holds, so that fetch() does not read them from disk; may return nullptr
     using block_source = std::function<server_kv_block_ptr(const server_kv_key & key)>;
 
+    // exclusive lock on a file, released when destroyed or when the process exits
+    struct file_lock {
+        enum class result { locked, busy, failed };
+
+        file_lock() = default;
+        file_lock(file_lock && other) noexcept;
+        file_lock & operator=(file_lock && other) noexcept;
+        ~file_lock();
+
+        // does not block, creates the file if needed
+        result try_lock(const std::string & path);
+        void   release();
+
+    private:
+        intptr_t handle = -1;
+    };
+
+    // the disk level for a fingerprint, nullptr if another server uses the directory with the same fingerprint
     // limit_size:    bytes in the directory, 0 = no limit
     // limit_pending: bytes of states waiting to be written, 0 = no limit; beyond it the oldest waiting state is dropped
-    server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd);
+    static std::unique_ptr<server_prompt_cache_disk> create(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd);
+
+    // lock: the lock of the fingerprint, see create()
+    server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd, file_lock && lock);
 
     // writes the states still waiting before returning
     ~server_prompt_cache_disk();
@@ -65,7 +88,8 @@ struct server_prompt_cache_disk {
     // the state fetched for id did not restore into the context. permanent: the failure cannot be for a lack of
     // free cells (each slot has its own KV stream), so the stored state is broken. a broken head is removed with
     // its blocks, so that the prompts that share them write them again; a whole state is skipped from then on.
-    // a failure that may be for a lack of cells is counted, and treated as permanent the second time.
+    // a failure that may be for a lack of cells is counted, and the entry is skipped after the second one; its
+    // files are kept, the blocks may be fine and shared by other heads.
     // a state that was taken back from the queue is queued again
     void restore_failed(int64_t id, server_prompt_cache_state && state, bool permanent);
 
@@ -149,6 +173,12 @@ private:
     std::string dir;
     std::string prefix; // file name prefix for the current fingerprint
 
+    file_lock lock_own;
+
+    // locks of other fingerprints whose servers do not run, taken by refresh_foreign() and held until make_room()
+    // has removed their files
+    std::vector<file_lock> locks_foreign;
+
     size_t limit_size    = 0;
     size_t limit_pending = 0;
 
@@ -176,7 +206,10 @@ private:
     void scan();
 
     // index the files of other fingerprints again, with the references of their blocks from their heads on disk
+    // the blocks of a fingerprint whose server runs are not referenced, they are never removed
     void refresh_foreign();
+
+    static std::string lock_path(const std::string & dir, uint64_t fingerprint);
 
     std::string block_path(const server_kv_key & key) const;
 

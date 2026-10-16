@@ -1616,12 +1616,15 @@ private:
                 } else if (disk_prev && disk_prev->get_fingerprint() == fingerprint && disk_prev->get_dir() == params_base.cache_disk_path) {
                     prompt_cache->disk = std::move(disk_prev);
                 } else {
+                    // write what the previous one holds and release its lock first
+                    disk_prev.reset();
+
                     const size_t limit_disk = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*params_base.cache_disk_mib;
 
                     // states waiting to be written may hold up to half of the RAM limit on top of it
                     const size_t limit_pending = prompt_cache->limit_size / 2;
 
-                    prompt_cache->disk = std::make_unique<server_prompt_cache_disk>(
+                    prompt_cache->disk = server_prompt_cache_disk::create(
                             params_base.cache_disk_path, limit_disk, limit_pending, fingerprint, mctx != nullptr);
                 }
             }

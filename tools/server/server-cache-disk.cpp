@@ -3,13 +3,23 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <unordered_map>
 
 #if defined(_WIN32)
+// windows.h defines min and max as macros, which breaks std::min and std::max
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -139,11 +149,116 @@ static bool ends_with(const std::string & str, const std::string & suffix) {
 }
 
 //
+// server_prompt_cache_disk::file_lock
+//
+
+server_prompt_cache_disk::file_lock::file_lock(file_lock && other) noexcept : handle(other.handle) {
+    other.handle = -1;
+}
+
+server_prompt_cache_disk::file_lock & server_prompt_cache_disk::file_lock::operator=(file_lock && other) noexcept {
+    if (this != &other) {
+        release();
+        handle       = other.handle;
+        other.handle = -1;
+    }
+    return *this;
+}
+
+server_prompt_cache_disk::file_lock::~file_lock() {
+    release();
+}
+
+void server_prompt_cache_disk::file_lock::release() {
+    if (handle == -1) {
+        return;
+    }
+#if defined(_WIN32)
+    CloseHandle((HANDLE) handle);
+#else
+    ::close((int) handle);
+#endif
+    handle = -1;
+}
+
+server_prompt_cache_disk::file_lock::result server_prompt_cache_disk::file_lock::try_lock(const std::string & path) {
+    release();
+
+#if defined(_WIN32)
+    HANDLE h = CreateFileW(fs::u8path(path).wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return result::failed;
+    }
+
+    OVERLAPPED ov = {};
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+        const DWORD err = GetLastError();
+        CloseHandle(h);
+        return err == ERROR_LOCK_VIOLATION ? result::busy : result::failed;
+    }
+
+    handle = (intptr_t) h;
+#else
+    // not inherited: a child process would hold the lock as long as it runs
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return result::failed;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int err = errno;
+        ::close(fd);
+        return err == EWOULDBLOCK ? result::busy : result::failed;
+    }
+
+    handle = fd;
+#endif
+
+    return result::locked;
+}
+
+//
 // server_prompt_cache_disk
 //
 
-server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd)
-    : dir(dir), prefix("pc-" + hex64(fingerprint) + "-"), limit_size(limit_size), limit_pending(limit_pending), fingerprint(fingerprint), has_mtmd(has_mtmd) {
+std::string server_prompt_cache_disk::lock_path(const std::string & dir, uint64_t fingerprint) {
+    return fs_path_to_utf8(fs::u8path(dir) / fs::u8path("pc-" + hex64(fingerprint) + ".lock"));
+}
+
+std::unique_ptr<server_prompt_cache_disk> server_prompt_cache_disk::create(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd) {
+    std::error_code ec;
+    fs::create_directories(fs::u8path(dir), ec);
+
+    const std::string path = lock_path(dir, fingerprint);
+
+    // a server of another fingerprint holds the lock while it removes files of this one, a server of this
+    // fingerprint that is stopping holds it until it has written its last states: wait for them a while
+    file_lock lock;
+    auto res = lock.try_lock(path);
+    for (int i = 0; res == file_lock::result::busy && i < 100; ++i) {
+        if (i == 10) {
+            SRV_INF("disk prompt cache: waiting for another server that uses '%s' with the same model and settings\n", dir.c_str());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        res = lock.try_lock(path);
+    }
+
+    if (res == file_lock::result::busy) {
+        SRV_WRN("disk prompt cache disabled: another server uses '%s' with the same model and settings\n", dir.c_str());
+        return nullptr;
+    }
+
+    if (res == file_lock::result::failed) {
+        SRV_WRN("disk prompt cache: cannot lock '%s', a second server with the same model and settings would remove the files of this one\n", path.c_str());
+    }
+
+    return std::make_unique<server_prompt_cache_disk>(dir, limit_size, limit_pending, fingerprint, has_mtmd, std::move(lock));
+}
+
+server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd, file_lock && lock)
+    : dir(dir), prefix("pc-" + hex64(fingerprint) + "-"), lock_own(std::move(lock)),
+      limit_size(limit_size), limit_pending(limit_pending), fingerprint(fingerprint), has_mtmd(has_mtmd) {
     scan();
 
     worker = std::thread([this]() { worker_loop(); });
@@ -251,6 +366,12 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
 }
 
 bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_point t_new) {
+    // the servers of the fingerprints that refresh_foreign() locked may start once their files are removed
+    struct release_locks {
+        std::vector<file_lock> & locks;
+        ~release_locks() { locks.clear(); }
+    } release { locks_foreign };
+
     if (limit_size > 0 && size_new > limit_size) {
         return false;
     }
@@ -351,6 +472,24 @@ void server_prompt_cache_disk::refresh_foreign() {
         }
     }
 
+    locks_foreign.clear();
+
+    // a fingerprint whose lock is held has a running server, which may hold its blocks in memory, in a queued
+    // state or in a head it is writing. the lock of any other fingerprint is kept, so that its server does not
+    // start while its files are removed
+    std::unordered_map<uint64_t, bool> live;
+    auto is_live = [&](uint64_t fp) {
+        auto res = live.emplace(fp, true);
+        if (res.second) {
+            file_lock lock;
+            if (lock.try_lock(lock_path(dir, fp)) == file_lock::result::locked) {
+                res.first->second = false;
+                locks_foreign.push_back(std::move(lock));
+            }
+        }
+        return res.first->second;
+    };
+
     std::error_code ec;
 
     try {
@@ -373,6 +512,8 @@ void server_prompt_cache_disk::refresh_foreign() {
             if (fp == fingerprint) {
                 continue;
             }
+
+            is_live(fp);
 
             const char kind = name[prefix.size()];
 
@@ -418,6 +559,12 @@ void server_prompt_cache_disk::refresh_foreign() {
 
         const uint64_t fp = e.fp;
 
+        if (live.at(fp)) {
+            // removing the head leaves its blocks alone
+            e.blocks.clear();
+            continue;
+        }
+
         e.blocks.erase(std::remove_if(e.blocks.begin(), e.blocks.end(), [&](const server_kv_key & key) { return blocks.count({ fp, key }) == 0; }), e.blocks.end());
 
         for (const auto & key : e.blocks) {
@@ -427,7 +574,7 @@ void server_prompt_cache_disk::refresh_foreign() {
 
     // blocks that no head holds become files that the LRU can evict
     for (auto it = blocks.begin(); it != blocks.end();) {
-        if (it->first.fp == fingerprint || it->second.refs > 0) {
+        if (it->first.fp == fingerprint || it->second.refs > 0 || live.at(it->first.fp)) {
             ++it;
             continue;
         }
@@ -873,12 +1020,15 @@ void server_prompt_cache_disk::restore_failed(int64_t id, server_prompt_cache_st
         if (it != entries.end() && it->on_disk) {
             it->n_fail = permanent ? 2 : it->n_fail + 1;
 
+            const bool remove = permanent && it->ranged && !it->busy();
+
             SRV_WRN("disk prompt cache: prompt with %zu tokens did not restore (%d time(s))%s\n",
-                    it->tokens.size(), it->n_fail, it->n_fail < 2 ? "" : it->ranged ? ", removing it and its KV blocks" : ", not using it any more");
+                    it->tokens.size(), it->n_fail, remove ? ", removing it and its KV blocks" : it->n_fail < 2 ? "" : ", not using it any more");
 
             // a broken head may hold blocks of another state format: they are removed too, so that the prompts
             // that share them write them again instead of listing them
-            if (it->n_fail >= 2 && it->ranged && !it->busy()) {
+            // a failure for a lack of cells says nothing about the blocks, other heads may share them
+            if (remove) {
                 for (const auto & key : it->blocks) {
                     auto bit = blocks.find({ fingerprint, key });
                     if (bit != blocks.end() && bit->second.on_disk) {
