@@ -401,6 +401,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+    if (params.allreduce_type != LLAMA_ALLREDUCE_TYPE_DEFAULT) {
+        LLAMA_LOG_INFO("%s: allreduce             = %s\n",   __func__, llama_allreduce_type_name(params.allreduce_type));
+    }
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: fa_native_quants      = %s\n",   __func__, cparams.flash_attn_native_quants ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
@@ -420,6 +423,15 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        // the AllReduce paths of the meta backends created below, in the backends that offer a choice (process-wide)
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            auto * set_mode = (ggml_backend_comm_set_mode_t) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_comm_set_mode");
+            if (set_mode != nullptr && !set_mode(llama_allreduce_type_name(params.allreduce_type))) {
+                LLAMA_LOG_WARN("%s: %s does not support allreduce '%s'\n", __func__,
+                        ggml_backend_reg_name(ggml_backend_reg_get(i)), llama_allreduce_type_name(params.allreduce_type));
+            }
+        }
+
         // GPU backends
         for (const auto & dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
@@ -4130,6 +4142,7 @@ llama_context_params llama_context_default_params() {
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
         /*.flash_attn_type             =*/ LLAMA_FLASH_ATTN_TYPE_AUTO,
+        /*.allreduce_type              =*/ LLAMA_ALLREDUCE_TYPE_DEFAULT,
         /*.rope_freq_base              =*/ 0.0f,
         /*.rope_freq_scale             =*/ 0.0f,
         /*.yarn_ext_factor             =*/ -1.0f,

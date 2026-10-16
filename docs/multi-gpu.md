@@ -113,28 +113,38 @@ GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
 
 P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
 
-### 7. Two GPUs without peer access
+`--allreduce p2p` (recipe 7) uses peer access for the AllReduce of `--split-mode tensor` without this variable: it enables peer access between the two GPUs itself, with the same caveat.
 
-With `--split-mode tensor`, two GPUs that cannot access each other's memory (the usual case for consumer cards) exchange their partial results through host memory. With NCCL compiled in, each reduction takes one of three paths:
+### 7. Two GPUs over PCIe (`--allreduce`)
 
-| Reduction size | Path | Why |
-|---|---|---|
-| below 512 KiB (decode, small batches) | internal pipeline, a single kernel with a handshake through pinned memory | lower latency than NCCL |
-| from 512 KiB (prompt processing) | copy engines: each GPU copies its part to pinned memory in chunks and the other one copies them back as they arrive | no SM is busy, both directions of a link are used at once |
-| anything the two above do not handle | NCCL | |
+With `--split-mode tensor`, two GPUs exchange their partial results after every layer. By default NCCL does all of it. With NCCL compiled in, `--allreduce` picks a path for each reduction by its size instead:
 
-With peer access, NCCL handles every reduction.
+| `--allreduce` | Reduction size | Path | Why |
+|---|---|---|---|
+| `host` | below 512 KiB (decode, small batches) | internal pipeline: a single kernel with a handshake through pinned memory | lower latency than NCCL |
+| `host` | from 512 KiB (prompt processing) | copy engines: each GPU copies its part to pinned memory in chunks, the other copies them back as they arrive | no SM is busy, both directions of a link are used at once |
+| `p2p` | below 512 KiB | peer-to-peer kernel: each GPU writes its part and a flag into the memory of the other and polls only its own | lower latency than NCCL and the internal pipeline |
+| `p2p` | from 512 KiB | copy engines from GPU to GPU | as above, without the copy through host memory |
+| `default` | all | NCCL | |
 
-Environment variables:
+`host` works without peer access, which consumer cards usually lack. `p2p` needs peer access between the GPUs (on consumer cards only with a patched driver) and falls back to `host` without it. Some platforms report peer access but corrupt or hang the transfers (IOMMU, see recipe 6). Over NVLink, keep `default`: NCCL uses the link natively.
+
+```bash
+llama-server -m model.gguf -sm tensor --allreduce host --split-overlap -ub 256
+```
+
+The paths matter most with `--split-overlap` (recipe 8): NCCL keeps an SM on each GPU busy, which slows down the compute of the other ubatch. Over PCIe, the bandwidth of the slower link limits a large reduction with or without peer access, so peer access mostly lowers the latency of the small ones. Measured with an RTX 4070 (PCIe 4.0 x16) and an RTX 3060 (PCIe 3.0 x4), Qwen3.8-27B, `--split-overlap -ub 256`, `default`/`host`/`p2p`: prompt processing 866/1178/1181 t/s, 3-token batches 88.8/97.4/99.5 t/s, generation 34.2/36.9/37.6 t/s (`default`: NCCL over peer access).
+
+For tuning, two environment variables move the thresholds:
 
 | Variable | Effect |
 |---|---|
-| `GGML_CUDA_ALLREDUCE=nccl` | NCCL for every reduction |
-| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size from which the internal pipeline is no longer used, and the default of `GGML_CUDA_AR_CE_MIN_BYTES` (0: NCCL for every reduction). Setting it also enables the internal pipeline with peer access; the copy engines stay off there |
-| `GGML_CUDA_AR_CE=0` | NCCL instead of the copy engines for large reductions |
-| `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used |
+| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size below which the small path is used (default 512 KiB, the most the peer-to-peer kernel handles; 0: NCCL for every reduction) |
+| `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used (default: where the small path ends) |
 
-The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU and per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total.
+`GGML_CUDA_ALLREDUCE=nccl|internal|none` overrides `--allreduce`.
+
+The copy engines need 16 MiB of VRAM per GPU, plus 8 MiB of pinned memory without peer access, per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total. The peer-to-peer kernel needs 512 KiB of VRAM per GPU and context.
 
 ### 8. Overlapping the AllReduce with compute (`--split-overlap`)
 
@@ -154,7 +164,7 @@ Notes:
 
 - Each scheduler reserves the compute buffers for a full ubatch. With half the `--ubatch-size`, the memory stays the same, and two ubatches are in flight at once. On the GPUs below, 256 per scheduler was faster than 128, 384 or 512.
 - Each scheduler captures its own CUDA graphs, which takes some more VRAM at run time (about 50 MiB here).
-- The overlap works best with the copy-engine AllReduce of recipe 7: NCCL kernels hold an SM each, and the compute of the other ubatch then runs slower.
+- The overlap works best with `--allreduce host` or `p2p` (recipe 7): NCCL kernels hold an SM each, and the compute of the other ubatch then runs slower.
 
 Qwen3.8-27B on an RTX 4070 (PCIe 4.0 x16) + RTX 3060 (PCIe 3.0 x4), `-ts 0.625,0.375 -as 1,3`, 262144 tokens of q5_1 cache in 2 slots, with MTP, prompt processing in t/s:
 
