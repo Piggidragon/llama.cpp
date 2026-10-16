@@ -210,6 +210,9 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // the AllReduce paths of the comm contexts created after the call: "default" or a backend-specific mode (CUDA: "host",
+    // "p2p"), returns false for an unknown mode
+    typedef bool   (*ggml_backend_comm_set_mode_t)(const char * mode);
 
     // Release the memory that the memory pools of a backend keep beyond what is in use, returns the released bytes
     typedef size_t (*ggml_backend_trim_pools_t)(ggml_backend_t backend);

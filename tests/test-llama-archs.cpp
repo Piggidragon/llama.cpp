@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <random>
@@ -511,12 +512,29 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+static void test_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif // _WIN32
+}
+
+static void test_unsetenv(const char * name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif // _WIN32
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
-        const std::vector<float> & attn_split = {}, const bool split_overlap = false, const bool workspace = false) {
+        const std::vector<float> & attn_split = {}, const bool split_overlap = false,
+        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -537,6 +555,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     // the ubatches of 64 tokens alternate between the lanes of the split overlap
     ctx_params.split_overlap = split_overlap;
+    ctx_params.allreduce_type = allreduce_type;
     // the compute buffers follow the batches: prompt and generation sizes, the KV extent
     ctx_params.phase_aware_workspace  = workspace;
     ctx_params.live_context_workspace = workspace;
@@ -556,7 +575,17 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
+    // the reductions of the test models stay below the 512 KiB from which the AllReduce paths by size use the copy
+    // engines: with a threshold of 4 KiB a single token still takes the small path and the ubatches the copy engines
+    // (read when the context creates its comm contexts)
+    const bool ce_small = allreduce_type != LLAMA_ALLREDUCE_TYPE_DEFAULT && getenv("GGML_CUDA_AR_CE_MIN_BYTES") == nullptr;
+    if (ce_small) {
+        test_setenv("GGML_CUDA_AR_CE_MIN_BYTES", "4096");
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    if (ce_small) {
+        test_unsetenv("GGML_CUDA_AR_CE_MIN_BYTES");
+    }
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -965,12 +994,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         size_t                          moe_cache_size;
         std::vector<float>              attn_split;   // empty: follow the tensor split
         bool                            split_overlap;
+        llama_allreduce_type            allreduce_type;
         bool                            workspace;    // phase-aware and live-context workspace
 
         device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0,
-                std::vector<float> attn_split = {}, bool split_overlap = false, bool workspace = false)
+                std::vector<float> attn_split = {}, bool split_overlap = false, llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT,
+                bool workspace = false)
             : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size),
-              attn_split(std::move(attn_split)), split_overlap(split_overlap), workspace(workspace) {}
+              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type), workspace(workspace) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -997,7 +1028,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     // compute buffers that follow the batches, on one GPU
                     if (devices_meta.empty()) {
                         dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, std::string(ggml_backend_dev_description(dev)) + " -paw -lcw",
-                                LLAMA_SPLIT_MODE_LAYER, false, 0, std::vector<float>{}, false, true);
+                                LLAMA_SPLIT_MODE_LAYER, false, 0, std::vector<float>{}, false, LLAMA_ALLREDUCE_TYPE_DEFAULT, true);
                         max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                     }
                     devices_meta.push_back(dev);
@@ -1022,9 +1053,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 // consecutive ubatches on two schedulers whose AllReduce overlaps
                 dev_configs.emplace_back(devices_meta, "Meta -so", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true);
 
+                // the AllReduce paths by size (two CUDA GPUs with NCCL, otherwise the same as "Meta")
+                dev_configs.emplace_back(devices_meta, "Meta -ar host", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false,
+                        LLAMA_ALLREDUCE_TYPE_HOST);
+                dev_configs.emplace_back(devices_meta, "Meta -ar p2p -so", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true,
+                        LLAMA_ALLREDUCE_TYPE_P2P);
+
                 // compute buffers that follow the batches, with and without the lanes
-                dev_configs.emplace_back(devices_meta, "Meta -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false, true);
-                dev_configs.emplace_back(devices_meta, "Meta -so -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true, true);
+                dev_configs.emplace_back(devices_meta, "Meta -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false,
+                        LLAMA_ALLREDUCE_TYPE_DEFAULT, true);
+                dev_configs.emplace_back(devices_meta, "Meta -so -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true,
+                        LLAMA_ALLREDUCE_TYPE_DEFAULT, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
             }
         }
@@ -1132,7 +1171,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.workspace);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type, dc.workspace);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

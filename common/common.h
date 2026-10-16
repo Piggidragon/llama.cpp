@@ -505,6 +505,7 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
+    enum llama_allreduce_type    allreduce_type    = LLAMA_ALLREDUCE_TYPE_DEFAULT; // split mode tensor: AllReduce paths
 
     bool flash_attn_native_quants = false; // read a quantized K/V cache in place instead of casting it to F16
     bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next

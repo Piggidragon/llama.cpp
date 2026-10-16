@@ -1800,6 +1800,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE"));
     add_opt(common_arg(
+        {"--allreduce"}, "{default,host,p2p}",
+        "with --split-mode tensor on two CUDA GPUs: how the GPUs exchange their partial results (docs/multi-gpu.md)\n"
+        "- default: NCCL\n"
+        "- host: by size, through host memory: small reductions through a kernel with a handshake in pinned memory, "
+        "large ones through the copy engines (no SM busy, both directions of the link at once)\n"
+        "- p2p: by size, with CUDA peer access between the GPUs: small reductions through a kernel that writes into "
+        "the other GPU, large ones through the copy engines from GPU to GPU; host without peer access. Some "
+        "platforms report peer access but corrupt the transfers (IOMMU)",
+        [](common_params & params, const std::string & value) {
+            if (value == "default") {
+                params.allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT;
+            } else if (value == "host") {
+                params.allreduce_type = LLAMA_ALLREDUCE_TYPE_HOST;
+            } else if (value == "p2p") {
+                params.allreduce_type = LLAMA_ALLREDUCE_TYPE_P2P;
+            } else {
+                throw std::invalid_argument("invalid value for --allreduce: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_ALLREDUCE"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

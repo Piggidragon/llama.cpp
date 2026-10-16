@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/allreduce-ce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1053,6 +1054,9 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ce_ar *           ce_ar        = nullptr;
     size_t                      ce_min_bytes = 0;
 
+    // with NCCL and peer access: reductions smaller than nccl_min_bytes go through the peer-to-peer kernel
+    ggml_cuda_p2p_ar *          p2p_ar       = nullptr;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1065,6 +1069,7 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
         ggml_cuda_ce_ar_free(ce_ar);
+        ggml_cuda_p2p_ar_free(p2p_ar);
     }
 };
 
@@ -1213,6 +1218,10 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
             ggml_cuda_ce_ar_allreduce(comm_ctx->ce_ar, comm_ctx->backends.data(), tensors)) {
         return true;
     }
+    if (comm_ctx->p2p_ar != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
+            ggml_cuda_p2p_ar_allreduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
     if (comm_ctx->ar_pipeline != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
             ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
         return true;
@@ -1260,61 +1269,110 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     ggml_backend_cuda_comm_init_none(ret);
 }
 
+// The AllReduce paths of the comm contexts created from now on (llama: --allreduce): "default" leaves every reduction
+// to NCCL (or the internal pipeline without NCCL), "host" and "p2p" pick a path by size between two GPUs, see
+// ggml_backend_cuda_comm_init_hybrid().
+enum ggml_cuda_comm_mode {
+    GGML_CUDA_COMM_MODE_DEFAULT,
+    GGML_CUDA_COMM_MODE_HOST,
+    GGML_CUDA_COMM_MODE_P2P,
+};
+
+static std::atomic<int> ggml_cuda_comm_mode_cur { GGML_CUDA_COMM_MODE_DEFAULT };
+
+static bool ggml_backend_cuda_comm_set_mode(const char * mode) {
+    if (mode == nullptr || strcmp(mode, "default") == 0) {
+        ggml_cuda_comm_mode_cur = GGML_CUDA_COMM_MODE_DEFAULT;
+    } else if (strcmp(mode, "host") == 0) {
+        ggml_cuda_comm_mode_cur = GGML_CUDA_COMM_MODE_HOST;
+    } else if (strcmp(mode, "p2p") == 0) {
+        ggml_cuda_comm_mode_cur = GGML_CUDA_COMM_MODE_P2P;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 #ifdef GGML_USE_NCCL
 // Without peer access NCCL exchanges the data through host memory as well.  A small reduction is then bound by the
 // latency of the handshake, where the in-kernel handshake of the internal pipeline is faster: with an RTX 4070 on
 // PCIe 4.0 x16 and an RTX 3060 on PCIe 3.0 x4, a Qwen3.8-27B decode step of 1-4 tokens runs 9-12% faster through it.
-// From 32 tokens (640 KiB per reduction) on NCCL is faster.  GGML_CUDA_AR_NCCL_MIN_BYTES sets the size from which
-// NCCL is used, 0 uses NCCL for everything.
+// From 32 tokens (640 KiB per reduction) on NCCL is faster.
 //
 // Larger reductions go through the copy engines instead of NCCL (see allreduce-ce.cuh): NCCL keeps an SM busy on each
 // GPU during the transfer, which pushes a kernel with one block per SM into a second wave, and does not use both
-// directions of a link at the same time. On the same GPUs prompt processing gets 16% faster. GGML_CUDA_AR_CE=0 keeps
-// NCCL for them, GGML_CUDA_AR_CE_MIN_BYTES sets the size from which the copy engines are used.
+// directions of a link at the same time. On the same GPUs prompt processing gets 16% faster.
+//
+// With peer access ("p2p") the same holds: NCCL's small reductions have more latency than a kernel that writes into
+// the other GPU and polls only its own memory, and a large one is bound by the link either way. The same GPUs with
+// BAR1 P2P: tg 36.9 -> 37.6 t/s and pp3 97.5 -> 99.7 against the internal pipeline, with --split-overlap prompt
+// processing 865 -> 1183 t/s against NCCL. Peer access is used only on request: some platforms report it but corrupt
+// or hang the transfers (IOMMU).
+//
+// GGML_CUDA_AR_NCCL_MIN_BYTES sets the size from which the small path ends (default 512 KiB, the peer-to-peer kernel
+// handles at most that, 0: NCCL for everything), GGML_CUDA_AR_CE_MIN_BYTES the size from which the copy engines are
+// used (default: where the small path ends).
 static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
-    if (ret->dev_ids.size() != 2) {
+    const int mode = ggml_cuda_comm_mode_cur;
+    if (mode == GGML_CUDA_COMM_MODE_DEFAULT || ret->dev_ids.size() != 2) {
         return;
     }
 
-    int can_access = 0;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
+    bool peer = false;
+    if (mode == GGML_CUDA_COMM_MODE_P2P) {
+        int can_access = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        can_access = 0; // the peer-to-peer kernel is CUDA only
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        peer = can_access != 0;
+        if (!peer) {
+            GGML_LOG_WARN("%s: no peer access between CUDA%d and CUDA%d, AllReduce through host memory\n",
+                    __func__, ret->dev_ids[0], ret->dev_ids[1]);
+        }
+    }
 
     size_t min_bytes = 512*1024;
     if (const char * env = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES")) {
         min_bytes = std::strtoull(env, nullptr, 10);
-    } else if (can_access) {
-        // NCCL takes the peer path, which has not been measured against the internal pipeline
-        return;
     }
-
     if (min_bytes == 0) {
         return;
     }
 
-    // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
-    // it needs Volta or newer, the copy engines do not
-    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
-    if (ret->ar_pipeline == nullptr) {
-        (void) cudaGetLastError();
-    } else {
-        ret->nccl_min_bytes = min_bytes;
+    // the small path: the peer-to-peer kernel (it needs Volta or newer), otherwise the internal pipeline
+    if (peer) {
+        ret->p2p_ar = ggml_cuda_p2p_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->p2p_ar != nullptr) {
+            ret->nccl_min_bytes = std::min(min_bytes, ggml_cuda_p2p_ar_max_bytes());
+        }
     }
-
-    // with peer access NCCL copies from GPU to GPU, the copy engines would go through host memory
-    const char * env_ce = getenv("GGML_CUDA_AR_CE");
-    if (!can_access && (env_ce == nullptr || atoi(env_ce) != 0)) {
-        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
-        ret->ce_min_bytes = min_bytes;
-        if (const char * env = getenv("GGML_CUDA_AR_CE_MIN_BYTES")) {
-            ret->ce_min_bytes = std::strtoull(env, nullptr, 10);
+    if (ret->p2p_ar == nullptr) {
+        // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
+        ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
+        if (ret->ar_pipeline == nullptr) {
+            (void) cudaGetLastError();
+        } else {
+            ret->nccl_min_bytes = min_bytes;
         }
     }
 
-    if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
+    // the large path: the copy engines take over where the small path ends
+    ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size(), /*peer =*/ peer);
+    ret->ce_min_bytes = ret->nccl_min_bytes > 0 ? ret->nccl_min_bytes : min_bytes;
+    if (const char * env = getenv("GGML_CUDA_AR_CE_MIN_BYTES")) {
+        ret->ce_min_bytes = std::strtoull(env, nullptr, 10);
+    }
+
+    if (ret->p2p_ar != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the peer-to-peer kernel, from %zu bytes through %s\n",
+                __func__, ret->nccl_min_bytes, ret->ce_ar != nullptr ? ret->ce_min_bytes : ret->nccl_min_bytes,
+                ret->ce_ar != nullptr ? "the copy engines" : "NCCL");
+    } else if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
         GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, from %zu bytes through the copy engines\n",
-                __func__, min_bytes, ret->ce_min_bytes);
+                __func__, ret->nccl_min_bytes, ret->ce_min_bytes);
     } else if (ret->ar_pipeline != nullptr) {
-        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, min_bytes);
+        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, ret->nccl_min_bytes);
     } else if (ret->ce_ar != nullptr) {
         GGML_LOG_INFO("%s: AllReduce from %zu bytes through the copy engines, NCCL below\n", __func__, ret->ce_min_bytes);
     }
@@ -6201,6 +6259,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_trim_pools") == 0) {
         return (void *)ggml_backend_cuda_trim_pools;
+    }
+    if (strcmp(name, "ggml_backend_comm_set_mode") == 0) {
+        return (void *)ggml_backend_cuda_comm_set_mode;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
