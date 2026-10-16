@@ -5,7 +5,9 @@
 
 #include <string>
 #include <unordered_set>
+#include <filesystem>
 #include <list>
+#include <memory>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -660,19 +662,29 @@ struct server_prompt_cache_state {
     }
 };
 
+struct server_prompt_cache_disk;
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
+    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
+
+    // second level on disk (--cache-disk): takes the states evicted from RAM, nullptr if disabled
+    std::unique_ptr<server_prompt_cache_disk> disk;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // context checkpoints kept per cached prompt, the newest ones: a resumed conversation rolls back to the
+    // checkpoints near the end of its last prompt, older ones only help when the history changes
+    static constexpr size_t n_checkpoints = 3;
+
+    // the newest n_checkpoints of a prompt
+    static std::list<common_prompt_checkpoint> newest_checkpoints(const std::list<common_prompt_checkpoint> & checkpoints);
 
     size_t size() const;
 
@@ -682,7 +694,18 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
+    // for a slot that shares lcp_base tokens with it; lcp_base if there is none
+    size_t n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max, size_t lcp_base) const;
+
     void update();
+
+    // remove the oldest state, handing it to the disk level if there is one
+    void evict_oldest();
+
+    // hand all states to the disk level, newest first, and optionally wait until they are written
+    // t_newest is the last use given to the newest state, the older ones get earlier times
+    void flush_to_disk(bool wait, std::filesystem::file_time_type t_newest);
 };
 
 // used exclusively by router mode
