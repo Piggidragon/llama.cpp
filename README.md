@@ -1,36 +1,34 @@
 # What this fork adds
 
-Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the features below. Each one is off until its flag enables it, except the changes to the server's RAM prompt cache, which are always on (see the prompt cache item). The rest of this file is the upstream README.
+Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the features below. Each one is off until its flag enables it, except the changes to the server's RAM prompt cache, which are always on (see the notes under the table). The rest of this file is the upstream README.
 
 ## Features
 
-- **Quantized-native FlashAttention (CUDA).** The FlashAttention kernel reads a quantized K/V cache in place instead of first copying the attention window to F16.
-  - Benefit: faster generation at long context (Qwen3.8-27B: +6-11% at 16k, up to +39% at 64k), and no F16 copy in the compute buffer (1.6 GiB less at 262k context).
-  - Enable: `--flash-attn-native-quants` (`-fanq 1` in llama-bench) with a quantized cache, the same type for K and V (`-ctk q5_1 -ctv q5_1`). `q4_1`, `q5_0` and `q5_1` need `-DGGML_CUDA_FA_QUANTS=<pair>` or `all` at build time. [Details](docs/quantized-native-flash-attention.md)
-- **Prompt cache on disk.** A disk level below the RAM prompt cache. Prompts are stored as KV blocks keyed by their prefix, so conversations with a shared prefix share blocks, and a growing conversation writes only its new blocks.
-  - Benefit: conversations survive RAM eviction, restarts and model swaps, and resume without processing the prompt again. The next turn of a 25k-token conversation writes 0.16 GB instead of 2.3 GB.
-  - Enable: `--cache-disk PATH` (server), sized with `--cache-disk-size` (MiB). [Details](tools/server/README.md#prompt-cache-on-disk)
-  - Always on, with the RAM prompt cache (`--cache-ram`, on by default):
-    - The RAM cache stores prompts as KV blocks of `--cache-block-size` tokens (default 2048).
-    - A cached prompt keeps only its newest 3 context checkpoints.
-    - The server restores a cached prompt into a slot when that prompt shares at least 256 more tokens with the request than the slot does.
-    - SIGINT and SIGTERM are handled on their own thread.
-- **Attention split** (`--split-mode tensor`). The attention heads and their KV cache get their own split across the GPUs, separate from `--tensor-split`.
-  - Benefit: with GPUs of different speed, the faster one takes more of the weights while the other one holds more of the KV cache.
-  - Enable: `--attn-split 1,3` (`-as`), next to e.g. `--tensor-split 0.625,0.375`. [Details](docs/multi-gpu.md)
-- **AllReduce by size** (`--split-mode tensor`, two CUDA GPUs). Small reductions go through a kernel with a handshake instead of NCCL, and large ones through the copy engines. With `p2p`, the GPUs write directly into each other's memory.
-  - Benefit: lower latency per decode step, and prompt processing that keeps every SM free for compute.
-  - Enable: `--allreduce host` (no peer access needed) or `--allreduce p2p` (needs peer access between the GPUs; falls back to `host` without it). [Details](docs/multi-gpu.md#7-two-gpus-over-pcie---allreduce)
-- **Split overlap** (`--split-mode tensor`). Large ubatches alternate between two schedulers, so the AllReduce of one ubatch overlaps with the compute of the next.
-  - Benefit: faster prompt processing when the link between the GPUs is slow (Qwen3.8-27B on two PCIe GPUs: 733 -> 947 t/s at 10k context).
-  - Enable: `--split-overlap`, with half the usual `--ubatch-size` (each scheduler has its own compute buffers). Best together with `--allreduce host` or `p2p`. [Details](docs/multi-gpu.md#8-overlapping-the-allreduce-with-compute---split-overlap)
+All measurements: Qwen3.8-27B. The last three rows need `--split-mode tensor`; the AllReduce paths need two CUDA GPUs.
+
+| Feature | What it does | Benefit | Enable |
+|---|---|---|---|
+| Quantized-native FlashAttention (CUDA) | Reads a quantized K/V cache in place instead of copying the attention window to F16 | Generation +6-11% at 16k context, up to +39% at 64k; 1.6 GiB less compute buffer at 262k | `--flash-attn-native-quants` (`-fanq 1`), same quantized type for K and V. [Details](docs/quantized-native-flash-attention.md) |
+| Prompt cache on disk | Stores prompts as KV blocks, keyed by their prefix, on disk below the RAM cache | Conversations survive RAM eviction, restarts and model swaps; a growing conversation writes only its new blocks (0.16 GB instead of 2.3 GB at 25k tokens) | `--cache-disk PATH`, `--cache-disk-size` (MiB). [Details](tools/server/README.md#prompt-cache-on-disk) |
+| Compute buffers that follow the batches | Sizes the compute buffers by the current batch; an MTP draft context uses its target's buffers | Up to 212 MiB less VRAM per GPU (106 MiB at full context), prompt processing 1-2% slower | `--phase-aware-workspace`, `--live-context-workspace`. [Details](docs/compute-workspace.md) |
+| Attention split | Splits the attention heads and their KV cache separately from `--tensor-split` | The faster GPU takes more weights, the other one more KV cache | `--attn-split 1,3` (`-as`). [Details](docs/multi-gpu.md) |
+| AllReduce by size | Small reductions through a kernel with a handshake, large ones through the copy engines, instead of NCCL | Prompt processing 866 -> 1181 t/s, generation 34.2 -> 37.6 t/s (two PCIe GPUs, with split overlap) | `--allreduce host`, or `p2p` with peer access. [Details](docs/multi-gpu.md#7-two-gpus-over-pcie---allreduce) |
+| Split overlap | Large ubatches alternate between two schedulers, so the AllReduce of one overlaps with the compute of the next | Prompt processing 733 -> 947 t/s at 10k context (two PCIe GPUs) | `--split-overlap` with half the usual `--ubatch-size`. [Details](docs/multi-gpu.md#8-overlapping-the-allreduce-with-compute---split-overlap) |
+
+Notes:
+- **Build:** `q4_1`, `q5_0` and `q5_1` for the native FlashAttention need `-DGGML_CUDA_FA_QUANTS=<pair>` (or `all`).
+- **Always on, without a flag:** with the RAM prompt cache (`--cache-ram`, on by default), the server
+  - stores prompts as KV blocks of `--cache-block-size` tokens;
+  - keeps the newest 3 context checkpoints of a cached prompt;
+  - restores a cached prompt into a slot when it shares at least 256 more tokens with the request than the slot does;
+  - handles SIGINT and SIGTERM on their own thread.
 
 ## Upstream vs this fork
 
 Setup: RTX 4070 (12 GB, PCIe 4.0 x16) + RTX 3060 (12 GB, PCIe 3.0 x4), Qwen3.8-27B UD-Q4_K_S with its MTP head (2 draft tokens), `llama-server` with 2 slots of 131k context, q5_1 K/V cache.
 
 - Upstream: `-sm tensor -fa on -ctk q5_1 -ctv q5_1`, the best split that fits.
-- This fork: additionally `--flash-attn-native-quants -ts 0.625,0.375 --attn-split 1,3 --allreduce p2p --split-overlap -ub 256 --cache-disk ...`.
+- This fork: additionally `--flash-attn-native-quants -ts 0.625,0.375 --attn-split 1,3 --allreduce p2p --split-overlap -ub 256 --phase-aware-workspace --live-context-workspace --cache-disk ...`.
 
 | | upstream | this fork |
 |---|--:|--:|
