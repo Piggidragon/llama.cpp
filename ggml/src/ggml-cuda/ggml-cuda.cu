@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-ce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1026,6 +1027,10 @@ struct ggml_backend_cuda_comm_context {
     // with NCCL: reductions smaller than this many bytes go through the internal pipeline when it is set up
     size_t                      nccl_min_bytes = 0;
 
+    // with NCCL: reductions of at least this many bytes go through the copy engines when it is set up
+    ggml_cuda_ce_ar *           ce_ar        = nullptr;
+    size_t                      ce_min_bytes = 0;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1037,6 +1042,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ce_ar_free(ce_ar);
     }
 };
 
@@ -1180,7 +1186,11 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 #ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    // the internal pipeline returns false before it enqueues anything, NCCL then takes the call
+    // both return false before they enqueue anything, NCCL then takes the call
+    if (comm_ctx->ce_ar != nullptr && ggml_nbytes(tensors[0]) >= comm_ctx->ce_min_bytes &&
+            ggml_cuda_ce_ar_allreduce(comm_ctx->ce_ar, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
     if (comm_ctx->ar_pipeline != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
             ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
         return true;
@@ -1234,21 +1244,25 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 // PCIe 4.0 x16 and an RTX 3060 on PCIe 3.0 x4, a Qwen3.8-27B decode step of 1-4 tokens runs 9-12% faster through it.
 // From 32 tokens (640 KiB per reduction) on NCCL is faster.  GGML_CUDA_AR_NCCL_MIN_BYTES sets the size from which
 // NCCL is used, 0 uses NCCL for everything.
+//
+// Larger reductions go through the copy engines instead of NCCL (see allreduce-ce.cuh): NCCL keeps an SM busy on each
+// GPU during the transfer, which pushes a kernel with one block per SM into a second wave, and does not use both
+// directions of a link at the same time. On the same GPUs prompt processing gets 16% faster. GGML_CUDA_AR_CE=0 keeps
+// NCCL for them, GGML_CUDA_AR_CE_MIN_BYTES sets the size from which the copy engines are used.
 static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
     if (ret->dev_ids.size() != 2) {
         return;
     }
 
+    int can_access = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
+
     size_t min_bytes = 512*1024;
     if (const char * env = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES")) {
         min_bytes = std::strtoull(env, nullptr, 10);
-    } else {
-        int can_access = 0;
-        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
-        if (can_access) {
-            // NCCL takes the peer path, which has not been measured against the internal pipeline
-            return;
-        }
+    } else if (can_access) {
+        // NCCL takes the peer path, which has not been measured against the internal pipeline
+        return;
     }
 
     if (min_bytes == 0) {
@@ -1256,14 +1270,32 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     }
 
     // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
+    // it needs Volta or newer, the copy engines do not
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
     if (ret->ar_pipeline == nullptr) {
         (void) cudaGetLastError();
-        return;
+    } else {
+        ret->nccl_min_bytes = min_bytes;
     }
 
-    ret->nccl_min_bytes = min_bytes;
-    GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, min_bytes);
+    // with peer access NCCL copies from GPU to GPU, the copy engines would go through host memory
+    const char * env_ce = getenv("GGML_CUDA_AR_CE");
+    if (!can_access && (env_ce == nullptr || atoi(env_ce) != 0)) {
+        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+        ret->ce_min_bytes = min_bytes;
+        if (const char * env = getenv("GGML_CUDA_AR_CE_MIN_BYTES")) {
+            ret->ce_min_bytes = std::strtoull(env, nullptr, 10);
+        }
+    }
+
+    if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, from %zu bytes through the copy engines\n",
+                __func__, min_bytes, ret->ce_min_bytes);
+    } else if (ret->ar_pipeline != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, min_bytes);
+    } else if (ret->ce_ar != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce from %zu bytes through the copy engines, NCCL below\n", __func__, ret->ce_min_bytes);
+    }
 }
 #endif // GGML_USE_NCCL
 

@@ -36,6 +36,7 @@ Set with `--split-mode` / `-sm`.
 |---|---|---|---|---|
 | `-sm` | `--split-mode` | `none` \| `layer` \| `tensor` | `layer` | See modes above. |
 | `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
+| `-as` | `--attn-split` | comma-separated proportions, e.g. `1,3` | follows `-ts` | With `--split-mode tensor`: the share of the attention heads per GPU. The heads take their weights and their KV cache along, the rest of the model follows `--tensor-split`. With GPUs of different speed, give the faster one more of `--tensor-split` and move KV heads to the other one to keep both in memory. The model load logs the KV heads each GPU got. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
@@ -110,6 +111,29 @@ GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
 ```
 
 P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
+
+### 7. Two GPUs without peer access
+
+With `--split-mode tensor`, two GPUs that cannot access each other's memory (the usual case for consumer cards) exchange their partial results through host memory. With NCCL compiled in, each reduction takes one of three paths:
+
+| Reduction size | Path | Why |
+|---|---|---|
+| below 512 KiB (decode, small batches) | internal pipeline, a single kernel with a handshake through pinned memory | lower latency than NCCL |
+| from 512 KiB (prompt processing) | copy engines: each GPU copies its part to pinned memory in chunks and the other one copies them back as they arrive | no SM is busy, both directions of a link are used at once |
+| anything the two above do not handle | NCCL | |
+
+With peer access, NCCL handles every reduction.
+
+Environment variables:
+
+| Variable | Effect |
+|---|---|
+| `GGML_CUDA_ALLREDUCE=nccl` | NCCL for every reduction |
+| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size from which the internal pipeline is no longer used, and the default of `GGML_CUDA_AR_CE_MIN_BYTES` (0: NCCL for every reduction). Setting it also enables the internal pipeline with peer access; the copy engines stay off there |
+| `GGML_CUDA_AR_CE=0` | NCCL instead of the copy engines for large reductions |
+| `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used |
+
+The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU and per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total.
 
 ---
 
