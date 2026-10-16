@@ -2960,26 +2960,44 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto penalize = [ctx](llama_token_data & td, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (td.logit <= 0) {
+            td.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            td.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // The candidates are usually still in vocabulary order (the penalties come first in the chain): a penalized token
+    // is then at its own index, and only the at most penalty_last_n penalized tokens are touched instead of looking up
+    // every candidate (~0.85 ms for a vocabulary of 248k).
+    bool in_place = true;
+    for (const auto & [id, count] : ctx->token_count) {
+        if (id < 0 || (size_t) id >= cur_p->size || cur_p->data[id].id != id) {
+            in_place = false;
+            break;
+        }
+    }
+
+    if (in_place) {
+        for (const auto & [id, count] : ctx->token_count) {
+            penalize(cur_p->data[id], count);
+        }
+    } else {
+        // filtered or reordered candidates: look each one up
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+            penalize(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
