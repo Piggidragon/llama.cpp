@@ -515,7 +515,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const std::vector<float> & attn_split = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -524,6 +525,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    std::vector<float> attn_split_all = attn_split;
+    if (!attn_split_all.empty()) {
+        attn_split_all.resize(llama_max_devices(), 0.0f);
+        model_params.attn_split = attn_split_all.data();
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -952,9 +958,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         llama_split_mode                split_mode;
         bool                            host_experts; // keep the experts in host memory, see host_experts_test
         size_t                          moe_cache_size;
+        std::vector<float>              attn_split;   // empty: follow the tensor split
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0,
+                std::vector<float> attn_split = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size),
+              attn_split(std::move(attn_split)) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -985,6 +994,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
         if (target_backend == nullptr) {
             dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+
+            // the attention heads and their KV cache get their own share: all on the first device, and an uneven one
+            if (devices_meta.size() > 1) {
+                std::vector<float> attn_first(devices_meta.size(), 0.0f);
+                attn_first[0] = 1.0f;
+                dev_configs.emplace_back(devices_meta, "Meta -as 1/0", LLAMA_SPLIT_MODE_TENSOR, false, 0, attn_first);
+
+                std::vector<float> attn_uneven(devices_meta.size(), 3.0f);
+                attn_uneven[0] = 1.0f;
+                dev_configs.emplace_back(devices_meta, "Meta -as 1/3", LLAMA_SPLIT_MODE_TENSOR, false, 0, attn_uneven);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+            }
         }
 
         // the ops that use the experts are offloaded to the first device and the scheduler copies the used experts
@@ -1090,7 +1111,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

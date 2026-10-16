@@ -72,6 +72,7 @@ test parameters:
   -lzm, --lazy-mode <on|auto|off>           (default: auto)
   -embd, --embeddings <0|1>                 (default: 0)
   -ts, --tensor-split <ts0/ts1/..>          (default: 0)
+  -as, --attn-split <as0/as1/..>            (default: 0 = follow --tensor-split)
   -ot --override-tensor <tensor name pattern>=<buffer type>;...
                                             (default: disabled)
   -nopo, --no-op-offload <0|1>              (default: 0)

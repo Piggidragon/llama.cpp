@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -445,6 +446,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+        size_t   il_eff = 0; // index of the layer among the previous layers of its kind, see get_il_eff
     };
 
     auto get_tensor_config_impl = [&](
@@ -464,18 +466,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         uint32_t il;
         std::string prefix;
         size_t rotation;
+        size_t il_eff = 0;
         if (tensor_name.substr(0, 4) == "blk.") {
             const size_t length_prefix = tensor_name.find('.', 4);
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            il_eff = get_il_eff(il);
+            rotation = il_eff % ud->n_devices;
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            il_eff = get_il_eff(il);
+            rotation = il_eff % ud->n_devices;
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -486,7 +491,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
-        return {axis, tensor_axis_0, il, rotation};
+        return {axis, tensor_axis_0, il, rotation, il_eff};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
@@ -851,10 +856,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
-        std::vector<float> tensor_split_scan;
+
+        // The share of the attention heads decides how much cache a device gets and how much attention
+        // work it does, neither of which has to follow the memory split. Only a split that counts heads
+        // follows it, and those are the ones measured against attn_output.weight - a linear-attention
+        // layer measures against ssm_out.weight and keeps tensor_split.
+        bool use_attn_split = false;
+        if (ud->model->attn_split() != nullptr) {
+            const std::string attn_out_name = "blk." + std::to_string(tc.il) + ".attn_output.weight";
+            const ggml_tensor * attn_out = ud->model->get_tensor(attn_out_name.c_str());
+            if (attn_out != nullptr && tc.tensor_axis_0 == attn_out) {
+                tensor_split   = ud->model->attn_split();
+                use_attn_split = true;
+            }
+        }
+
+        // The attention split spreads the rounding over the layers: the boundaries of layer il_eff are the
+        // differences of the rounded cumulative boundaries of the layers before it, so the heads over all layers
+        // of a kind follow the ratio within one head. The tensor split rotates the device that is rounded first.
+        const size_t rotation = use_attn_split ? 0 : tc.rotation;
+
+        // in double: the tensors of a layer have different sizes, and a share that is inexact in binary must not
+        // round them to different numbers of heads
+        std::vector<double> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0 : (double) tensor_split[(j + rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -865,18 +892,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
+
+            // the share of devices [0, j] in units of the granularity
+            const double n_units = (double) ne_s / g_s;
+            auto units_upto = [&](size_t j) -> double {
+                const double frac = tensor_split_scan.back() == 0.0 ?
+                    double(j + 1)/ud->n_devices : tensor_split_scan[j]/tensor_split_scan.back();
+                return n_units * frac;
+            };
+
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
+                int64_t high_units;
+                if (use_attn_split) {
+                    const double x = units_upto(j);
+                    high_units = std::llround(x*(tc.il_eff + 1)) - std::llround(x*tc.il_eff);
+                } else {
+                    // a share that is exact in decimal can come out just below the boundary in binary
+                    high_units = (int64_t) std::floor(units_upto(j) + 1e-9);
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                int64_t high = std::clamp<int64_t>(high_units, 0, (int64_t) n_units) * g_s;
+                high = std::max(high, low);
+                split_state.ne[is*ud->n_devices + (j + rotation) % ud->n_devices] = high - low;
                 low = high;
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            split_state.ne[is*ud->n_devices + (j + rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -1270,6 +1311,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<float> attn_split_owned;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1328,6 +1370,27 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.attn_split != nullptr) {
+        // the shares reach a cumulative division and a conversion to whole heads, so a negative, a
+        // non-finite or an all-zero set has no meaning here - fall back to the tensor split
+        // they are kept as fractions of their sum, so that large shares cannot overflow the rounding
+        double sum = 0.0;
+        bool   ok  = true;
+        for (size_t i = 0; i < llama_max_devices(); i++) {
+            ok = ok && std::isfinite(params.attn_split[i]) && params.attn_split[i] >= 0.0f;
+            sum += params.attn_split[i];
+        }
+        if (!ok || !std::isfinite(sum) || !(sum > 0.0)) {
+            LLAMA_LOG_WARN("%s: the attention split is not a set of non-negative shares; ignoring it\n", __func__);
+            this->params.attn_split = nullptr;
+        } else {
+            pimpl->attn_split_owned.resize(llama_max_devices());
+            for (size_t i = 0; i < llama_max_devices(); i++) {
+                pimpl->attn_split_owned[i] = (float) (params.attn_split[i] / sum);
+            }
+            this->params.attn_split = pimpl->attn_split_owned.data();
+        }
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1999,6 +2062,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the attention split gives each layer whole KV heads, rounding toward a different device from layer to layer:
+    // show what it came to over all layers
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && params.attn_split != nullptr && get_split_state_ud.n_devices > 1) {
+        const size_t n_dev = get_split_state_ud.n_devices;
+
+        std::vector<int64_t> n_head_kv_dev(n_dev, 0);
+        int64_t n_head_kv_all = 0;
+
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            const std::string name = "blk." + std::to_string(il) + ".attn_output.weight";
+            const ggml_tensor * attn_out = get_tensor(name.c_str());
+            // layers left in host memory are not split, layers that reuse another layer's KV have none of their own
+            if (attn_out == nullptr || attn_out->buffer == nullptr || ggml_backend_buffer_is_host(attn_out->buffer) || !hparams.has_kv(il)) {
+                continue;
+            }
+
+            const ggml_backend_meta_split_state split_state = llama_meta_device_get_split_state(attn_out, &get_split_state_ud);
+            if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0) {
+                continue;
+            }
+
+            const int64_t n_embd_head_kv = (int64_t) hparams.n_embd_head_v(il) * hparams.n_gqa(il);
+            for (size_t j = 0; j < n_dev; ++j) {
+                n_head_kv_dev[j] += split_state.ne[j] / n_embd_head_kv;
+            }
+            n_head_kv_all += attn_out->ne[0] / n_embd_head_kv;
+        }
+
+        float share_used = 0.0f;
+        for (size_t j = 0; j < n_dev; ++j) {
+            share_used += params.attn_split[j];
+        }
+        if (share_used == 0.0f) {
+            LLAMA_LOG_WARN("%s: the attention split gives the %zu devices in use no share, the heads follow the tensor split\n", __func__, n_dev);
+        }
+        if (n_head_kv_all == 0) {
+            LLAMA_LOG_WARN("%s: the attention split has no effect, no layer of this model splits its attention heads on the devices\n", __func__);
+        } else {
+            std::string desc;
+            for (size_t j = 0; j < n_dev; ++j) {
+                desc += format("%sdevice %zu: %" PRId64 " (%.1f%%)", j > 0 ? ", " : "", j, n_head_kv_dev[j], 100.0*n_head_kv_dev[j]/n_head_kv_all);
+            }
+            LLAMA_LOG_INFO("%s: attention split, KV heads of all layers per device: %s\n", __func__, desc.c_str());
+        }
+    }
+
     if (ml.no_alloc) {
         return true;
     }
@@ -2401,6 +2510,10 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+const float * llama_model::attn_split() const {
+    return params.attn_split;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -3342,6 +3455,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.attn_split                  =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
