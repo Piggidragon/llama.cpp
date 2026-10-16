@@ -397,7 +397,7 @@ static void ggml_cuda_ar_wait_for_compute(
 // Init / free
 // ---------------------------------------------------------------------------
 
-ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
+ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices, bool small_only) {
 
     if (n_devices != 2) {
         GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
@@ -420,7 +420,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
     p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
-    p->copy_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_THRESHOLD", GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT);
+    p->copy_threshold   = small_only ? 0 : ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_THRESHOLD", GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT);
     // 0 = use the per-call heuristic (default).  Non-zero env value forces a
     // fixed chunk size for diagnostics, with a floor at COPY_CHUNK_BYTES_MIN.
     p->copy_chunk_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_COPY_CHUNK_BYTES", 0);
@@ -516,7 +516,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
     // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
     // cross-stream wait in copy_impl on the prior AR's add_kernel-done event.
-    for (size_t i = 0; i < n_devices; ++i) {
+    // Not needed when copy_threshold is 0: no call takes the path.
+    if (small_only) {
+        p->copy_bytes = 0;
+    }
+    for (size_t i = 0; i < n_devices && !small_only; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
             GGML_LOG_ERROR("%s: alloc for large staging failed (%zu bytes)\n",
@@ -965,7 +969,7 @@ bool ggml_cuda_ar_allreduce(
 // AllReduce is unavailable there. The dispatcher in ggml-cuda.cu treats
 // a nullptr pipeline as "init failed" and silently falls back to the meta
 // backend's generic AllReduce.
-ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
+ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t, bool) {
     return nullptr;
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {

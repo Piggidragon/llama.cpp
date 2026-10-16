@@ -1023,6 +1023,9 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // with NCCL: reductions smaller than this many bytes go through the internal pipeline when it is set up
+    size_t                      nccl_min_bytes = 0;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1157,7 +1160,12 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
                            __func__, i, tensors[i]->data, (int) type, ne);
             return false;
         }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
+        // NCCL or the generic AllReduce of the meta backend takes the call
+        if ((ggml_nbytes(tensors[i]) & 0xF) != 0) {
+            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] size %zu is not a multiple of 16 bytes\n",
+                           __func__, i, ggml_nbytes(tensors[i]));
+            return false;
+        }
     }
 
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
@@ -1172,6 +1180,11 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 #ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    // the internal pipeline returns false before it enqueues anything, NCCL then takes the call
+    if (comm_ctx->ar_pipeline != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
+            ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
 #endif // GGML_USE_NCCL
@@ -1215,7 +1228,47 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     ggml_backend_cuda_comm_init_none(ret);
 }
 
-static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+#ifdef GGML_USE_NCCL
+// Without peer access NCCL exchanges the data through host memory as well.  A small reduction is then bound by the
+// latency of the handshake, where the in-kernel handshake of the internal pipeline is faster: with an RTX 4070 on
+// PCIe 4.0 x16 and an RTX 3060 on PCIe 3.0 x4, a Qwen3.8-27B decode step of 1-4 tokens runs 9-12% faster through it.
+// From 32 tokens (640 KiB per reduction) on NCCL is faster.  GGML_CUDA_AR_NCCL_MIN_BYTES sets the size from which
+// NCCL is used, 0 uses NCCL for everything.
+static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
+    if (ret->dev_ids.size() != 2) {
+        return;
+    }
+
+    size_t min_bytes = 512*1024;
+    if (const char * env = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES")) {
+        min_bytes = std::strtoull(env, nullptr, 10);
+    } else {
+        int can_access = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
+        if (can_access) {
+            // NCCL takes the peer path, which has not been measured against the internal pipeline
+            return;
+        }
+    }
+
+    if (min_bytes == 0) {
+        return;
+    }
+
+    // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
+    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
+    if (ret->ar_pipeline == nullptr) {
+        (void) cudaGetLastError();
+        return;
+    }
+
+    ret->nccl_min_bytes = min_bytes;
+    GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, min_bytes);
+}
+#endif // GGML_USE_NCCL
+
+// hybrid: also set up the internal pipeline for small reductions, see ggml_backend_cuda_comm_init_hybrid()
+static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret, bool hybrid = false) {
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
@@ -1231,6 +1284,9 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        if (hybrid) {
+            ggml_backend_cuda_comm_init_hybrid(ret);
+        }
         return;
     }
 
@@ -1238,6 +1294,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
+    GGML_UNUSED(hybrid);
 #ifndef GGML_USE_HIP
     GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
                   "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
@@ -1269,7 +1326,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
 #if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
+        ggml_backend_cuda_comm_init_nccl(ret, /*hybrid =*/ true);
 #else
         ggml_backend_cuda_comm_init_internal(ret);
 #endif // defined(__linux__)

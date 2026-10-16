@@ -10,9 +10,11 @@ struct ggml_cuda_ar_pipeline;
 
 // Allocate a pipeline for n_devices GPUs.
 // devices[] holds the GPU device IDs in rank order.
+// small_only: every reduction takes the chunked kernel path and the copy-engine staging is not allocated, for a
+// caller that sends large reductions elsewhere.
 // Returns nullptr on allocation failure.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
-    const int * devices, size_t n_devices);
+    const int * devices, size_t n_devices, bool small_only = false);
 
 // Release all resources owned by the pipeline.
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * pipeline);
