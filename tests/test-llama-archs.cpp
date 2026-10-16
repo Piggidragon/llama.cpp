@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <random>
@@ -511,6 +512,22 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+static void test_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif // _WIN32
+}
+
+static void test_unsetenv(const char * name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif // _WIN32
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
@@ -555,7 +572,17 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
+    // the reductions of the test models stay below the 512 KiB from which the AllReduce paths by size use the copy
+    // engines: with a threshold of 4 KiB a single token still takes the small path and the ubatches the copy engines
+    // (read when the context creates its comm contexts)
+    const bool ce_small = allreduce_type != LLAMA_ALLREDUCE_TYPE_DEFAULT && getenv("GGML_CUDA_AR_CE_MIN_BYTES") == nullptr;
+    if (ce_small) {
+        test_setenv("GGML_CUDA_AR_CE_MIN_BYTES", "4096");
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+    if (ce_small) {
+        test_unsetenv("GGML_CUDA_AR_CE_MIN_BYTES");
+    }
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }

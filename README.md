@@ -1,6 +1,6 @@
 # What this fork adds
 
-Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the features below. Each one is off until you enable it; without the flags everything runs as upstream. The rest of this file is the upstream README.
+Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the features below. Each one is off until its flag enables it, except the changes to the server's RAM prompt cache, which are always on (see the prompt cache item). The rest of this file is the upstream README.
 
 ## Features
 
@@ -9,7 +9,12 @@ Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.c
   - Enable: `--flash-attn-native-quants` (`-fanq 1` in llama-bench) with a quantized cache, the same type for K and V (`-ctk q5_1 -ctv q5_1`). `q4_1`, `q5_0` and `q5_1` need `-DGGML_CUDA_FA_QUANTS=<pair>` or `all` at build time. [Details](docs/quantized-native-flash-attention.md)
 - **Prompt cache on disk.** A disk level below the RAM prompt cache. Prompts are stored as KV blocks keyed by their prefix, so conversations with a shared prefix share blocks, and a growing conversation writes only its new blocks.
   - Benefit: conversations survive RAM eviction, restarts and model swaps, and resume without processing the prompt again. The next turn of a 25k-token conversation writes 0.16 GB instead of 2.3 GB.
-  - Enable: `--cache-disk PATH` (server), sized with `--cache-disk-size` (MiB) and `--cache-block-size` (tokens). [Details](tools/server/README.md#prompt-cache-on-disk)
+  - Enable: `--cache-disk PATH` (server), sized with `--cache-disk-size` (MiB). [Details](tools/server/README.md#prompt-cache-on-disk)
+  - Always on, with the RAM prompt cache (`--cache-ram`, on by default):
+    - The RAM cache stores prompts as KV blocks of `--cache-block-size` tokens (default 2048).
+    - A cached prompt keeps only its newest 3 context checkpoints.
+    - The server restores a cached prompt into a slot when that prompt shares at least 256 more tokens with the request than the slot does.
+    - SIGINT and SIGTERM are handled on their own thread.
 - **Attention split** (`--split-mode tensor`). The attention heads and their KV cache get their own split across the GPUs, separate from `--tensor-split`.
   - Benefit: with GPUs of different speed, the faster one takes more of the weights while the other one holds more of the KV cache.
   - Enable: `--attn-split 1,3` (`-as`), next to e.g. `--tensor-split 0.625,0.375`. [Details](docs/multi-gpu.md)
