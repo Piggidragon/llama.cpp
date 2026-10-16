@@ -1271,14 +1271,19 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     // link either way. The same GPUs with BAR1 P2P: tg 36.9 -> 37.6 t/s and pp3 97.5 -> 99.7 against the internal
     // pipeline, with --split-overlap prompt processing 865 -> 1183 t/s against NCCL. A link with native peer atomics
     // (NVLink) keeps NCCL. GGML_CUDA_AR_P2P_SMALL and GGML_CUDA_AR_CE_P2P (0 or 1) override the choice.
+    // Peer access over PCIe is used only on request (GGML_CUDA_P2P, docs/multi-gpu.md), as in the rest of this
+    // backend: some platforms report it but corrupt or hang the transfers (IOMMU). NCCL_P2P_DISABLE also turns it
+    // off. Without it the GPUs are treated like GPUs without peer access.
     int native_atomics = 0;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (can_access) {
         CUDA_CHECK(cudaDeviceGetP2PAttribute(&native_atomics, cudaDevP2PAttrNativeAtomicSupported, ret->dev_ids[0], ret->dev_ids[1]));
     }
-    const bool p2p_pcie = can_access && !native_atomics;
+    const bool p2p_pcie = can_access && !native_atomics && ggml_cuda_p2p_enabled() && !ggml_cuda_env_flag("NCCL_P2P_DISABLE");
+    const bool peer     = p2p_pcie || (can_access && native_atomics);
 #else
     const bool p2p_pcie = false;
+    const bool peer     = can_access != 0;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     auto env_flag = [](const char * name, bool def) {
@@ -1287,9 +1292,9 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     };
 
     const char * env_min = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES");
-    const bool   small_p2p      = can_access && env_flag("GGML_CUDA_AR_P2P_SMALL", p2p_pcie);
-    const bool   small_internal = !small_p2p && (!can_access || env_min != nullptr);
-    const bool   large_ce       = can_access ? env_flag("GGML_CUDA_AR_CE_P2P", p2p_pcie) : env_flag("GGML_CUDA_AR_CE", true);
+    const bool   small_p2p      = peer && env_flag("GGML_CUDA_AR_P2P_SMALL", p2p_pcie);
+    const bool   small_internal = !small_p2p && (!peer || env_min != nullptr);
+    const bool   large_ce       = peer ? env_flag("GGML_CUDA_AR_CE_P2P", p2p_pcie) : env_flag("GGML_CUDA_AR_CE", true);
     if (!small_p2p && !small_internal && !large_ce) {
         return;
     }
@@ -1321,8 +1326,9 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     }
 
     if (large_ce) {
-        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size(), /*peer =*/ can_access != 0);
-        ret->ce_min_bytes = min_bytes;
+        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size(), /*peer =*/ peer);
+        // the copy engines take over where the small path ends: the peer-to-peer kernel handles at most 512 KiB
+        ret->ce_min_bytes = small_p2p && ret->p2p_ar != nullptr ? ret->nccl_min_bytes : min_bytes;
         if (const char * env = getenv("GGML_CUDA_AR_CE_MIN_BYTES")) {
             ret->ce_min_bytes = std::strtoull(env, nullptr, 10);
         }

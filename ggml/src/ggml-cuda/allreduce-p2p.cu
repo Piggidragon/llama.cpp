@@ -11,7 +11,8 @@
 //
 // Two slots alternate. GPU i writes slot k%2 of call k only after its kernel of call k-1 saw the arrival of the
 // other GPU for call k-1, which that GPU signals after its kernel of call k-2 has read slot k%2 (stream order).
-// The tokens grow, so a flag that already holds a later token also counts as arrived.
+// The tokens grow, so a flag that already holds a later token also counts as arrived. They wrap around at 2^32:
+// a flag counts as arrived when it is at most 2^31 - 1 ahead of the token, in unsigned arithmetic.
 
 static constexpr int     GGML_CUDA_P2P_AR_BLOCKS  = 8;
 static constexpr int     GGML_CUDA_P2P_AR_THREADS = 256;
@@ -21,14 +22,14 @@ struct ggml_cuda_p2p_ar {
     int devices[2] = { -1, -1 };
 
     nv_bfloat16 * recv [2] = {}; // device i: [slot][GGML_CUDA_P2P_AR_MAX_NE], written by the other GPU
-    int *         flags[2] = {}; // device i: [block], written by the other GPU
+    unsigned int * flags[2] = {}; // device i: [block], written by the other GPU
 
     unsigned int token = 0;
 };
 
 static __global__ void ggml_cuda_p2p_ar_kernel(
-        float * data, const bool compute, nv_bfloat16 * peer_recv, int * peer_flags,
-        const nv_bfloat16 * own_recv, const int * own_flags, const int64_t n, const int token) {
+        float * data, const bool compute, nv_bfloat16 * peer_recv, unsigned int * peer_flags,
+        const nv_bfloat16 * own_recv, const unsigned int * own_flags, const int64_t n, const unsigned int token) {
     const int64_t per   = (n + gridDim.x - 1) / gridDim.x;
     const int64_t i0    = blockIdx.x*per;
     const int64_t i1    = i0 + per < n ? i0 + per : n;
@@ -41,9 +42,9 @@ static __global__ void ggml_cuda_p2p_ar_kernel(
     if (threadIdx.x == 0) {
         // the data before the token, for the other GPU
         __threadfence_system();
-        *(volatile int *) &peer_flags[blockIdx.x] = token;
+        *(volatile unsigned int *) &peer_flags[blockIdx.x] = token;
 
-        while ((int) (*(const volatile int *) &own_flags[blockIdx.x] - token) < 0) {
+        while (*(const volatile unsigned int *) &own_flags[blockIdx.x] - token > 0x7fffffffu) {
         }
         __threadfence();
     }
@@ -102,8 +103,8 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
             ok = err == cudaSuccess;
         }
         ok = ok && cudaMalloc((void **) &ar->recv[i], 2*GGML_CUDA_P2P_AR_MAX_NE*sizeof(nv_bfloat16)) == cudaSuccess;
-        ok = ok && cudaMalloc((void **) &ar->flags[i], GGML_CUDA_P2P_AR_BLOCKS*sizeof(int)) == cudaSuccess;
-        ok = ok && cudaMemset(ar->flags[i], 0, GGML_CUDA_P2P_AR_BLOCKS*sizeof(int)) == cudaSuccess;
+        ok = ok && cudaMalloc((void **) &ar->flags[i], GGML_CUDA_P2P_AR_BLOCKS*sizeof(unsigned int)) == cudaSuccess;
+        ok = ok && cudaMemset(ar->flags[i], 0, GGML_CUDA_P2P_AR_BLOCKS*sizeof(unsigned int)) == cudaSuccess;
     }
 
     if (!ok) {
@@ -133,7 +134,7 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
     }
 
     ar->token++;
-    const int     token = (int) ar->token;
+    const unsigned int token = ar->token;
     const int64_t s_off = (ar->token % 2)*GGML_CUDA_P2P_AR_MAX_NE;
 
     for (int i = 0; i < 2; ++i) {
