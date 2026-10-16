@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_set>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <map>
@@ -686,16 +687,18 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // longest prefix of tokens_new that load() can restore from a cached prompt (RAM or disk)
-    size_t n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max) const;
+    // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
+    // for a slot that shares lcp_base tokens with it; lcp_base if there is none
+    size_t n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max, size_t lcp_base) const;
 
     void update();
 
     // remove the oldest state, handing it to the disk level if there is one
     void evict_oldest();
 
-    // hand all states to the disk level, newest first, and wait until they are written
-    void flush_to_disk();
+    // hand all states to the disk level, newest first, and optionally wait until they are written
+    // t_newest is the last use given to the newest state, the older ones get earlier times
+    void flush_to_disk(bool wait, std::filesystem::file_time_type t_newest);
 };
 
 // used exclusively by router mode

@@ -1733,7 +1733,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-size"}, "N",
-        string_format("set the maximum size of the --cache-disk directory in MiB (default: %d, -1 - no limit)", params.cache_disk_mib),
+        string_format("set the maximum size of the --cache-disk directory in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_mib),
         [](common_params & params, int value) {
             params.cache_disk_mib = value;
         }

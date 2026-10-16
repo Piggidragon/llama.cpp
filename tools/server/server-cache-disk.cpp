@@ -20,8 +20,10 @@ static constexpr uint32_t DISK_VERSION = 1;
 // blobs are written in chunks, so that fetch() can stop a write early
 static constexpr size_t DISK_CHUNK = 64ull*1024*1024;
 
-// free space the disk level leaves on the file system
-static constexpr size_t DISK_RESERVE = 1024ull*1024*1024;
+// free space the disk level leaves on the file system: 5% of it, at least 1 GiB
+static size_t disk_reserve(const fs::space_info & space) {
+    return std::max<size_t>(1024ull*1024*1024, space.capacity / 20);
+}
 
 static constexpr double MiB = 1024.0*1024.0;
 
@@ -179,7 +181,7 @@ size_t server_prompt_cache_disk::size() const {
 
 size_t server_prompt_cache_disk::n_entries() const {
     std::lock_guard<std::mutex> lk(mtx);
-    return entries.size();
+    return std::count_if(entries.begin(), entries.end(), [](const entry & e) { return !e.foreign; });
 }
 
 void server_prompt_cache_disk::erase_entry(std::list<entry>::iterator it) {
@@ -204,7 +206,8 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
     for (auto it = entries.begin(); it != entries.end();) {
         auto next = std::next(it);
 
-        if (&*it != &cur && !it->busy() && it->tokens.size() <= cur.tokens.size() &&
+        // a waiting entry is left alone: fetch() may wait for it after a cancelled write
+        if (&*it != &cur && !it->busy() && !it->pending && !it->foreign && it->tokens.size() <= cur.tokens.size() &&
             cur.tokens.get_common_prefix(it->tokens) == it->tokens.size()) {
             SRV_TRC("disk prompt cache: removing prompt with %zu tokens, contained in the new one\n", it->tokens.size());
             erase_entry(it);
@@ -214,43 +217,60 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
     }
 }
 
-bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep) {
+bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_point t_new) {
     if (limit_size > 0 && size_new > limit_size) {
         return false;
     }
 
-    while (true) {
-        bool fits = limit_size == 0 || size_on_disk() + size_new <= limit_size;
+    // bytes to free for the size limit, and to keep the reserve free on the file system
+    size_t need = 0;
 
-        if (fits && size_new > 0) {
-            std::error_code ec;
-            const auto space = fs::space(fs::u8path(dir), ec);
-            fits = ec || space.available >= size_new + DISK_RESERVE;
-        }
-
-        if (fits) {
-            return true;
-        }
-
-        // remove the least recently used file
-        auto it_lru = entries.end();
-        for (auto it = entries.begin(); it != entries.end(); ++it) {
-            if (!it->on_disk || it->busy() || it->pending || it->id == id_keep) {
-                continue;
-            }
-            if (it_lru == entries.end() || it->t_used < it_lru->t_used) {
-                it_lru = it;
-            }
-        }
-
-        if (it_lru == entries.end()) {
-            return false;
-        }
-
-        SRV_INF("disk prompt cache: removing least recently used prompt with %zu tokens (%.3f MiB)\n", it_lru->tokens.size(), it_lru->size / MiB);
-
-        erase_entry(it_lru);
+    const size_t size_cur = size_on_disk();
+    if (limit_size > 0 && size_cur + size_new > limit_size) {
+        need = size_cur + size_new - limit_size;
     }
+
+    if (size_new > 0) {
+        std::error_code ec;
+        const auto space = fs::space(fs::u8path(dir), ec);
+        const size_t reserve = ec ? 0 : disk_reserve(space);
+        if (!ec && space.available < size_new + reserve) {
+            need = std::max<size_t>(need, size_new + reserve - space.available);
+        }
+    }
+
+    if (need == 0) {
+        return true;
+    }
+
+    // least recently used files first, and only files used before the new state
+    std::vector<std::list<entry>::iterator> lru;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->on_disk && !it->busy() && !it->pending && it->id != id_keep && it->t_used < t_new) {
+            lru.push_back(it);
+        }
+    }
+    std::sort(lru.begin(), lru.end(), [](const auto & a, const auto & b) { return a->t_used < b->t_used; });
+
+    // count the freed bytes from the file sizes: a copy-on-write file system can report the free space later
+    size_t n_free  = 0;
+    size_t n_evict = 0;
+    while (n_evict < lru.size() && n_free < need) {
+        n_free += lru[n_evict++]->size;
+    }
+
+    if (n_free < need) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n_evict; ++i) {
+        SRV_INF("disk prompt cache: removing least recently used %s with %zu tokens (%.3f MiB)\n",
+                lru[i]->foreign ? "file of another fingerprint" : "prompt", lru[i]->tokens.size(), lru[i]->size / MiB);
+
+        erase_entry(lru[i]);
+    }
+
+    return true;
 }
 
 void server_prompt_cache_disk::scan() {
@@ -266,17 +286,35 @@ void server_prompt_cache_disk::scan() {
             const std::string name = fs_path_to_utf8(de.path().filename());
             const std::string path = fs_path_to_utf8(de.path());
 
-            if (name.rfind(prefix, 0) != 0 || !de.is_regular_file()) {
+            if (name.rfind("pc-", 0) != 0 || !de.is_regular_file()) {
                 continue;
             }
 
+            const bool own = name.rfind(prefix, 0) == 0;
+
             if (ends_with(name, ".tmp")) {
-                // left behind by an interrupted write
-                fs::remove(de.path(), ec);
+                // left behind by an interrupted write (another fingerprint may still be writing its own)
+                if (own) {
+                    fs::remove(de.path(), ec);
+                }
                 continue;
             }
 
             if (!ends_with(name, ".bin")) {
+                continue;
+            }
+
+            if (!own) {
+                entries.emplace_back();
+
+                auto & e = entries.back();
+                e.id      = id_next++;
+                e.path    = path;
+                e.size    = de.file_size();
+                e.t_used  = de.last_write_time();
+                e.on_disk = true;
+                e.foreign = true;
+
                 continue;
             }
 
@@ -301,13 +339,15 @@ void server_prompt_cache_disk::scan() {
         SRV_WRN("disk prompt cache: failed to scan '%s': %s\n", dir.c_str(), err.what());
     }
 
-    make_room(0, -1);
+    make_room(0, -1, time_point::max());
 
-    SRV_INF("disk prompt cache: %zu prompt(s), %.3f MiB in '%s' (limit: %.3f MiB)\n",
-            entries.size(), size_on_disk() / MiB, dir.c_str(), limit_size / MiB);
+    const size_t n_own = std::count_if(entries.begin(), entries.end(), [](const entry & e) { return !e.foreign; });
+
+    SRV_INF("disk prompt cache: %zu prompt(s), %zu file(s) of other fingerprints, %.3f MiB in '%s' (limit: %.3f MiB)\n",
+            n_own, entries.size() - n_own, size_on_disk() / MiB, dir.c_str(), limit_size / MiB);
 }
 
-void server_prompt_cache_disk::put(server_prompt_cache_state && state) {
+void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_point t_used, bool bounded) {
     const size_t n_tokens = state.prompt.tokens.size();
     if (n_tokens == 0) {
         return;
@@ -344,7 +384,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state) {
     const size_t size_state = state.size();
 
     // the disk is behind: drop the oldest waiting states to bound the memory they hold
-    while (limit_pending > 0 && size_pending + size_state > limit_pending) {
+    while (bounded && limit_pending > 0 && size_pending + size_state > limit_pending) {
         auto it_old = entries.end();
         for (const int64_t id : queue) {
             auto it = find_entry(id);
@@ -372,7 +412,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state) {
     e.tokens   = state.prompt.tokens.clone();
     e.size     = size_state;
     e.size_mem = size_state;
-    e.t_used   = fs::file_time_type::clock::now();
+    e.t_used   = t_used;
     e.pending  = std::make_unique<server_prompt_cache_state>(std::move(state));
 
     queue.push_back(e.id);
@@ -402,7 +442,7 @@ int64_t server_prompt_cache_disk::find(const server_tokens & tokens_new, size_t 
     int64_t id_best = -1;
 
     for (const auto & e : entries) {
-        if (e.tokens.size() > n_tokens_max) {
+        if (e.foreign || e.n_fail >= 2 || e.tokens.size() > n_tokens_max) {
             continue;
         }
 
@@ -437,7 +477,15 @@ bool server_prompt_cache_disk::fetch(int64_t id, server_prompt_cache_state & out
     if (it->writing) {
         // stop the write at the next chunk, the writer keeps the state for us
         it->cancel = true;
-        cv.wait(lk, [&]() { return !it->writing; });
+        cv.wait(lk, [&]() {
+            auto cur = find_entry(id);
+            return cur == entries.end() || !cur->writing;
+        });
+
+        it = find_entry(id);
+        if (it == entries.end()) {
+            return false;
+        }
     }
 
     if (it->pending) {
@@ -468,20 +516,30 @@ bool server_prompt_cache_disk::fetch(int64_t id, server_prompt_cache_state & out
 
     const int64_t t_start = ggml_time_us();
 
-    const bool ok = read_file(path, out, false);
+    // the entry is not erased while it is being read, so it stays valid
+    bool ok      = false;
+    bool corrupt = false;
+    try {
+        ok      = read_file(path, out, false);
+        corrupt = !ok;
+    } catch (const std::exception & err) {
+        SRV_WRN("disk prompt cache: failed to read '%s': %s\n", path.c_str(), err.what());
+    }
 
     lk.lock();
 
     it->reading = false;
 
     if (!ok) {
-        SRV_WRN("disk prompt cache: failed to read '%s', removing it\n", path.c_str());
-        erase_entry(it);
+        if (corrupt) {
+            SRV_WRN("disk prompt cache: '%s' is corrupt, removing it\n", path.c_str());
+            erase_entry(it);
+        }
         cv.notify_all();
         return false;
     }
 
-    it->t_used = fs::file_time_type::clock::now();
+    it->t_used = time_point::clock::now();
 
     std::error_code ec;
     fs::last_write_time(fs::u8path(path), it->t_used, ec);
@@ -494,13 +552,23 @@ bool server_prompt_cache_disk::fetch(int64_t id, server_prompt_cache_state & out
     return true;
 }
 
-void server_prompt_cache_disk::remove(int64_t id) {
-    std::lock_guard<std::mutex> lk(mtx);
+void server_prompt_cache_disk::restore_failed(int64_t id, server_prompt_cache_state && state) {
+    {
+        std::lock_guard<std::mutex> lk(mtx);
 
-    auto it = find_entry(id);
-    if (it != entries.end() && !it->busy()) {
-        erase_entry(it);
+        auto it = find_entry(id);
+        if (it != entries.end() && it->on_disk) {
+            it->n_fail++;
+
+            SRV_WRN("disk prompt cache: prompt with %zu tokens did not restore (%d time(s))%s\n",
+                    it->tokens.size(), it->n_fail, it->n_fail >= 2 ? ", not using it any more" : "");
+
+            return;
+        }
     }
+
+    // it was taken back from the queue, write it after all
+    put(std::move(state));
 }
 
 void server_prompt_cache_disk::flush() {
@@ -530,7 +598,7 @@ void server_prompt_cache_disk::worker_loop() {
             continue;
         }
 
-        if (!make_room(it->size_mem, id)) {
+        if (!make_room(it->size_mem, id, it->t_used)) {
             SRV_WRN("disk prompt cache: no room for prompt with %zu tokens (%.3f MiB), dropping it\n", it->tokens.size(), it->size_mem / MiB);
             erase_entry(it);
             cv.notify_all();
@@ -544,16 +612,27 @@ void server_prompt_cache_disk::worker_loop() {
 
         const server_prompt_cache_state & state = *it->pending;
 
+        const time_point t_used = it->t_used;
+
         lk.unlock();
 
         const int64_t t_start = ggml_time_us();
 
-        bool ok = write_file(path_tmp, state, it->cancel);
+        bool ok = false;
+        try {
+            ok = write_file(path_tmp, state, it->cancel);
+        } catch (const std::exception & err) {
+            SRV_WRN("disk prompt cache: failed to write '%s': %s\n", path_tmp.c_str(), err.what());
+        }
 
         std::error_code ec;
         if (ok) {
             fs::rename(fs::u8path(path_tmp), fs::u8path(path), ec);
             ok = !ec;
+        }
+        if (ok) {
+            // the mtime keeps the LRU order over restarts
+            fs::last_write_time(fs::u8path(path), t_used, ec);
         }
         if (!ok) {
             fs::remove(fs::u8path(path_tmp), ec);
@@ -568,7 +647,6 @@ void server_prompt_cache_disk::worker_loop() {
         if (ok) {
             it->on_disk = true;
             it->size    = fs::file_size(fs::u8path(path), ec);
-            it->t_used  = fs::file_time_type::clock::now();
 
             SRV_INF("disk prompt cache: wrote prompt with %zu tokens (%.3f MiB) in %.2f s, %.3f MiB on disk\n",
                     it->tokens.size(), it->size / MiB, t_s, size_on_disk() / MiB);
@@ -581,7 +659,7 @@ void server_prompt_cache_disk::worker_loop() {
 
             drop_superseded(*it);
 
-            make_room(0, id);
+            make_room(0, id, it->t_used);
         } else if (!it->cancel) {
             SRV_WRN("disk prompt cache: failed to write '%s', dropping prompt with %zu tokens\n", path.c_str(), it->tokens.size());
             erase_entry(it);

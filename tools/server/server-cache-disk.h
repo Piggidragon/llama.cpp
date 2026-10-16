@@ -21,19 +21,23 @@
 // cache outlives the process. files are written by a background thread: an evicted state stays in memory
 // until its file is complete, and a request that needs it in the meantime takes it back from the queue.
 //
-// file names start with a fingerprint of the model files, so several models can share one directory.
-// the size limit applies to the files of the current fingerprint only.
+// file names start with a fingerprint of the model files and of the settings that change the KV contents,
+// so several models can share one directory. files of other fingerprints are never loaded, but they count
+// toward the size limit and are removed first when they are the least recently used.
 struct server_prompt_cache_disk {
-    // limit_size:    bytes on disk, 0 = no limit
+    using time_point = std::filesystem::file_time_type;
+
+    // limit_size:    bytes in the directory, 0 = no limit
     // limit_pending: bytes of states waiting to be written, 0 = no limit; beyond it the oldest waiting state is dropped
     server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd);
 
     // writes the states still waiting before returning
     ~server_prompt_cache_disk();
 
-    // take a state evicted from RAM and write it in the background
+    // take a state evicted from RAM and write it in the background, t_used is its last use for the LRU order
     // nothing is written if an entry already holds these tokens or a continuation of them
-    void put(server_prompt_cache_state && state);
+    // bounded = false skips the limit on waiting states (the caller only moves states that are already in memory)
+    void put(server_prompt_cache_state && state, time_point t_used = time_point::clock::now(), bool bounded = true);
 
     // true if an entry (written or waiting) holds these tokens or a continuation of them
     bool contains(const server_tokens & tokens) const;
@@ -43,19 +47,23 @@ struct server_prompt_cache_disk {
     int64_t find(const server_tokens & tokens_new, size_t n_tokens_max, size_t & lcp_best) const;
 
     // move the state of an entry into out: a waiting state is taken back, a written one is read from its file
-    // a file that cannot be read is deleted
+    // a corrupt file is deleted
     bool fetch(int64_t id, server_prompt_cache_state & out);
 
-    // delete an entry and its file, used when its state does not restore into the context
-    void remove(int64_t id);
+    // the state fetched for id did not restore into the context (no room, ...): a file is kept but skipped
+    // after repeated failures, a state that was taken back is queued again
+    void restore_failed(int64_t id, server_prompt_cache_state && state);
 
     // block until all waiting states are written
     void flush();
 
     size_t n_entries() const;
 
-    // bytes of the written files
+    // bytes of the files in the directory
     size_t size() const;
+
+    const std::string & get_dir() const { return dir; }
+    uint64_t get_fingerprint()    const { return fingerprint; }
 
     // hash of the size and sampled content of the files and of the config string, 0 if a file cannot be read
     static uint64_t compute_fingerprint(const std::vector<std::string> & files, const std::string & config);
@@ -70,11 +78,14 @@ private:
         size_t size     = 0; // file size once written, state size while waiting
         size_t size_mem = 0; // bytes of the waiting state
 
-        std::filesystem::file_time_type t_used; // last use, kept as the file mtime
+        time_point t_used; // last use, kept as the file mtime
 
         bool on_disk = false;
+        bool foreign = false; // file of another fingerprint: counts toward the limit, never loaded
         bool writing = false;
         bool reading = false;
+
+        int n_fail = 0; // failed restores, the entry is skipped after 2
 
         // set by fetch() while the entry is being written, the writer then stops and keeps the state
         std::atomic<bool> cancel{false};
@@ -114,7 +125,7 @@ private:
 
     // must be called with mtx held
     size_t size_on_disk() const;
-    bool   make_room(size_t size_new, int64_t id_keep);
+    bool   make_room(size_t size_new, int64_t id_keep, time_point t_new);
     void   erase_entry(std::list<entry>::iterator it);
     void   drop_superseded(const entry & cur);
 

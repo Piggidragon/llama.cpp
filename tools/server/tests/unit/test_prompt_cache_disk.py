@@ -132,6 +132,55 @@ def test_other_model_files_ignored():
     assert os.path.exists(other)
 
 
+def n_tokens_in_file(path: str) -> int:
+    # header: u32 magic, u32 version, u64 fingerprint, u64 number of packed tokens
+    with open(path, "rb") as f:
+        f.seek(16)
+        return int.from_bytes(f.read(8), "little")
+
+
+def test_lru_order_kept_on_exit():
+    global server
+    server.start()
+
+    # A, then B, then C (C stays in the slot, A and B go to the RAM level)
+    for i, n in enumerate([20, 40, 60]):
+        complete(make_prompt(i)[: 12 * n])
+    server.stop()
+
+    files = sorted(cache_files(), key=os.path.getmtime)
+    assert len(files) == 3
+    # the newest state (the slot) gets the newest mtime, so it is evicted last
+    sizes = [n_tokens_in_file(f) for f in files]
+    assert sizes == sorted(sizes)
+
+
+def test_disk_size_zero_disables():
+    global server
+    server.cache_disk_size = 0
+    server.start()
+    log = LogReader(server.log_path)
+    assert "disk prompt cache disabled by --cache-disk-size 0" in log.drain()
+    complete(make_prompt(0))
+    server.stop()
+    assert len(cache_files()) == 0
+
+
+def test_other_fingerprints_count_toward_limit():
+    global server
+    # an old file of another fingerprint, larger than the limit
+    other = os.path.join(cache_dir, "pc-0000000000000000-0000000000000000.bin")
+    with open(other, "wb") as f:
+        f.write(b"\0" * (3 * 1024 * 1024))
+    os.utime(other, (1, 1))
+
+    server.cache_disk_size = 2
+    server.start()
+    log = LogReader(server.log_path)
+    assert "removing least recently used file of another fingerprint" in log.drain()
+    assert not os.path.exists(other)
+
+
 def test_corrupt_file_removed():
     global server
     server.start()
@@ -151,7 +200,7 @@ def test_corrupt_file_removed():
     log = LogReader(server.log_path)
 
     res = complete(make_prompt(0))
-    assert "disk prompt cache: failed to read" in log.drain()
+    assert "is corrupt, removing it" in log.drain()
     assert res["content"] == first["content"]
     assert not os.path.exists(files[0])
 

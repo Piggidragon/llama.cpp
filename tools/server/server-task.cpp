@@ -1738,14 +1738,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache, or send them to the disk level
-    const bool over_limit = limit_size > 0 && state_size_new > limit_size;
-    if (over_limit) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, %s\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), disk ? "writing it to disk" : "skipping");
-        if (!disk) {
-            return nullptr;
-        }
+    // skip over-limit entries to avoid disturbing the cache
+    if (limit_size > 0 && state_size_new > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
     }
 
     // remove any cached prompts that are fully contained in the current prompt
@@ -1761,7 +1758,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    if (limit_size > 0 && !over_limit) {
+    if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
@@ -1790,7 +1787,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    server_prompt_cache_state state = {
+    states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
@@ -1799,74 +1796,70 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-    };
-
-    if (over_limit) {
-        // as the oldest entry, the next update() hands it to the disk level without touching the others
-        states.push_front(std::move(state));
-
-        return &states.front();
-    }
-
-    states.push_back(std::move(state));
+    });
 
     return &states.back();
 }
 
 // restore a cached state into the sequence of a slot, the prompt takes its tokens and checkpoints
+// on failure the state is left as it was
 static bool prompt_cache_restore(server_prompt_cache_state & state, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     {
-        auto & data = state.data.main;
+        const auto & data = state.data.main;
 
-        const size_t size = data.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-        if (n != size) {
-            SRV_ERR("failed to restore state with size %zu\n", size);
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), id_slot, 0);
+        if (n != data.size()) {
+            SRV_ERR("failed to restore state with size %zu\n", data.size());
 
             return false;
         }
-
-        data.clear();
-        data.shrink_to_fit();
     }
 
     {
-        auto & data = state.data.drft;
+        const auto & data = state.data.drft;
 
         if (!data.empty()) {
             GGML_ASSERT(ctx_dft);
 
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_WRN("failed to restore state with size %zu\n", size);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), data.size(), id_slot, 0);
+            if (n != data.size()) {
+                SRV_WRN("failed to restore state with size %zu\n", data.size());
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
     }
+
+    state.data.main.clear();
+    state.data.main.shrink_to_fit();
+    state.data.drft.clear();
+    state.data.drft.shrink_to_fit();
 
     prompt = std::move(state.prompt);
 
     return true;
 }
 
-// a cached prompt is used only if the new prompt keeps at least 1/4 of it (don't trash large prompts)
-static bool prompt_cache_keeps(size_t lcp, size_t n_tokens) {
-    return float(lcp) / n_tokens >= 0.25f;
+// a cached prompt replaces the prompt of the slot (common prefix lcp_base with the new prompt) if:
+// - the new prompt keeps at least 1/4 of it (don't trash large prompts)
+// - it shares a longer prefix
+// - a prompt that only exists in RAM loses fewer tokens than it saves: the slot keeps only the common prefix
+static bool prompt_cache_better(size_t lcp_cur, size_t n_cur, size_t lcp_base, bool in_ram) {
+    if (float(lcp_cur) / n_cur < 0.25f || lcp_cur <= lcp_base) {
+        return false;
+    }
+
+    return !in_ram || n_cur - lcp_cur <= lcp_cur - lcp_base;
 }
 
-size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max) const {
-    size_t lcp_best = 0;
+size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max, size_t lcp_base) const {
+    size_t lcp_best = lcp_base;
 
     for (const auto & state : states) {
         const size_t lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
 
-        if (prompt_cache_keeps(lcp_cur, state.prompt.tokens.size())) {
-            lcp_best = std::max(lcp_best, lcp_cur);
+        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, state.prompt.tokens.size(), lcp_base, true)) {
+            lcp_best = lcp_cur;
         }
     }
 
@@ -1878,7 +1871,9 @@ size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t 
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    size_t lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const size_t lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+
+    size_t lcp_best = lcp_base;
 
     SRV_TRC(" - looking for better prompt, base lcp = %zu, f_sim = %.3f\n", lcp_best, float(lcp_best) / tokens_new.size());
 
@@ -1891,11 +1886,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC("   - prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur,
                 float(lcp_cur) / it->prompt.tokens.size(), float(lcp_cur) / tokens_new.size());
 
-        if (!prompt_cache_keeps(lcp_cur, it->prompt.tokens.size())) {
-            continue;
-        }
-
-        if (lcp_cur > lcp_best) {
+        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, it->prompt.tokens.size(), lcp_base, true)) {
             lcp_best = lcp_cur;
             it_best  = it;
         }
@@ -1912,7 +1903,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             if (disk->fetch(id, state)) {
                 if (!prompt_cache_restore(state, prompt, ctx_tgt, ctx_dft, id_slot)) {
-                    disk->remove(id);
+                    disk->restore_failed(id, std::move(state));
 
                     return false;
                 }
@@ -1947,16 +1938,22 @@ void server_prompt_cache::evict_oldest() {
     states.pop_front();
 }
 
-void server_prompt_cache::flush_to_disk() {
+void server_prompt_cache::flush_to_disk(bool wait, std::filesystem::file_time_type t_newest) {
     if (!disk) {
         return;
     }
 
-    // newest first, and one at a time so that put() does not drop states waiting to be written
+    // newest first, and one microsecond apart so that the LRU order on disk stays the same
+    // the states are moved, so the limit on waiting states does not apply
+    auto t_used = t_newest;
     while (!states.empty()) {
-        disk->put(std::move(states.back()));
+        disk->put(std::move(states.back()), t_used, false);
         states.pop_back();
 
+        t_used -= std::chrono::microseconds(1);
+    }
+
+    if (wait) {
         disk->flush();
     }
 }

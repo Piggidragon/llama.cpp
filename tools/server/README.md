@@ -341,11 +341,14 @@ services:
 
 ### Prompt cache on disk
 
-With `--cache-disk PATH`, the prompt cache (`--cache-ram`) gets a second level on disk. A prompt state that the RAM level evicts, or one larger than the RAM limit, is written to a file in `PATH` by a background thread instead of being dropped. When a later request shares a longer prefix with a file than with any slot or RAM entry, the state is read back, together with its context checkpoints. On exit (and before the server sleeps) the idle slots and the RAM entries are written as well, and on startup the files are indexed again, so the cache outlives the process.
+With `--cache-disk PATH`, the prompt cache (`--cache-ram`) gets a second level on disk. A prompt state that the RAM level evicts is written to a file in `PATH` by a background thread instead of being dropped. When a later request shares a longer prefix with a file than with any slot or RAM entry, the state is read back, together with its context checkpoints. On exit (and before the server sleeps) the idle slots and the RAM entries are written as well, and on startup the files are indexed again, so the cache outlives the process.
 
-- File names start with a fingerprint of the model, mmproj, draft model and LoRA files, so several models can share one directory; the files of other fingerprints are left alone. `--cache-disk-size` limits the files of the current fingerprint, the least recently used file is removed first.
+- File names start with a fingerprint of the model, mmproj, draft model, LoRA and control vector files and of the settings that change the KV contents (KV cache types, RoPE/YaRN, metadata overrides), so several models and configurations can share one directory. Files of other fingerprints are never loaded.
+- `--cache-disk-size` limits all files in the directory, including those of other fingerprints; the least recently used file is removed first. 5% of the file system (at least 1 GiB) is always left free. `--cache-disk-size 0` disables the disk level.
 - A state is written once: nothing is written if a file already holds the same tokens or a continuation of them, and a file whose tokens are a prefix of a new one is removed.
-- Writing on exit can take a while for large states. In router mode, raise `stop-timeout` of the model preset, else the router stops the instance before the files are complete (incomplete files are removed on the next start).
+- States larger than `--cache-ram` are not cached, as without the disk level. States waiting to be written may hold about half of `--cache-ram` on top of it; when the disk is slower than that, the oldest waiting states are dropped.
+- A file whose state does not restore (for example no free cells in a unified KV cache) is kept, and skipped after the second failure.
+- Writing on exit can take a while for large states. In router mode, raise `stop-timeout` of the model preset, else the router stops the instance before the files are complete (incomplete files are removed on the next start). Before sleeping, the states are only handed to the writer thread.
 
 ### Multimodal support
 

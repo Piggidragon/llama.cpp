@@ -1084,8 +1084,56 @@ private:
         mctx = nullptr;
     }
 
+    // identifies the model files and the settings that change the KV contents, for the disk level of the prompt cache
+    uint64_t prompt_cache_fingerprint() const {
+        std::vector<std::string> files = { params_base.model.path };
+        if (mctx) {
+            files.push_back(params_base.mmproj.path);
+        }
+        if (params_base.speculative.has_dft()) {
+            files.push_back(params_base.speculative.draft.mparams.path);
+        }
+
+        const auto & dft = params_base.speculative.draft;
+
+        std::string config = string_format("spec %s%s kv %s %s dft-kv %s %s rope %g %g %d yarn %g %g %g %g %d",
+                common_speculative_type_name_str(params_base.speculative.types).c_str(), ctx_dft ? " +dft" : "",
+                ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v),
+                ggml_type_name(dft.cache_type_k), ggml_type_name(dft.cache_type_v),
+                params_base.rope_freq_base, params_base.rope_freq_scale, (int) params_base.rope_scaling_type,
+                params_base.yarn_ext_factor, params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow,
+                params_base.yarn_orig_ctx);
+
+        for (const auto & la : params_base.lora_adapters) {
+            files.push_back(la.path);
+            config += string_format(" lora %g", la.scale);
+        }
+
+        for (const auto & cv : params_base.control_vectors) {
+            files.push_back(cv.fname);
+            config += string_format(" cvec %g", cv.strength);
+        }
+        config += string_format(" cvec-layers %d %d", params_base.control_vector_layer_start, params_base.control_vector_layer_end);
+
+        for (const auto & kvo : params_base.kv_overrides) {
+            if (kvo.key[0] == 0) {
+                continue;
+            }
+            config += string_format(" ovr %s=", kvo.key);
+            switch (kvo.tag) {
+                case LLAMA_KV_OVERRIDE_TYPE_INT:   config += std::to_string(kvo.val_i64);   break;
+                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: config += std::to_string(kvo.val_f64);   break;
+                case LLAMA_KV_OVERRIDE_TYPE_BOOL:  config += kvo.val_bool ? "true" : "false"; break;
+                case LLAMA_KV_OVERRIDE_TYPE_STR:   config += kvo.val_str;                   break;
+            }
+        }
+
+        return server_prompt_cache_disk::compute_fingerprint(files, config);
+    }
+
     // write the idle slots and the RAM level of the prompt cache to the disk level, before the context is freed
-    void prompt_cache_persist() {
+    // wait = false only queues the states for the writer thread: the sleeping callback runs with the task queue locked
+    void prompt_cache_persist(bool wait) {
         if (!prompt_cache || !prompt_cache->disk || ctx_tgt == nullptr) {
             return;
         }
@@ -1103,6 +1151,9 @@ private:
             return a->t_last_used > b->t_last_used;
         });
 
+        // one microsecond apart, so that the files keep the LRU order
+        auto t_used = std::filesystem::file_time_type::clock::now();
+
         for (auto * slot : order) {
             if (prompt_cache->disk->contains(slot->prompt.tokens)) {
                 continue;
@@ -1110,14 +1161,20 @@ private:
 
             server_prompt_cache_state state;
             if (slot->prompt_copy(state)) {
-                prompt_cache->disk->put(std::move(state));
-                prompt_cache->disk->flush();
+                prompt_cache->disk->put(std::move(state), t_used, false);
+
+                // one copy in memory at a time
+                if (wait) {
+                    prompt_cache->disk->flush();
+                }
             }
+
+            t_used -= std::chrono::microseconds(1);
         }
 
-        prompt_cache->flush_to_disk();
+        prompt_cache->flush_to_disk(wait, t_used);
 
-        SRV_INF("prompt cache written to disk in %.2f s\n", (ggml_time_us() - t_start) / 1e6);
+        SRV_INF("prompt cache %s disk in %.2f s\n", wait ? "written to" : "handed to the writer for", (ggml_time_us() - t_start) / 1e6);
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1128,7 +1185,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
-            prompt_cache_persist();
+            prompt_cache_persist(false);
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1558,28 +1615,20 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
+            // keep the disk level over a sleep, its writer may still be busy with the states it was given
+            std::unique_ptr<server_prompt_cache_disk> disk_prev = prompt_cache ? std::move(prompt_cache->disk) : nullptr;
+
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
 
-            if (!params_base.cache_disk_path.empty()) {
-                // states are only valid for the same model files
-                std::vector<std::string> files = { params_base.model.path };
-                if (mctx) {
-                    files.push_back(params_base.mmproj.path);
-                }
-                if (params_base.speculative.has_dft()) {
-                    files.push_back(params_base.speculative.draft.mparams.path);
-                }
-
-                std::string config = common_speculative_type_name_str(params_base.speculative.types) + (ctx_dft ? " +dft" : "");
-                for (const auto & la : params_base.lora_adapters) {
-                    files.push_back(la.path);
-                    config += string_format(" lora %g", la.scale);
-                }
-
-                const uint64_t fingerprint = server_prompt_cache_disk::compute_fingerprint(files, config);
+            if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
+                SRV_INF("%s", "disk prompt cache disabled by --cache-disk-size 0\n");
+            } else if (!params_base.cache_disk_path.empty()) {
+                const uint64_t fingerprint = prompt_cache_fingerprint();
 
                 if (fingerprint == 0) {
                     SRV_WRN("%s", "disk prompt cache disabled: cannot fingerprint the model files\n");
+                } else if (disk_prev && disk_prev->get_fingerprint() == fingerprint && disk_prev->get_dir() == params_base.cache_disk_path) {
+                    prompt_cache->disk = std::move(disk_prev);
                 } else {
                     const size_t limit_disk = params_base.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*params_base.cache_disk_mib;
 
@@ -1850,7 +1899,7 @@ private:
                     // the slot keeps most of its prompt, but a cached prompt may share a much longer prefix with the task
                     // (e.g. the slot holds another conversation with the same system prompt)
                     const size_t lcp_slot  = ret->prompt.tokens.get_common_prefix(task.tokens);
-                    const size_t lcp_cache = prompt_cache->n_lcp_best(task.tokens, llama_n_ctx_seq(ctx_tgt));
+                    const size_t lcp_cache = prompt_cache->n_lcp_best(task.tokens, llama_n_ctx_seq(ctx_tgt), lcp_slot);
 
                     if (lcp_cache >= lcp_slot + n_lcp_cache_min) {
                         SLT_INF(*ret, "prompt cache shares a longer prefix with the task (%zu > %zu tokens)\n", lcp_cache, lcp_slot);
@@ -4813,7 +4862,7 @@ void server_context::start_loop() {
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 
     if (!impl->sleeping) {
-        impl->prompt_cache_persist();
+        impl->prompt_cache_persist(true);
     }
 }
 
