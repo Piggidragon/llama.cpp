@@ -1294,7 +1294,7 @@ public:
 
     size_t          size()  const { return buf ? buf->size : 0; }
     bool            empty() const { return size() == 0; }
-    const uint8_t * data()  const { return buf ? buf->data.get() : nullptr; }
+    const uint8_t * data()  const { return buf ? buf->data : nullptr; }
 
     // writable bytes, copied first if another copy shares them (not data(): reading must never copy)
     uint8_t * wdata();
@@ -1309,11 +1309,14 @@ public:
 
 private:
     struct storage {
-        std::unique_ptr<uint8_t[]> data;
-        size_t                     size = 0;
+        uint8_t * data = nullptr;
+        size_t    size = 0;
 
-        // a large buffer goes back to a small pool, see common_bytes::resize()
+        explicit storage(size_t n);
         ~storage();
+
+        storage(const storage &) = delete;
+        storage & operator=(const storage &) = delete;
     };
 
     std::shared_ptr<storage> buf;

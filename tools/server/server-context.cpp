@@ -2706,6 +2706,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // a checkpoint of this task's tokens at this position exists, e.g. the slot was just restored from it:
+        // keep it instead of copying the same state again
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & cur : slot.prompt.checkpoints) {
+                if (cur.n_tokens == n_tokens_new && cur.pos_min == pos_min && cur.pos_max == pos_max &&
+                        cur.id_task != -1 && !cur.data_tgt.empty() && (ctx_dft == nullptr || !cur.data_dft.empty())) {
+                    SLT_TRC(slot, "keeping the context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
+                    cur.id_task = id_task; // spared by the min-step eviction like a new one
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint

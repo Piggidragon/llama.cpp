@@ -26,7 +26,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -61,6 +60,10 @@
 
 #if defined(_AIX)
 #include <sys/systemcfg.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/mman.h>
 #endif
 
 #if defined(_MSC_VER)
@@ -2363,60 +2366,34 @@ bool common_prompt_batch_decode(
 
 namespace {
 
-// Freed buffers of common_bytes, reused by resize() for the same size: the context checkpoints of a model all have
-// one size, and a reused buffer is already mapped - a new one page-faults while the device copies the state into it.
-struct common_bytes_pool {
-    static constexpr size_t min_size  = 1u << 20;
-    static constexpr size_t max_count = 3;
-    static constexpr size_t max_bytes = 1ull << 30;
+// Large buffers ask for transparent huge pages: a device writes a state into them a few hundred KiB at a time, and
+// faulting the buffer in 4 KiB pages takes longer than the copy (a 150 MB checkpoint from two GPUs: 85 ms instead of 49 ms).
+constexpr size_t bytes_huge_page = 2u << 20;
 
-    std::mutex mtx;
-    std::vector<std::pair<size_t, std::unique_ptr<uint8_t[]>>> free;
-    size_t free_bytes = 0;
-
-    std::unique_ptr<uint8_t[]> take(size_t n) {
-        if (n < min_size) {
-            return nullptr;
+uint8_t * bytes_alloc(size_t n) {
+    void * p = nullptr;
+#if defined(__linux__)
+    if (n >= bytes_huge_page) {
+        if (posix_memalign(&p, bytes_huge_page, n) != 0) {
+            throw std::bad_alloc();
         }
-        std::lock_guard<std::mutex> lock(mtx);
-        for (auto it = free.begin(); it != free.end(); ++it) {
-            if (it->first == n) {
-                auto res = std::move(it->second);
-                free_bytes -= n;
-                free.erase(it);
-                return res;
-            }
-        }
-        return nullptr;
+        madvise(p, n, MADV_HUGEPAGE); // a hint, the buffer works without it
+        return (uint8_t *) p;
     }
-
-    void give(size_t n, std::unique_ptr<uint8_t[]> && buf) {
-        if (n < min_size || n > max_bytes) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(mtx);
-        // the oldest ones make room
-        while (!free.empty() && (free.size() >= max_count || free_bytes + n > max_bytes)) {
-            free_bytes -= free.front().first;
-            free.erase(free.begin());
-        }
-        free.emplace_back(n, std::move(buf));
-        free_bytes += n;
+#endif
+    p = malloc(n);
+    if (!p) {
+        throw std::bad_alloc();
     }
-};
-
-// never destroyed: buffers can be released during static destruction
-common_bytes_pool & bytes_pool() {
-    static common_bytes_pool * pool = new common_bytes_pool;
-    return *pool;
+    return (uint8_t *) p;
 }
 
 }
+
+common_bytes::storage::storage(size_t n) : data(bytes_alloc(n)), size(n) {} // not zeroed
 
 common_bytes::storage::~storage() {
-    if (data) {
-        bytes_pool().give(size, std::move(data));
-    }
+    free(data);
 }
 
 uint8_t * common_bytes::wdata() {
@@ -2424,13 +2401,11 @@ uint8_t * common_bytes::wdata() {
         return nullptr;
     }
     if (buf.use_count() > 1) {
-        auto own = std::make_shared<storage>();
-        own->data.reset(new uint8_t[buf->size]);
-        own->size = buf->size;
-        memcpy(own->data.get(), buf->data.get(), buf->size);
+        auto own = std::make_shared<storage>(buf->size);
+        memcpy(own->data, buf->data, buf->size);
         buf = std::move(own);
     }
-    return buf->data.get();
+    return buf->data;
 }
 
 void common_bytes::resize(size_t n) {
@@ -2438,13 +2413,7 @@ void common_bytes::resize(size_t n) {
         buf.reset();
         return;
     }
-    auto own = std::make_shared<storage>();
-    own->data = bytes_pool().take(n);
-    if (!own->data) {
-        own->data.reset(new uint8_t[n]); // default-initialized: not zeroed
-    }
-    own->size = n;
-    buf = std::move(own);
+    buf = std::make_shared<storage>(n);
 }
 
 size_t common_prompt_checkpoint::size() const {
