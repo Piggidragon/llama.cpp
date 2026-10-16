@@ -58,13 +58,13 @@ def block_files():
 
 
 def head_blocks(path: str) -> list[int]:
-    # head: u32 magic, u32 version, u64 fingerprint, u64 n + n packed tokens, u32 n_blocks + n_blocks u64 keys
+    # head: u32 magic, u32 version, u64 fingerprint, u64 n + n packed tokens, u32 n_blocks + n_blocks 16-byte keys
     with open(path, "rb") as f:
         f.seek(16)
         n_packed = int.from_bytes(f.read(8), "little")
         f.seek(24 + 4 * n_packed)
         n_blocks = int.from_bytes(f.read(4), "little")
-        return [int.from_bytes(f.read(8), "little") for _ in range(n_blocks)]
+        return [int.from_bytes(f.read(16), "little") for _ in range(n_blocks)]
 
 
 # distinct prompts of about 150 tokens each, so that a few of them fill the 1 MiB RAM level
@@ -321,3 +321,202 @@ def test_shared_prefix_blocks_stored_once():
     keys_a, keys_b = (set(head_blocks(h)) for h in heads)
     assert len(keys_a & keys_b) > 0
     assert len(block_files()) == len(keys_a | keys_b)
+
+
+def tokens_of(seed: int, n: int) -> list[int]:
+    return [10 + ((seed * 13 + k * 7) % 480) for k in range(n)]
+
+
+def complete_tokens(tokens: list[int]):
+    res = server.make_request("POST", "/completion", data={"prompt": tokens, "cache_prompt": True})
+    assert res.status_code == 200
+    return res.body
+
+
+def run_once(opts: dict, prompt: list[int]):
+    global server
+    server = make_server()
+    server.n_ctx = 2048
+    for k, v in opts.items():
+        setattr(server, k, v)
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete_tokens(prompt)
+    server.stop()
+    return res, log.drain()
+
+
+def test_attention_layout_change_gets_own_files():
+    # flash attention changes the layout of the V cache: the old files must not be used or shared
+    prompt = tokens_of(0, 300)
+
+    res, _ = run_once({"fa": "off", "cache_block_size": 32}, prompt)
+    assert res["timings"]["cache_n"] == 0
+
+    res, log = run_once({"fa": "on", "cache_block_size": 32}, prompt)
+    assert "file(s) of other fingerprints" in log and " 0 prompt(s)" in log
+    assert "did not restore" not in log and "is corrupt" not in log
+    assert res["timings"]["cache_n"] == 0
+
+    # the new layout restores its own files
+    res, log = run_once({"fa": "on", "cache_block_size": 32}, prompt)
+    assert "did not restore" not in log
+    assert res["timings"]["cache_n"] > 250
+
+
+def test_block_size_change_keeps_cache():
+    # blocks of another size have other keys: the old prompt still restores, the new one writes its own blocks
+    prompt = tokens_of(0, 300)
+
+    run_once({"cache_block_size": 32}, prompt)
+    n_before = len(block_files())
+
+    res, log = run_once({"cache_block_size": 64}, prompt + tokens_of(1, 100))
+    assert "disk prompt cache: read prompt" in log
+    assert "is corrupt" not in log and "did not restore" not in log
+    assert res["timings"]["cache_n"] > 250
+    assert len(block_files()) > n_before
+
+    res, log = run_once({"cache_block_size": 64}, prompt + tokens_of(1, 100))
+    assert "is corrupt" not in log and "did not restore" not in log
+    assert res["timings"]["cache_n"] > 350
+
+
+def test_large_prompt_with_shared_blocks_skipped():
+    # a prompt larger than --cache-ram is not cached, also when it shares blocks with cached prompts
+    global server
+    server.cache_block_size = 32
+    server.n_ctx = 4096
+    server.n_predict = 2
+    server.start()
+    log = LogReader(server.log_path)
+
+    system = tokens_of(0, 400)
+    x = system + tokens_of(1, 500)
+    complete_tokens(tokens_of(2, 300))
+    complete_tokens(x)
+    complete_tokens(tokens_of(4, 50))
+    complete_tokens(system + tokens_of(3, 1300))
+    complete_tokens(tokens_of(5, 50))
+    assert "exceeds cache size limit" in log.drain()
+
+    # x is still cached in RAM
+    res = complete_tokens(x)
+    assert res["timings"]["cache_n"] > 800
+
+
+def test_corrupt_block_written_again():
+    global server
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    prompt = tokens_of(0, 300)
+    first = complete_tokens(prompt)
+    server.stop()
+
+    blocks = sorted(block_files())
+    assert len(blocks) > 2
+    with open(blocks[1], "r+b") as f:
+        f.truncate(os.path.getsize(blocks[1]) // 2)
+
+    server = make_server()
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete_tokens(prompt)
+    assert "is corrupt, removing it" in log.drain()
+    assert res["content"] == first["content"]
+    server.stop()
+
+    # the next write of the prompt writes the block again
+    server = make_server()
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete_tokens(prompt)
+    assert "disk prompt cache: read prompt" in log.drain()
+    assert res["timings"]["cache_n"] > 250
+
+
+def test_other_fingerprint_evicted_with_its_blocks():
+    # the heads of another fingerprint are evicted with the blocks that only they hold
+    global server
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.ctk = "f32"
+    server.start()
+    complete_tokens(tokens_of(0, 300))
+    server.stop()
+    other = set(cache_files())
+    assert len(other) > 2
+
+    # both prompts together are more than 1 MiB, the new one alone fits
+    server = make_server()
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.cache_disk_size = 1
+    server.start()
+    complete_tokens(tokens_of(1, 1200))
+    server.stop()
+    assert len(head_files()) == 1
+
+    # the other model's prompt is gone completely, no orphan blocks are left
+    assert not (other & set(cache_files()))
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_hybrid_restore_at_checkpoint():
+    # a hybrid model stores a prompt at its newest checkpoint; the restored state continues like a fresh one
+    global server
+
+    def run(cache):
+        global server
+        server = make_server()
+        server.model_hf_repo = None
+        server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+        server.n_ctx = 4096
+        server.cache_block_size = 256
+        server.n_predict = 16
+        if not cache:
+            server.cache_disk = None
+        server.start()
+        log = LogReader(server.log_path)
+        prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(500))
+        first = complete(prompt)
+        res = complete(prompt + first["content"] + " And then the story goes on.")
+        server.stop()
+        return first, res, log.drain()
+
+    first, res, _ = run(cache=True)
+
+    # restart: the conversation comes back from disk at the checkpoint
+    server = make_server()
+    server.model_hf_repo = None
+    server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    server.n_ctx = 4096
+    server.cache_block_size = 256
+    server.n_predict = 16
+    server.start()
+    log = LogReader(server.log_path)
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(500))
+    cont = prompt + first["content"] + " And then the story goes on." + res["content"] + " The end."
+    restored = complete(cont)
+    content = log.drain()
+    server.stop()
+    assert "disk prompt cache: read prompt" in content
+    assert "forcing full prompt re-processing" not in content
+    assert restored["timings"]["cache_n"] > 1000
+
+    # the same request on a server without cache gives the same text
+    server = make_server()
+    server.model_hf_repo = None
+    server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    server.n_ctx = 4096
+    server.n_predict = 16
+    server.cache_disk = None
+    server.start()
+    fresh = complete(cont)
+    server.stop()
+    assert restored["content"] == fresh["content"]

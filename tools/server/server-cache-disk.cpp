@@ -20,6 +20,7 @@ static constexpr uint32_t DISK_MAGIC       = 0x44435053; // "SPCD"
 static constexpr uint32_t DISK_MAGIC_HEAD  = 0x48435053; // "SPCH"
 static constexpr uint32_t DISK_MAGIC_BLOCK = 0x4b435053; // "SPCK"
 static constexpr uint32_t DISK_VERSION     = 1;
+static constexpr uint32_t DISK_VERSION_KV  = 2; // heads and blocks: 128-bit SHA-256 block keys
 
 // blobs are written in chunks, so that fetch() can stop a write early
 static constexpr size_t DISK_CHUNK = 64ull*1024*1024;
@@ -168,8 +169,8 @@ std::list<server_prompt_cache_disk::entry>::iterator server_prompt_cache_disk::f
     return std::find_if(entries.begin(), entries.end(), [id](const entry & e) { return e.id == id; });
 }
 
-std::string server_prompt_cache_disk::block_path(uint64_t key) const {
-    return fs_path_to_utf8(fs::u8path(dir) / fs::u8path(prefix + "k" + hex64(key) + ".bin"));
+std::string server_prompt_cache_disk::block_path(const server_kv_key & key) const {
+    return fs_path_to_utf8(fs::u8path(dir) / fs::u8path(prefix + "k" + hex64(key.a) + hex64(key.b) + ".bin"));
 }
 
 size_t server_prompt_cache_disk::size_on_disk() const {
@@ -198,8 +199,8 @@ size_t server_prompt_cache_disk::n_entries() const {
 }
 
 void server_prompt_cache_disk::release_blocks(const entry & e) {
-    for (const uint64_t key : e.blocks) {
-        auto it = blocks.find(key);
+    for (const auto & key : e.blocks) {
+        auto it = blocks.find({ e.fp, key });
         if (it == blocks.end() || --it->second.refs > 0) {
             continue;
         }
@@ -286,7 +287,7 @@ bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_
 
     // an entry frees its file and the blocks that no other entry holds
     // the bytes are counted from the file sizes: a copy-on-write file system can report the free space later
-    std::unordered_map<uint64_t, int> refs;
+    std::unordered_map<block_id, int, block_id_hash> refs;
 
     size_t n_free  = 0;
     size_t n_evict = 0;
@@ -295,13 +296,15 @@ bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_
 
         n_free += e.size;
 
-        for (const uint64_t key : e.blocks) {
-            auto it = blocks.find(key);
+        for (const auto & key : e.blocks) {
+            const block_id id { e.fp, key };
+
+            auto it = blocks.find(id);
             if (it == blocks.end()) {
                 continue;
             }
 
-            auto res = refs.emplace(key, it->second.refs);
+            auto res = refs.emplace(id, it->second.refs);
             if (--res.first->second == 0 && it->second.on_disk) {
                 n_free += it->second.size;
             }
@@ -335,11 +338,19 @@ void server_prompt_cache_disk::scan() {
             const std::string name = fs_path_to_utf8(de.path().filename());
             const std::string path = fs_path_to_utf8(de.path());
 
-            if (name.rfind("pc-", 0) != 0 || !de.is_regular_file()) {
+            // pc-<16 hex digits of the fingerprint>-<kind and hash>
+            if (name.rfind("pc-", 0) != 0 || name.size() <= prefix.size() || name[prefix.size() - 1] != '-' || !de.is_regular_file()) {
                 continue;
             }
 
-            const bool own = name.rfind(prefix, 0) == 0;
+            uint64_t fp = 0;
+            try {
+                fp = std::stoull(name.substr(3, 16), nullptr, 16);
+            } catch (...) {
+                continue;
+            }
+
+            const bool own = fp == fingerprint;
 
             if (ends_with(name, ".tmp")) {
                 // left behind by an interrupted write (another fingerprint may still be writing its own)
@@ -353,46 +364,39 @@ void server_prompt_cache_disk::scan() {
                 continue;
             }
 
-            if (!own) {
-                entries.emplace_back();
-
-                auto & e = entries.back();
-                e.id      = id_next++;
-                e.path    = path;
-                e.size    = de.file_size();
-                e.t_used  = de.last_write_time();
-                e.on_disk = true;
-                e.foreign = true;
-
-                continue;
-            }
-
             // a KV block: 'k', a head of a ranged state: 'h', a whole state: hex digits
-            const char kind = name.size() > prefix.size() ? name[prefix.size()] : 0;
+            const char kind = name[prefix.size()];
 
             if (kind == 'k') {
                 server_kv_block block;
-                if (!read_block(path, block, true)) {
+                if (read_block(path, fp, block, true)) {
+                    auto & b = blocks[{ fp, block.key }];
+                    b.path    = path;
+                    b.size    = de.file_size();
+                    b.on_disk = true;
+                    continue;
+                }
+
+                if (own) {
                     SRV_WRN("disk prompt cache: removing unreadable file '%s'\n", path.c_str());
                     fs::remove(de.path(), ec);
                     continue;
                 }
 
-                auto & b = blocks[block.key];
-                b.path    = path;
-                b.size    = de.file_size();
-                b.on_disk = true;
-
-                continue;
+                // another fingerprint in a format this version does not read: a file the LRU can evict
             }
 
-            server_prompt_cache_state state;
-            std::vector<uint64_t>     keys;
+            server_prompt_cache_state  state;
+            std::vector<server_kv_key> keys;
 
-            const bool ranged = kind == 'h';
-            const bool ok     = ranged ? read_head(path, state, keys, true) : read_file(path, state, true);
+            bool ok = false;
+            if (kind == 'h') {
+                ok = read_head(path, fp, state, keys, true);
+            } else if (kind != 'k' && own) {
+                ok = read_file(path, state, true);
+            }
 
-            if (!ok) {
+            if (!ok && own) {
                 SRV_WRN("disk prompt cache: removing unreadable file '%s'\n", path.c_str());
                 fs::remove(de.path(), ec);
                 continue;
@@ -403,12 +407,17 @@ void server_prompt_cache_disk::scan() {
             auto & e = entries.back();
             e.id      = id_next++;
             e.path    = path;
-            e.tokens  = std::move(state.prompt.tokens);
-            e.ranged  = ranged;
+            e.fp      = fp;
+            e.ranged  = kind == 'h' && ok;
             e.blocks  = std::move(keys);
             e.size    = de.file_size();
             e.t_used  = de.last_write_time();
             e.on_disk = true;
+            e.foreign = !own;
+
+            if (own) {
+                e.tokens = std::move(state.prompt.tokens);
+            }
         }
     } catch (const std::exception & err) {
         SRV_WRN("disk prompt cache: failed to scan '%s': %s\n", dir.c_str(), err.what());
@@ -416,37 +425,61 @@ void server_prompt_cache_disk::scan() {
 
     // a head whose blocks are missing cannot be restored
     for (auto it = entries.begin(); it != entries.end();) {
-        const bool complete = std::all_of(it->blocks.begin(), it->blocks.end(), [this](uint64_t key) { return blocks.count(key) > 0; });
-        if (!complete) {
-            SRV_WRN("disk prompt cache: removing '%s', a KV block of it is missing\n", it->path.c_str());
-            fs::remove(fs::u8path(it->path), ec);
-            it = entries.erase(it);
-            continue;
+        const uint64_t fp = it->fp;
+
+        auto missing = [&](const server_kv_key & key) { return blocks.count({ fp, key }) == 0; };
+
+        if (std::any_of(it->blocks.begin(), it->blocks.end(), missing)) {
+            if (!it->foreign) {
+                SRV_WRN("disk prompt cache: removing '%s', a KV block of it is missing\n", it->path.c_str());
+                fs::remove(fs::u8path(it->path), ec);
+                it = entries.erase(it);
+                continue;
+            }
+            // another server may still be writing it: count only the blocks that exist
+            it->blocks.erase(std::remove_if(it->blocks.begin(), it->blocks.end(), missing), it->blocks.end());
         }
 
-        for (const uint64_t key : it->blocks) {
-            blocks[key].refs++;
+        for (const auto & key : it->blocks) {
+            blocks[{ fp, key }].refs++;
         }
 
         ++it;
     }
 
-    // blocks that no head holds, left behind by an interrupted write
+    // blocks that no head holds: own ones are left behind by an interrupted write, other ones may still get their
+    // head from another server, so they become files that the LRU can evict
     for (auto it = blocks.begin(); it != blocks.end();) {
-        if (it->second.refs == 0) {
-            fs::remove(fs::u8path(it->second.path), ec);
-            it = blocks.erase(it);
-        } else {
+        if (it->second.refs > 0) {
             ++it;
+            continue;
         }
+
+        if (it->first.fp == fingerprint) {
+            fs::remove(fs::u8path(it->second.path), ec);
+        } else {
+            entries.emplace_back();
+
+            auto & e = entries.back();
+            e.id      = id_next++;
+            e.path    = it->second.path;
+            e.fp      = it->first.fp;
+            e.size    = it->second.size;
+            e.t_used  = fs::last_write_time(fs::u8path(it->second.path), ec);
+            e.on_disk = true;
+            e.foreign = true;
+        }
+
+        it = blocks.erase(it);
     }
 
     make_room(0, -1, time_point::max());
 
-    const size_t n_own = std::count_if(entries.begin(), entries.end(), [](const entry & e) { return !e.foreign; });
+    const size_t n_own        = std::count_if(entries.begin(), entries.end(), [](const entry & e) { return !e.foreign; });
+    const size_t n_own_blocks = std::count_if(blocks.begin(), blocks.end(), [this](const auto & it) { return it.first.fp == fingerprint; });
 
     SRV_INF("disk prompt cache: %zu prompt(s) with %zu KV block(s), %zu file(s) of other fingerprints, %.3f MiB in '%s' (limit: %.3f MiB)\n",
-            n_own, blocks.size(), entries.size() - n_own, size_on_disk() / MiB, dir.c_str(), limit_size / MiB);
+            n_own, n_own_blocks, entries.size() - n_own + blocks.size() - n_own_blocks, size_on_disk() / MiB, dir.c_str(), limit_size / MiB);
 }
 
 void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_point t_used, bool bounded) {
@@ -488,7 +521,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     // bytes the state adds to the queue: its own data and the blocks that are neither on disk nor waiting
     size_t size_state = state.size_own();
     for (const auto & block : state.data.blocks) {
-        auto it = blocks.find(block->key);
+        auto it = blocks.find({ fingerprint, block->key });
         if (it == blocks.end() || (!it->second.on_disk && !it->second.data)) {
             size_state += block->size();
         }
@@ -520,6 +553,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     auto & e = entries.back();
     e.id       = id_next++;
     e.path     = fs_path_to_utf8(fs::u8path(dir) / fs::u8path(name));
+    e.fp       = fingerprint;
     e.tokens   = state.prompt.tokens.clone();
     e.ranged   = ranged;
     e.size     = size_state;
@@ -529,7 +563,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     for (const auto & block : state.data.blocks) {
         e.blocks.push_back(block->key);
 
-        auto & b = blocks[block->key];
+        auto & b = blocks[{ fingerprint, block->key }];
         b.refs++;
         if (!b.on_disk && !b.data) {
             b.path = block_path(block->key);
@@ -639,49 +673,51 @@ bool server_prompt_cache_disk::fetch(int64_t id, server_prompt_cache_state & out
     const bool        ranged = it->ranged;
 
     // the blocks cannot be removed while the entry is being read, it holds them
-    std::vector<std::pair<uint64_t, std::string>> block_files;
-    for (const uint64_t key : it->blocks) {
-        block_files.emplace_back(key, blocks.at(key).path);
+    std::vector<std::pair<server_kv_key, std::string>> block_files;
+    for (const auto & key : it->blocks) {
+        block_files.emplace_back(key, blocks.at({ fingerprint, key }).path);
     }
 
     lk.unlock();
 
     const int64_t t_start = ggml_time_us();
 
-    bool     ok          = false;
-    bool     corrupt     = false;
-    uint64_t key_corrupt = 0;
-    size_t   n_read      = 0;
+    bool          ok            = false;
+    bool          corrupt       = false;
+    bool          block_corrupt = false;
+    server_kv_key key_corrupt;
+    size_t        n_read        = 0;
 
     try {
         if (!ranged) {
             ok = read_file(path, out, false);
             corrupt = !ok;
         } else {
-            std::vector<uint64_t> keys;
-            ok = read_head(path, out, keys, false);
+            std::vector<server_kv_key> keys;
+            ok = read_head(path, fingerprint, out, keys, false);
             corrupt = !ok;
 
             // the head lists the same blocks as the index, in position order without gaps; a block of
             // another head that failed to read is not on disk any more
             size_t n_end = 0;
             for (size_t i = 0; ok && i < block_files.size(); ++i) {
-                const uint64_t key = block_files[i].first;
+                const server_kv_key & key = block_files[i].first;
 
                 server_kv_block_ptr block = source ? source(key) : nullptr;
                 if (!block) {
                     auto block_new = std::make_shared<server_kv_block>();
-                    if (!read_block(block_files[i].second, *block_new, false) || block_new->key != key) {
-                        ok          = false;
-                        corrupt     = true;
-                        key_corrupt = key;
+                    if (!read_block(block_files[i].second, fingerprint, *block_new, false) || !(block_new->key == key)) {
+                        ok            = false;
+                        corrupt       = true;
+                        block_corrupt = true;
+                        key_corrupt   = key;
                         break;
                     }
                     n_read += block_new->size();
                     block = std::move(block_new);
                 }
 
-                if (i >= keys.size() || keys[i] != key || block->n_begin != n_end) {
+                if (i >= keys.size() || !(keys[i] == key) || block->n_begin != n_end) {
                     ok      = false;
                     corrupt = true;
                     break;
@@ -705,10 +741,10 @@ bool server_prompt_cache_disk::fetch(int64_t id, server_prompt_cache_state & out
     it->reading = false;
 
     if (!ok) {
-        if (key_corrupt != 0) {
+        if (block_corrupt) {
             // the other heads that hold the block fail when they are read
             // a new state that holds the block writes it again
-            auto bit = blocks.find(key_corrupt);
+            auto bit = blocks.find({ fingerprint, key_corrupt });
             if (bit != blocks.end() && bit->second.on_disk) {
                 SRV_WRN("disk prompt cache: KV block '%s' is corrupt, removing it\n", bit->second.path.c_str());
                 std::error_code ec;
@@ -802,9 +838,9 @@ void server_prompt_cache_disk::worker_loop() {
         const server_prompt_cache_state & state = *it->pending;
 
         // the blocks to write: the worker is the only writer, so a block written for another entry is on disk already
-        std::vector<std::pair<uint64_t, server_kv_block_ptr>> todo;
-        for (const uint64_t key : it->blocks) {
-            const auto & b = blocks.at(key);
+        std::vector<std::pair<server_kv_key, server_kv_block_ptr>> todo;
+        for (const auto & key : it->blocks) {
+            const auto & b = blocks.at({ fingerprint, key });
             if (!b.on_disk) {
                 todo.emplace_back(key, b.data);
             }
@@ -816,7 +852,7 @@ void server_prompt_cache_disk::worker_loop() {
 
         bool ok = true;
 
-        std::vector<std::pair<uint64_t, size_t>> written; // key, file size
+        std::vector<std::pair<server_kv_key, size_t>> written; // key, file size
         size_t n_written = 0;
 
         std::error_code ec;
@@ -868,7 +904,7 @@ void server_prompt_cache_disk::worker_loop() {
 
         // the blocks are on disk even if the head failed: an erased entry removes them again
         for (const auto & [key, size] : written) {
-            auto bit = blocks.find(key);
+            auto bit = blocks.find({ fingerprint, key });
             if (bit != blocks.end()) {
                 bit->second.on_disk = true;
                 bit->second.size    = size;
@@ -905,9 +941,9 @@ void server_prompt_cache_disk::worker_loop() {
 
 // ranged state: a head file and one file per KV block, native byte order
 //   head:  u32 magic, u32 version, u64 fingerprint, u64 n + n x llama_token (server_tokens::serialize()),
-//          u32 n_blocks + n_blocks x u64 key, then the KV after the blocks (target, draft) and the partial state
+//          u32 n_blocks + n_blocks x 2 u64 key, then the KV after the blocks (target, draft) and the partial state
 //          (target, draft), each as u64 n + n bytes
-//   block: u32 magic, u32 version, u64 fingerprint, u64 key, u64 n_begin, u64 n_end, then the KV (target, draft)
+//   block: u32 magic, u32 version, u64 fingerprint, 2 u64 key, u64 n_begin, u64 n_end, then the KV (target, draft)
 
 bool server_prompt_cache_disk::write_head(const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const {
     disk_file f(path, "wb");
@@ -919,14 +955,15 @@ bool server_prompt_cache_disk::write_head(const std::string & path, const server
     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
 
     f.write_val<uint32_t>(DISK_MAGIC_HEAD);
-    f.write_val<uint32_t>(DISK_VERSION);
+    f.write_val<uint32_t>(DISK_VERSION_KV);
     f.write_val<uint64_t>(fingerprint);
     f.write_val<uint64_t>(packed.size() / sizeof(llama_token));
     f.write(packed.data(), packed.size());
 
     f.write_val<uint32_t>((uint32_t) state.data.blocks.size());
     for (const auto & block : state.data.blocks) {
-        f.write_val<uint64_t>(block->key);
+        f.write_val<uint64_t>(block->key.a);
+        f.write_val<uint64_t>(block->key.b);
     }
 
     if (!write_blob(f, state.data.tail_tgt, cancel) ||
@@ -939,7 +976,7 @@ bool server_prompt_cache_disk::write_head(const std::string & path, const server
     return f.sync();
 }
 
-bool server_prompt_cache_disk::read_head(const std::string & path, server_prompt_cache_state & out, std::vector<uint64_t> & keys, bool header_only) const {
+bool server_prompt_cache_disk::read_head(const std::string & path, uint64_t fp, server_prompt_cache_state & out, std::vector<server_kv_key> & keys, bool header_only) const {
     std::error_code ec;
     const size_t file_size = fs::file_size(fs::u8path(path), ec);
     if (ec) {
@@ -949,8 +986,8 @@ bool server_prompt_cache_disk::read_head(const std::string & path, server_prompt
     disk_file f(path, "rb");
 
     if (f.read_val<uint32_t>() != DISK_MAGIC_HEAD ||
-        f.read_val<uint32_t>() != DISK_VERSION    ||
-        f.read_val<uint64_t>() != fingerprint     || !f.ok) {
+        f.read_val<uint32_t>() != DISK_VERSION_KV ||
+        f.read_val<uint64_t>() != fp              || !f.ok) {
         return false;
     }
 
@@ -973,12 +1010,15 @@ bool server_prompt_cache_disk::read_head(const std::string & path, server_prompt
     }
 
     const uint32_t n_blocks = f.read_val<uint32_t>();
-    if (!f.ok || n_blocks > (file_size - f.n) / sizeof(uint64_t)) {
+    if (!f.ok || n_blocks > (file_size - f.n) / (2*sizeof(uint64_t))) {
         return false;
     }
 
     keys.resize(n_blocks);
-    f.read(keys.data(), n_blocks * sizeof(uint64_t));
+    for (auto & key : keys) {
+        key.a = f.read_val<uint64_t>();
+        key.b = f.read_val<uint64_t>();
+    }
     if (!f.ok) {
         return false;
     }
@@ -1006,9 +1046,10 @@ bool server_prompt_cache_disk::write_block(const std::string & path, const serve
     }
 
     f.write_val<uint32_t>(DISK_MAGIC_BLOCK);
-    f.write_val<uint32_t>(DISK_VERSION);
+    f.write_val<uint32_t>(DISK_VERSION_KV);
     f.write_val<uint64_t>(fingerprint);
-    f.write_val<uint64_t>(block.key);
+    f.write_val<uint64_t>(block.key.a);
+    f.write_val<uint64_t>(block.key.b);
     f.write_val<uint64_t>(block.n_begin);
     f.write_val<uint64_t>(block.n_end);
 
@@ -1020,7 +1061,7 @@ bool server_prompt_cache_disk::write_block(const std::string & path, const serve
     return f.sync();
 }
 
-bool server_prompt_cache_disk::read_block(const std::string & path, server_kv_block & out, bool header_only) const {
+bool server_prompt_cache_disk::read_block(const std::string & path, uint64_t fp, server_kv_block & out, bool header_only) const {
     std::error_code ec;
     const size_t file_size = fs::file_size(fs::u8path(path), ec);
     if (ec) {
@@ -1030,12 +1071,13 @@ bool server_prompt_cache_disk::read_block(const std::string & path, server_kv_bl
     disk_file f(path, "rb");
 
     if (f.read_val<uint32_t>() != DISK_MAGIC_BLOCK ||
-        f.read_val<uint32_t>() != DISK_VERSION     ||
-        f.read_val<uint64_t>() != fingerprint      || !f.ok) {
+        f.read_val<uint32_t>() != DISK_VERSION_KV  ||
+        f.read_val<uint64_t>() != fp               || !f.ok) {
         return false;
     }
 
-    out.key     = f.read_val<uint64_t>();
+    out.key.a   = f.read_val<uint64_t>();
+    out.key.b   = f.read_val<uint64_t>();
     out.n_begin = f.read_val<uint64_t>();
     out.n_end   = f.read_val<uint64_t>();
 

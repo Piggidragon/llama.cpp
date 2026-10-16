@@ -1060,6 +1060,13 @@ private:
                 params_base.yarn_ext_factor, params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow,
                 params_base.yarn_orig_ctx);
 
+        // the layout of the stored state: KV streams, V transposition (flash attention), SWA cache size and
+        // Hadamard rotation of quantized K/V (the block size is part of the block keys instead)
+        const char * rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+        config += string_format(" seq %u unified %d fa %s swa-full %d rot-disable %s",
+                llama_n_seq_max(ctx_tgt), params_base.kv_unified ? 1 : 0, llama_flash_attn_type_name(params_base.flash_attn_type),
+                params_base.swa_full ? 1 : 0, rot_disable ? rot_disable : "");
+
         for (const auto & la : params_base.lora_adapters) {
             files.push_back(la.path);
             config += string_format(" lora %g", la.scale);

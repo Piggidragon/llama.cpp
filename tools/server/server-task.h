@@ -644,13 +644,31 @@ struct server_prompt {
     }
 };
 
+// identifies the KV of a block: SHA-256 over the key of the previous block and the tokens of the block, so over
+// all tokens up to its end, truncated to 128 bits. a crafted prompt cannot take the key of another prompt's block
+struct server_kv_key {
+    uint64_t a = 0;
+    uint64_t b = 0;
+
+    bool operator==(const server_kv_key & other) const {
+        return a == other.a && b == other.b;
+    }
+};
+
+struct server_kv_key_hash {
+    size_t operator()(const server_kv_key & key) const {
+        return key.a ^ (key.b * 0x9e3779b97f4a7c15ull);
+    }
+};
+
 // a block of the KV cache of a prompt: the cells of tokens [n_begin, n_end) that can be rolled back
-// (llama_state_seq_get_data_range). the key hashes tokens [0, n_end), so blocks with the same key hold the same
-// KV and are shared between prompts, in RAM and on disk
+// (llama_state_seq_get_data_range). blocks with the same key hold the same KV and are shared between prompts,
+// in RAM and on disk
 struct server_kv_block {
-    uint64_t key     = 0;
-    size_t   n_begin = 0;
-    size_t   n_end   = 0;
+    server_kv_key key;
+
+    size_t n_begin = 0;
+    size_t n_end   = 0;
 
     std::vector<uint8_t> tgt;
     std::vector<uint8_t> dft;
@@ -762,7 +780,10 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     // a KV block held by a cached prompt in RAM, nullptr if there is none
-    server_kv_block_ptr find_block(uint64_t key);
+    server_kv_block_ptr find_block(const server_kv_key & key);
+
+    // bytes of the cache with an extra state added, blocks shared between prompts counted once
+    size_t size_with(const server_prompt_cache_state * extra) const;
 
     // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
     // for a slot that shares lcp_base tokens with it; lcp_base if there is none
@@ -775,7 +796,7 @@ struct server_prompt_cache {
 
 private:
     // the KV blocks held in RAM, by key
-    std::unordered_map<uint64_t, std::weak_ptr<const server_kv_block>> blocks_ram;
+    std::unordered_map<server_kv_key, std::weak_ptr<const server_kv_block>, server_kv_key_hash> blocks_ram;
 
 public:
     // hand all states to the disk level, newest first, and optionally wait until they are written

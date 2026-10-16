@@ -1,6 +1,12 @@
 #include "server-task.h"
 #include "server-cache-disk.h"
 
+#include <cstring>
+
+extern "C" {
+#include "hash/sha256/sha256.h"
+}
+
 #include "build-info.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -1707,11 +1713,15 @@ std::list<common_prompt_checkpoint> server_prompt_cache::newest_checkpoints(cons
 }
 
 size_t server_prompt_cache::size() const {
+    return size_with(nullptr);
+}
+
+size_t server_prompt_cache::size_with(const server_prompt_cache_state * extra) const {
     std::unordered_set<const server_kv_block *> seen;
 
     size_t res = 0;
 
-    for (const auto & state : states) {
+    auto add = [&](const server_prompt_cache_state & state) {
         res += state.size_own();
 
         // blocks shared between prompts count once
@@ -1720,6 +1730,14 @@ size_t server_prompt_cache::size() const {
                 res += block->size();
             }
         }
+    };
+
+    for (const auto & state : states) {
+        add(state);
+    }
+
+    if (extra) {
+        add(*extra);
     }
 
     return res;
@@ -1735,18 +1753,29 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-static constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ull;
+// the token range is part of the key, so that blocks of different sizes never share a key
+static server_kv_key block_key(const server_kv_key & prev, const server_tokens & tokens, size_t i0, size_t i1) {
+    const uint64_t range[2] = { (uint64_t) i0, (uint64_t) i1 };
 
-static uint64_t hash_tokens(uint64_t h, const server_tokens & tokens, size_t i0, size_t i1) {
+    sha256_t ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const unsigned char *) &prev.a, sizeof(prev.a));
+    sha256_update(&ctx, (const unsigned char *) &prev.b, sizeof(prev.b));
+    sha256_update(&ctx, (const unsigned char *) range,   sizeof(range));
+
     for (size_t i = i0; i < i1; ++i) {
         const llama_token tok = tokens[i];
-        const auto * p = (const uint8_t *) &tok;
-        for (size_t j = 0; j < sizeof(tok); ++j) {
-            h ^= p[j];
-            h *= 0x100000001b3ull;
-        }
+        sha256_update(&ctx, (const unsigned char *) &tok, sizeof(tok));
     }
-    return h;
+
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_final(&ctx, digest);
+
+    server_kv_key key;
+    memcpy(&key.a, digest,     sizeof(key.a));
+    memcpy(&key.b, digest + 8, sizeof(key.b));
+
+    return key;
 }
 
 // a prompt is stored in KV blocks if the memory supports state ranges, and only for text: positions follow
@@ -1781,7 +1810,7 @@ static std::vector<uint8_t> state_partial(llama_context * ctx, int32_t id_slot) 
     return buf;
 }
 
-server_kv_block_ptr server_prompt_cache::find_block(uint64_t key) {
+server_kv_block_ptr server_prompt_cache::find_block(const server_kv_key & key) {
     auto it = blocks_ram.find(key);
     if (it == blocks_ram.end()) {
         return nullptr;
@@ -1824,10 +1853,10 @@ bool server_prompt_cache::copy_state(const server_prompt & prompt, llama_context
         const size_t n_full = n / n_block * n_block;
 
         // full blocks, shared with the cached prompts that hold the same tokens
-        uint64_t key = FNV_OFFSET;
+        server_kv_key key;
 
         for (size_t i0 = 0; i0 < n_full; i0 += n_block) {
-            key = hash_tokens(key, prompt.tokens, i0, i0 + n_block);
+            key = block_key(key, prompt.tokens, i0, i0 + n_block);
 
             server_kv_block_ptr block = find_block(key);
             if (!block) {
@@ -1912,7 +1941,8 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
     }
 
     // bytes the state adds: its own data and the blocks no cached prompt holds yet
-    size_t size_new = state.size_own();
+    const size_t size_new = size_with(&state) - size();
+
     size_t n_shared = 0;
     {
         std::unordered_set<const server_kv_block *> held;
@@ -1922,21 +1952,18 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
             }
         }
         for (const auto & block : state.data.blocks) {
-            if (held.count(block.get())) {
-                n_shared++;
-            } else {
-                size_new += block->size();
-            }
+            n_shared += held.count(block.get());
         }
     }
 
-    SRV_TRC(" - saving prompt with length %d, new state size = %.3f MiB (%zu of %zu blocks shared)\n",
-            prompt.n_tokens(), size_new / (1024.0 * 1024.0), n_shared, state.data.blocks.size());
+    SRV_TRC(" - saving prompt with length %d, state size = %.3f MiB, new = %.3f MiB (%zu of %zu blocks shared)\n",
+            prompt.n_tokens(), state.size() / (1024.0 * 1024.0), size_new / (1024.0 * 1024.0), n_shared, state.data.blocks.size());
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && size_new > limit_size) {
+    // the whole state counts: making room may evict the prompts it shares blocks with
+    if (limit_size > 0 && state.size() > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                state.size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return false;
     }
 
@@ -1954,7 +1981,7 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
     }
 
     if (limit_size > 0) {
-        while (!states.empty() && size() + size_new > limit_size) {
+        while (!states.empty() && size_with(&state) > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
@@ -2162,7 +2189,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             server_prompt_cache_state state;
 
             // blocks that RAM entries hold are not read from disk
-            auto source = [this](uint64_t key) { return find_block(key); };
+            auto source = [this](const server_kv_key & key) { return find_block(key); };
 
             if (disk->fetch(id, state, source)) {
                 if (!prompt_cache_restore(state, prompt, ctx_tgt, ctx_dft, id_slot)) {

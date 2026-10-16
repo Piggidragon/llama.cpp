@@ -28,14 +28,15 @@
 // tokens, so a conversation that grows writes only its new blocks. a state of a memory without ranges is written
 // as one file.
 //
-// file names start with a fingerprint of the model files and of the settings that change the KV contents,
-// so several models can share one directory. files of other fingerprints are never loaded, but they count
-// toward the size limit and are removed first when they are the least recently used.
+// file names start with a fingerprint of the model files and of the settings that change the KV contents or the
+// state format, so several models and configurations can share one directory. files of other fingerprints are
+// never loaded, but they count toward the size limit: their heads are evicted by LRU like the own ones, with the
+// blocks that no other head of their fingerprint holds.
 struct server_prompt_cache_disk {
     using time_point = std::filesystem::file_time_type;
 
     // KV blocks that the RAM level holds, so that fetch() does not read them from disk; may return nullptr
-    using block_source = std::function<server_kv_block_ptr(uint64_t key)>;
+    using block_source = std::function<server_kv_block_ptr(const server_kv_key & key)>;
 
     // limit_size:    bytes in the directory, 0 = no limit
     // limit_pending: bytes of states waiting to be written, 0 = no limit; beyond it the oldest waiting state is dropped
@@ -83,12 +84,14 @@ private:
         int64_t     id;
         std::string path;
 
+        uint64_t fp = 0; // fingerprint of the file
+
         server_tokens tokens;
 
         bool ranged = false;
 
         // keys of the KV blocks of a ranged state, in position order
-        std::vector<uint64_t> blocks;
+        std::vector<server_kv_key> blocks;
 
         size_t size     = 0; // file size once written, state size while waiting
         size_t size_mem = 0; // bytes of the waiting state that are not on disk yet
@@ -111,7 +114,22 @@ private:
         bool busy() const { return writing || reading; }
     };
 
-    // a KV block file, shared by the heads that list its key
+    // a KV block file, shared by the heads of its fingerprint that list its key
+    struct block_id {
+        uint64_t      fp;
+        server_kv_key key;
+
+        bool operator==(const block_id & other) const {
+            return fp == other.fp && key == other.key;
+        }
+    };
+
+    struct block_id_hash {
+        size_t operator()(const block_id & id) const {
+            return server_kv_key_hash()(id.key) ^ id.fp;
+        }
+    };
+
     struct block {
         std::string path;
 
@@ -139,7 +157,7 @@ private:
     std::list<entry>    entries;
     std::deque<int64_t> queue; // ids of the entries waiting to be written, oldest first
 
-    std::unordered_map<uint64_t, block> blocks;
+    std::unordered_map<block_id, block, block_id_hash> blocks;
 
     size_t  size_pending = 0;
     int64_t id_next      = 0;
@@ -153,7 +171,7 @@ private:
 
     void scan();
 
-    std::string block_path(uint64_t key) const;
+    std::string block_path(const server_kv_key & key) const;
 
     // must be called with mtx held
     size_t size_on_disk() const;
@@ -165,7 +183,7 @@ private:
     bool write_file (const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const;
     bool read_file  (const std::string & path, server_prompt_cache_state & out, bool tokens_only) const;
     bool write_head (const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const;
-    bool read_head  (const std::string & path, server_prompt_cache_state & out, std::vector<uint64_t> & keys, bool header_only) const;
+    bool read_head  (const std::string & path, uint64_t fp, server_prompt_cache_state & out, std::vector<server_kv_key> & keys, bool header_only) const;
     bool write_block(const std::string & path, const server_kv_block & block, const std::atomic<bool> & cancel) const;
-    bool read_block (const std::string & path, server_kv_block & out, bool header_only) const;
+    bool read_block (const std::string & path, uint64_t fp, server_kv_block & out, bool header_only) const;
 };
