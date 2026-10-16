@@ -1,5 +1,7 @@
 #include "allreduce-ce.cuh"
 
+#if !defined(GGML_USE_MUSA)
+
 #include "convert.cuh"
 
 #include <algorithm>
@@ -18,8 +20,8 @@ static constexpr int64_t GGML_CUDA_CE_AR_CHUNK_ELEMS = GGML_CUDA_CE_AR_CHUNK_BYT
 struct ggml_cuda_ce_ar {
     int devices[2] = { -1, -1 };
 
-    // the buffers are set up with the first reduction, a context that never reduces large tensors (e.g. a draft
-    // model) allocates nothing; if that fails, every call is left to the caller
+    // the buffers are set up with the first large reduction, a context that never has one allocates nothing (an
+    // MTP draft does: it processes the prompt batches as well); if that fails, every call is left to the caller
     bool allocated = false;
     bool failed    = false;
 
@@ -41,7 +43,8 @@ struct ggml_cuda_ce_ar {
     int slot = 0;
 };
 
-// the sum is formed from the two BF16 values in the same order on both devices, so both get the same result
+// both devices add the same two BF16 values (in swapped order, which IEEE addition does not see), so both get the
+// same result
 static __global__ void ggml_cuda_ce_ar_add(float * dst, const nv_bfloat16 * a, const nv_bfloat16 * b, const int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) {
@@ -250,3 +253,17 @@ bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar * ar, ggml_backend_t * backends, 
 
     return true;
 }
+
+#else // defined(GGML_USE_MUSA)
+
+// MUSA lacks cudaHostAlloc / cudaHostAllocPortable (see allreduce.cu): the caller keeps its other AllReduce
+ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int *, size_t) {
+    return nullptr;
+}
+void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar *) {
+}
+bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+
+#endif // !defined(GGML_USE_MUSA)

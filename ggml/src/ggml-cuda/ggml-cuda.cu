@@ -1270,13 +1270,13 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     }
 
     // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
+    // it needs Volta or newer, the copy engines do not
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
     if (ret->ar_pipeline == nullptr) {
         (void) cudaGetLastError();
-        return;
+    } else {
+        ret->nccl_min_bytes = min_bytes;
     }
-
-    ret->nccl_min_bytes = min_bytes;
 
     // with peer access NCCL copies from GPU to GPU, the copy engines would go through host memory
     const char * env_ce = getenv("GGML_CUDA_AR_CE");
@@ -1288,11 +1288,13 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
         }
     }
 
-    if (ret->ce_ar != nullptr) {
+    if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
         GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, from %zu bytes through the copy engines\n",
                 __func__, min_bytes, ret->ce_min_bytes);
-    } else {
+    } else if (ret->ar_pipeline != nullptr) {
         GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, NCCL above\n", __func__, min_bytes);
+    } else if (ret->ce_ar != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce from %zu bytes through the copy engines, NCCL below\n", __func__, ret->ce_min_bytes);
     }
 }
 #endif // GGML_USE_NCCL

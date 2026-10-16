@@ -129,11 +129,11 @@ Environment variables:
 | Variable | Effect |
 |---|---|
 | `GGML_CUDA_ALLREDUCE=nccl` | NCCL for every reduction |
-| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size from which the internal pipeline is no longer used (0: NCCL for every reduction). Setting it also enables the paths above with peer access |
+| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size from which the internal pipeline is no longer used, and the default of `GGML_CUDA_AR_CE_MIN_BYTES` (0: NCCL for every reduction). Setting it also enables the internal pipeline with peer access; the copy engines stay off there |
 | `GGML_CUDA_AR_CE=0` | NCCL instead of the copy engines for large reductions |
 | `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used |
 
-The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU. They are allocated with the first large reduction.
+The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU and per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total.
 
 ---
 
