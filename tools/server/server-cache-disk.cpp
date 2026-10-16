@@ -127,6 +127,28 @@ static bool write_blob(disk_file & f, const std::vector<uint8_t> & buf, const st
     return f.ok;
 }
 
+static bool write_blob(disk_file & f, const common_bytes & buf, const std::atomic<bool> & cancel) {
+    f.write_val<uint64_t>(buf.size());
+    for (size_t off = 0; off < buf.size() && f.ok; off += DISK_CHUNK) {
+        if (cancel.load()) {
+            return false;
+        }
+        f.write(buf.data() + off, std::min(DISK_CHUNK, buf.size() - off));
+    }
+    return f.ok;
+}
+
+static bool read_blob(disk_file & f, common_bytes & buf, size_t file_size) {
+    const uint64_t size = f.read_val<uint64_t>();
+    // check the size against the bytes left before allocating, the field may be corrupted
+    if (!f.ok || size > file_size - f.n) {
+        return false;
+    }
+    buf.resize(size);
+    f.read(buf.wdata(), size);
+    return f.ok;
+}
+
 static bool read_blob(disk_file & f, std::vector<uint8_t> & buf, size_t file_size) {
     const uint64_t size = f.read_val<uint64_t>();
     // check the size against the bytes left before allocating, the field may be corrupted

@@ -694,8 +694,9 @@ struct server_prompt_data {
     std::vector<uint8_t> tail_tgt;
     std::vector<uint8_t> tail_dft;
 
-    std::vector<uint8_t> part_tgt;
-    std::vector<uint8_t> part_dft;
+    // the partial state (recurrent state) at the end of the prompt, shared with a checkpoint when it is one
+    common_bytes part_tgt;
+    common_bytes part_dft;
 
     // the KV after the blocks up to the newest checkpoint, see server_prompt_cache_state::at_checkpoint()
     std::vector<uint8_t> tail_ckpt_tgt;

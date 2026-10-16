@@ -2360,6 +2360,31 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+uint8_t * common_bytes::wdata() {
+    if (!buf) {
+        return nullptr;
+    }
+    if (buf.use_count() > 1) {
+        auto own = std::make_shared<storage>();
+        own->data.reset(new uint8_t[buf->size]);
+        own->size = buf->size;
+        memcpy(own->data.get(), buf->data.get(), buf->size);
+        buf = std::move(own);
+    }
+    return buf->data.get();
+}
+
+void common_bytes::resize(size_t n) {
+    if (n == 0) {
+        buf.reset();
+        return;
+    }
+    auto own = std::make_shared<storage>();
+    own->data.reset(new uint8_t[n]); // default-initialized: not zeroed
+    own->size = n;
+    buf = std::move(own);
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2400,7 +2425,7 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.wdata(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2418,7 +2443,7 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.wdata(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }

@@ -1826,9 +1826,10 @@ static std::vector<uint8_t> state_range(llama_context * ctx, int32_t id_slot, ll
     return buf;
 }
 
-static std::vector<uint8_t> state_partial(llama_context * ctx, int32_t id_slot) {
-    std::vector<uint8_t> buf(llama_state_seq_get_size_ext(ctx, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-    if (buf.empty() || llama_state_seq_get_data_ext(ctx, buf.data(), buf.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != buf.size()) {
+static common_bytes state_partial(llama_context * ctx, int32_t id_slot) {
+    common_bytes buf;
+    buf.resize(llama_state_seq_get_size_ext(ctx, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    if (buf.empty() || llama_state_seq_get_data_ext(ctx, buf.wdata(), buf.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != buf.size()) {
         throw std::runtime_error("failed to copy the partial state");
     }
     return buf;
