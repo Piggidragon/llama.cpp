@@ -2047,6 +2047,41 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+size_t ggml_backend_trim_pools(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return 0;
+    }
+    if (ggml_backend_is_meta(backend)) {
+        size_t released = 0;
+        for (size_t i = 0; i < ggml_backend_meta_n_backends(backend); i++) {
+            released += ggml_backend_trim_pools(ggml_backend_meta_simple_backend(backend, i));
+        }
+        return released;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * trim = reg != nullptr ? (ggml_backend_trim_pools_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_trim_pools") : nullptr;
+    return trim != nullptr ? trim(backend) : 0;
+}
+
+bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner) {
+    GGML_ASSERT(sched != nullptr);
+    return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);
+}
+
+void ggml_backend_sched_get_buffer_state(
+        ggml_backend_sched_t sched,
+        uint64_t * generation,
+        uint64_t * shrink_generation) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_get_resizable_state(sched->galloc, generation, shrink_generation);
+}
+
+void ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_request_shrink(sched->galloc);
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run

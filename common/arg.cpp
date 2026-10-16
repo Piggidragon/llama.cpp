@@ -1780,6 +1780,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_OVERLAP"));
     add_opt(common_arg(
+        {"--phase-aware-workspace"},
+        {"--no-phase-aware-workspace"},
+        "size the compute buffers for the current phase: generation batches reserve only for their few tokens, the "
+        "next prompt grows them again. An MTP draft context computes in the buffers of the target instead of its own, "
+        "docs/compute-workspace.md (default: disabled)",
+        [](common_params & params, bool value) {
+            params.phase_aware_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
+    add_opt(common_arg(
+        {"--live-context-workspace"},
+        {"--no-live-context-workspace"},
+        "size the attention part of the compute buffers by the used part of the KV cache (power-of-two steps from 1/8 "
+        "of it) instead of the full context; the buffers grow as the context fills, so the memory for a full context "
+        "must still be free then, docs/compute-workspace.md (default: disabled)",
+        [](common_params & params, bool value) {
+            params.live_context_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE"));
+    add_opt(common_arg(
         {"--allreduce"}, "{default,host,p2p}",
         "with --split-mode tensor on two CUDA GPUs: how the GPUs exchange their partial results (docs/multi-gpu.md)\n"
         "- default: NCCL\n"

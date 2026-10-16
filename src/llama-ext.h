@@ -138,6 +138,21 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// phase-aware workspace: let an MTP context compute in the compute buffers of its target (both created with
+// phase_aware_workspace). The two contexts then wait for each other before they compute.
+// Returns 1 when the buffers are shared, 0 when they cannot be (other placement, option off) and -1 on failure (the
+// borrower then has no compute buffers until its next decode). Either context may be destroyed first.
+// The shared buffers have the larger requirement of the two, also after an allocation failed: a borrower that needs
+// more than its owner and fails to get it makes the owner fail as well until one of them reserves successfully. An
+// MTP draft context processes the batches of its target after it and needs less, so it never drives the growth.
+LLAMA_API int32_t llama_attach_shared_workspace(struct llama_context * borrower, struct llama_context * owner);
+
+LLAMA_API bool llama_contexts_share_workspace(const struct llama_context * ctx_a, const struct llama_context * ctx_b);
+
+// return the memory that the device memory pools keep after the batch that needed it (CUDA VMM pools), for example
+// when the server is idle; returns the released bytes
+LLAMA_API uint64_t llama_trim_transient_memory(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

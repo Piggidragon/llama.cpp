@@ -509,6 +509,8 @@ struct common_params {
 
     bool flash_attn_native_quants = false; // read a quantized K/V cache in place instead of casting it to F16
     bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next
+    bool phase_aware_workspace    = false; // size the compute buffers for prompt or generation, share them with the MTP draft
+    bool live_context_workspace   = false; // size the attention compute buffers by the used part of the KV cache
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;

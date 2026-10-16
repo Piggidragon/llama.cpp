@@ -601,7 +601,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size > 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
@@ -719,6 +721,26 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    // only an idle pool: a mapping is unmapped as a whole, the address range stays reserved and is mapped again on
+    // the next allocation
+    size_t trim() override {
+        if (pool_addr == 0 || pool_size == 0 || pool_used != 0) {
+            return 0;
+        }
+        ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+#else
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+#endif
+        const size_t released = pool_size;
+        pool_size = 0;
+        return released;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -6190,6 +6212,40 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// the memory of the idle VMM pools of a backend (ggml_backend_trim_pools_t)
+// the captured CUDA graphs use addresses in the pools: they are dropped, the next compute captures them again and
+// maps the memory again
+static size_t ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->streams[device][stream] != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->streams[device][stream]));
+            }
+        }
+    }
+
+    size_t released = 0;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->pools[device][stream] != nullptr) {
+                released += cuda_ctx->pools[device][stream]->trim();
+            }
+        }
+    }
+#ifdef USE_CUDA_GRAPH
+    if (released > 0) {
+        cuda_ctx->cuda_graphs.clear();
+    }
+#endif // USE_CUDA_GRAPH
+    return released;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6200,6 +6256,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_trim_pools") == 0) {
+        return (void *)ggml_backend_cuda_trim_pools;
     }
     if (strcmp(name, "ggml_backend_comm_set_mode") == 0) {
         return (void *)ggml_backend_cuda_comm_set_mode;

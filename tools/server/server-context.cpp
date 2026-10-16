@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_trim_transient_memory
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1523,6 +1524,21 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // the compute buffers of the workspace options grow with the next batches: give them the memory that
+                // the device memory pools keep from the last one, once no slot is busy
+                if (!params_base.phase_aware_workspace && !params_base.live_context_workspace) {
+                    return;
+                }
+                const bool all_idle = std::all_of(slots.begin(), slots.end(),
+                        [](const server_slot & item) { return !item.is_processing(); });
+                if (all_idle) {
+                    const uint64_t released = llama_trim_transient_memory(ctx_tgt) +
+                            (ctx_dft != nullptr ? llama_trim_transient_memory(ctx_dft) : 0);
+                    if (released > 0) {
+                        SRV_DBG("released %.2f MiB of the device memory pools\n", released/1024.0/1024.0);
+                    }
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {

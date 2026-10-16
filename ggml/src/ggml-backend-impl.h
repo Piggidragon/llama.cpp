@@ -105,6 +105,10 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // new meta buffer over the simple buffers of another one, with its own tensor mapping
+    // the alias must be freed before the source buffer
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_alias(ggml_backend_buffer_t buffer);
+
     //
     // Backend (stream)
     //

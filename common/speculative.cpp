@@ -2700,6 +2700,19 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+
+    // the MTP context computes in the compute buffers of the target, one after the other
+    if (pimpl->context && spec_mtp && params.phase_aware_workspace) {
+        const int32_t status = llama_attach_shared_workspace(pimpl->context.get(), ctx_tgt);
+        if (status < 0) {
+            LOG_ERR("%s: failed to share the compute buffers of the target and the MTP context\n", __func__);
+            pimpl->context.reset();
+            return;
+        }
+        if (status == 0) {
+            LOG_INF("%s: the MTP context keeps its own compute buffers\n", __func__);
+        }
+    }
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;

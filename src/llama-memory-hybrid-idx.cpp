@@ -142,6 +142,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -481,17 +485,35 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx())) {
     if (kpool_track()) {
-        mem->kpool_layout_update();
-        auto st = kpool_build_sizes();
-        const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
-        GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
-        st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
-        st.n_new   = st.n_pool_real;
-        st.n_new_g = std::max(st.n_new, 1u);
-        kpool_st = std::make_unique<kpool_state>(std::move(st));
-        i_kpool  = 0;
+        kpool_reserve(mem->get_mem_idx()->get_size());
     }
+}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv) :
+    llama_memory_hybrid_context(mem, mem->get_mem_attn()->init_reserve(n_kv)),
+    mem(mem),
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    // the indexer cache tracks the attention cache cell for cell: the same bound
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), n_kv)) {
+    if (kpool_track()) {
+        kpool_reserve(std::min(n_kv, mem->get_mem_idx()->get_size()));
+    }
+}
+
+// the pools of a sequence are complete pools of its cells: with n_kv cells per stream at most n_kv/kpool per sequence
+void llama_memory_hybrid_idx_context::kpool_reserve(uint32_t n_kv) {
+    mem->kpool_layout_update();
+    auto st = kpool_build_sizes();
+    const auto * idx = mem->get_mem_idx();
+    const uint64_t n_pool_max = uint64_t(n_kv / mem->get_kpool()) * idx->get_n_seq_max();
+    GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+    st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+    st.n_new   = st.n_pool_real;
+    st.n_new_g = std::max(st.n_new, 1u);
+    kpool_st = std::make_unique<kpool_state>(std::move(st));
+    i_kpool  = 0;
 }
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(

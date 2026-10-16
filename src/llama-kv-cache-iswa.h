@@ -61,6 +61,10 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -112,6 +116,11 @@ public:
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv);
 
+    // used to create a context that reads the first n_kv cells of each cache (for allocating bounded compute buffers)
+    llama_kv_cache_iswa_context(
+            llama_kv_cache_iswa * kv,
+            uint32_t n_kv);
+
     // used to create an update context
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv,
@@ -136,6 +145,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_kv_cache_iswa_context specific API
