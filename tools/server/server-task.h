@@ -679,6 +679,13 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // context checkpoints kept per cached prompt, the newest ones: a resumed conversation rolls back to the
+    // checkpoints near the end of its last prompt, older ones only help when the history changes
+    static constexpr size_t n_checkpoints = 3;
+
+    // the newest n_checkpoints of a prompt
+    static std::list<common_prompt_checkpoint> newest_checkpoints(const std::list<common_prompt_checkpoint> & checkpoints);
+
     size_t size() const;
 
     size_t n_tokens() const;

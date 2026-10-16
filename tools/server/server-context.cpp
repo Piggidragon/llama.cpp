@@ -350,7 +350,8 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
-        out.prompt = prompt.clone();
+        out.prompt.tokens      = prompt.tokens.clone();
+        out.prompt.checkpoints = server_prompt_cache::newest_checkpoints(prompt.checkpoints);
 
         return true;
     }

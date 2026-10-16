@@ -1699,6 +1699,13 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
 
 server_prompt_cache::~server_prompt_cache() = default;
 
+std::list<common_prompt_checkpoint> server_prompt_cache::newest_checkpoints(const std::list<common_prompt_checkpoint> & checkpoints) {
+    auto first = checkpoints.begin();
+    std::advance(first, checkpoints.size() - std::min(checkpoints.size(), n_checkpoints));
+
+    return std::list<common_prompt_checkpoint>(first, checkpoints.end());
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1730,9 +1737,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    auto checkpoints = newest_checkpoints(prompt.checkpoints);
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
+    for (const auto & ckpt : checkpoints) {
         checkpoints_size += ckpt.size();
     }
 
@@ -1790,7 +1799,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
