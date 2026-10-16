@@ -440,6 +440,7 @@ private:
     };
     sched_lane       lane_other;
     int              lane_active = 0;
+    int              lane_next   = 1;     // the lane of the next large ubatch
     bool             lanes       = false;
     const uint32_t   lanes_min_tokens = 64; // smaller ubatches stay on lane 0
     ggml_backend_ptr backend_lane1;         // the meta backend of lane 1

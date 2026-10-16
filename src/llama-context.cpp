@@ -443,16 +443,23 @@ llama_context::llama_context(
 
         // a second meta backend for the lanes, see llama_context::sched_lane
         // a draft context only gets small ubatches, it stays on one lane
+        // the CPU parts of a graph run synchronously when the scheduler gets to them, outside of the order between
+        // the lanes: the KV cache, all layers and the experts must be on the devices
         if (cparams.split_overlap && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
-            if (model.devices.size() == 1 && model.devices[0].is_meta && backends.size() == 1 && cparams.n_ubatch >= lanes_min_tokens) {
+            const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+            if (model.devices.size() == 1 && model.devices[0].is_meta && backends.size() == 1 && cparams.n_ubatch >= lanes_min_tokens &&
+                    cparams.offload_kqv && full_offload && !model.has_tensor_overrides() && cparams.moe_cache_size == 0) {
                 backend_lane1.reset(ggml_backend_dev_init(model.devices[0].dev, nullptr));
-                if (backend_lane1) {
-                    ggml_backend_meta_share_lanes(backends[0].get(), backend_lane1.get());
+                if (backend_lane1 && ggml_backend_meta_share_lanes(backends[0].get(), backend_lane1.get())) {
                     lanes = true;
                     LLAMA_LOG_INFO("%s: split overlap: ubatches of at least %u tokens alternate between two schedulers\n", __func__, lanes_min_tokens);
+                } else {
+                    backend_lane1.reset();
+                    LLAMA_LOG_WARN("%s: split overlap needs devices with events, it is not used\n", __func__);
                 }
             } else {
-                LLAMA_LOG_WARN("%s: split overlap needs split mode tensor and a ubatch of at least %u tokens, it is not used\n", __func__, lanes_min_tokens);
+                LLAMA_LOG_WARN("%s: split overlap needs split mode tensor, all layers and the KV cache on the devices and a ubatch of at least %u tokens, it is not used\n",
+                        __func__, lanes_min_tokens);
             }
         }
 
@@ -2052,8 +2059,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        // large ubatches alternate between the lanes
-        lane_switch(ubatch.n_tokens >= lanes_min_tokens ? lane_active ^ 1 : 0);
+        // large ubatches alternate between the lanes, also across calls
+        if (lanes && ubatch.n_tokens >= lanes_min_tokens) {
+            lane_switch(lane_next);
+            lane_next ^= 1;
+        } else {
+            lane_switch(0);
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 

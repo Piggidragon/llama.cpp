@@ -144,7 +144,9 @@ llama-server -m model.gguf -sm tensor -ub 256 --split-overlap
 
 In `tensor` mode every layer ends with an AllReduce, and the GPUs wait for it. On a slow link this can take a large share of prompt processing: about 40% with an RTX 3060 on PCIe 3.0 x4.
 
-With `--split-overlap`, consecutive ubatches of at least 64 tokens alternate between two schedulers. Each scheduler has its own backends, streams and compute buffers. A subgraph waits for the same subgraph of the previous ubatch, since it reads the KV cache and the recurrent state that one wrote. So while one ubatch transfers a layer's result, the other computes the same layer.
+With `--split-overlap`, consecutive ubatches of at least 64 tokens alternate between two schedulers, also across calls. Each scheduler has its own backends, streams and compute buffers. A subgraph waits on each GPU for the subgraphs of the other ubatch that last read or wrote the same state tensors (KV cache, recurrent state). A subgraph without state, such as an FFN, does not wait. So while one ubatch transfers a layer's result, the other computes.
+
+It needs all layers, the KV cache and the experts on the GPUs (the CPU parts of a graph would run outside that order), and devices with events.
 
 The output is the same as without the option. Decode (small ubatches) is not affected.
 
@@ -158,8 +160,8 @@ Qwen3.8-27B on an RTX 4070 (PCIe 4.0 x16) + RTX 3060 (PCIe 3.0 x4), `-ts 0.625,0
 
 | prompt | `-ub 512` | `-ub 256 --split-overlap` |
 |---|--:|--:|
-| 10k tokens | 733 | 948 |
-| 95k tokens | 570 | 729 |
+| 10k tokens | 733 | 947 |
+| 93k tokens | 570 | 734 |
 
 ---
 

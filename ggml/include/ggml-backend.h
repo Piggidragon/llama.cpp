@@ -431,9 +431,10 @@ extern "C" {
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
     // let two backends of the same meta device compute consecutive graphs as lanes: each lane runs on its own streams,
-    // and a graph waits per subgraph for the previous graph of the other lane, so the AllReduce of one lane overlaps
-    // with the compute of the other. The graphs must not share intermediate buffers (one scheduler per lane).
-    GGML_API void ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b);
+    // and a subgraph waits for the subgraphs of the other lane that last touched the same state tensors (KV cache,
+    // recurrent state), so the AllReduce of one lane overlaps with the compute of the other. The graphs must not
+    // share intermediate buffers (one scheduler per lane). Returns false if a device has no events.
+    GGML_API bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b);
 
     //
     // Utils
