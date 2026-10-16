@@ -498,9 +498,16 @@ static constexpr __host__ __device__ int mmvq_narrow_min_ncols_ada(ggml_type typ
     return mmvq_type_is_grid(type) ? 2 : mmvq_type_is_light(type) ? MMVQ_MAX_BATCH_SIZE + 1 : 7;
 }
 
-// whether narrow blocks can be chosen for this type and ncols_dst on some device (only those kernels are compiled)
+// whether narrow blocks can be chosen for this type and ncols_dst on some device (only those kernels are compiled;
+// NVIDIA only, see mul_mat_vec_q for the archs)
 static constexpr bool mmvq_narrow_possible(ggml_type type, int ncols_dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(type);
+    GGML_UNUSED(ncols_dst);
+    return false;
+#else
     return ncols_dst >= mmvq_narrow_min_ncols_ampere_ga10x(type) || ncols_dst >= mmvq_narrow_min_ncols_ada(type);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 // the compute capability of the device itself, not of the compiled code: the narrow blocks are launched with their
@@ -665,10 +672,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool narrow = false>
-__launch_bounds__((narrow ? mmvq_narrow_nwarps(ncols_dst) : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k, bool halve_iters, bool narrow>
+static __device__ __forceinline__ void mul_mat_vec_q_impl(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device & fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
@@ -919,6 +925,32 @@ static __global__ void mul_mat_vec_q(
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+    }
+}
+
+// The narrow blocks are only launched on devices of compute capability 8.6 and 8.9 (mmvq_use_narrow), which can run
+// code of these archs or below: archs from Hopper on do not compile them.
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool narrow = false>
+__launch_bounds__((narrow ? mmvq_narrow_nwarps(ncols_dst) : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride, const uint32_t nrows_x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    constexpr bool compiled = !narrow;
+#else
+    constexpr bool compiled = true;
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    if constexpr (compiled) {
+        mul_mat_vec_q_impl<type, ncols_dst, has_fusion, small_k, halve_iters, narrow>(
+            vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio,
+            stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_x);
+    } else {
+        NO_DEVICE_CODE;
     }
 }
 
