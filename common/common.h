@@ -1299,7 +1299,7 @@ public:
     // writable bytes, copied first if another copy shares them (not data(): reading must never copy)
     uint8_t * wdata();
 
-    // new bytes for this copy only (the content is undefined)
+    // bytes for this copy only, the same ones if no other copy shares them and the size matches (the content is undefined)
     void resize(size_t n);
 
     void clear() { buf.reset(); }

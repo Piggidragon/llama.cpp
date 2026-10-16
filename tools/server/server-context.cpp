@@ -4091,10 +4091,11 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // erase any checkpoints with pos_max > pos_next, and the ones past the common prefix:
+                                // the last token of a checkpoint at pos_max == pos_next is not the one of this prompt
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    if (cur.pos_max > pos_next || cur.n_tokens > n_past) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {

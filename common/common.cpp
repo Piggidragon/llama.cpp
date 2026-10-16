@@ -15,6 +15,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -2404,6 +2405,8 @@ uint8_t * common_bytes::wdata() {
         auto own = std::make_shared<storage>(buf->size);
         memcpy(own->data, buf->data, buf->size);
         buf = std::move(own);
+    } else {
+        std::atomic_thread_fence(std::memory_order_acquire); // see resize()
     }
     return buf->data;
 }
@@ -2411,6 +2414,11 @@ uint8_t * common_bytes::wdata() {
 void common_bytes::resize(size_t n) {
     if (n == 0) {
         buf.reset();
+        return;
+    }
+    // a checkpoint refreshed in place (the speculative one, every draft round) keeps its buffer
+    if (buf && buf->size == n && buf.use_count() == 1) {
+        std::atomic_thread_fence(std::memory_order_acquire); // after the last use of a copy released on another thread
         return;
     }
     buf = std::make_shared<storage>(n);
