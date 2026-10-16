@@ -3275,16 +3275,155 @@ private:
     size_t size_written = 0;
 };
 
+// The two halves of the staging buffer take turns: the devices copy one half while the CPU moves the other one to
+// or from its place in host memory. A copy from a device into pageable memory is synchronous and stages through
+// the driver one piece at a time, so the devices otherwise wait for each other and for the CPU.
+static constexpr size_t state_stage_size = 32u << 20;
+
+void llama_context::state_copy(const std::vector<state_copy_item> & items, bool to_host) {
+    auto copy_sync = [&](const state_copy_item & it) {
+        if (to_host) {
+            ggml_backend_tensor_get(it.tensor, it.host, it.offset, it.size);
+        } else {
+            ggml_backend_tensor_set(it.tensor, it.host, it.offset, it.size);
+        }
+    };
+
+    if (!state_stage_tried) {
+        state_stage_tried = true;
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (buft != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                state_stage.reset(ggml_backend_buft_alloc_buffer(buft, state_stage_size));
+                break;
+            }
+        }
+    }
+
+    if (!state_stage) {
+        for (const auto & it : items) {
+            copy_sync(it);
+        }
+        return;
+    }
+
+    // the backend that copies a tensor asynchronously, nullptr to copy it here
+    ggml_backend_buffer_t last_buf     = nullptr;
+    ggml_backend_t        last_backend = nullptr;
+    auto backend_of = [&](const ggml_tensor * t) -> ggml_backend_t {
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == last_buf) {
+            return last_backend;
+        }
+        last_buf     = buf;
+        last_backend = nullptr;
+        if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU || type == GGML_BACKEND_DEVICE_TYPE_META) &&
+                    ggml_backend_supports_buft(backend.get(), buft)) {
+                last_backend = backend.get();
+                break;
+            }
+        }
+        return last_backend;
+    };
+
+    const size_t half = ggml_backend_buffer_get_size(state_stage.get()) / 2;
+    uint8_t * stage[2] = {
+        (uint8_t *) ggml_backend_buffer_get_base(state_stage.get()),
+        (uint8_t *) ggml_backend_buffer_get_base(state_stage.get()) + half,
+    };
+
+    struct staged {
+        const state_copy_item * it;
+        ggml_backend_t          backend;
+        size_t                  offs; // in its half
+    };
+    std::vector<staged> group[2];
+    std::vector<ggml_backend_t> used;
+
+    // the next items that fit into half h, the others are copied here on the way
+    size_t i_next = 0;
+    auto take = [&](int h) {
+        group[h].clear();
+        size_t offs = 0;
+        for (; i_next < items.size(); i_next++) {
+            const auto & it = items[i_next];
+            if (it.size == 0) {
+                continue;
+            }
+            ggml_backend_t backend = backend_of(it.tensor);
+            if (backend == nullptr || it.size > half) {
+                copy_sync(it);
+                continue;
+            }
+            if (offs + it.size > half) {
+                break;
+            }
+            group[h].push_back({ &it, backend, offs });
+            if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                used.push_back(backend);
+            }
+            offs = GGML_PAD(offs + it.size, 256);
+        }
+    };
+    auto sync = [&]() {
+        for (ggml_backend_t backend : used) {
+            ggml_backend_synchronize(backend);
+        }
+    };
+
+    int h = 0;
+    if (to_host) {
+        auto issue = [&](int h) {
+            for (const auto & st : group[h]) {
+                ggml_backend_tensor_get_async(st.backend, st.it->tensor, stage[h] + st.offs, st.it->offset, st.it->size);
+            }
+        };
+        take(h);
+        issue(h);
+        sync();
+        while (!group[h].empty()) {
+            take(1 - h);
+            issue(1 - h);
+            for (const auto & st : group[h]) {
+                memcpy(st.it->host, stage[h] + st.offs, st.it->size);
+            }
+            sync();
+            h = 1 - h;
+        }
+    } else {
+        auto fill = [&](int h) {
+            take(h);
+            for (const auto & st : group[h]) {
+                memcpy(stage[h] + st.offs, st.it->host, st.it->size);
+            }
+        };
+        fill(h);
+        while (!group[h].empty()) {
+            for (const auto & st : group[h]) {
+                ggml_backend_tensor_set_async(st.backend, st.it->tensor, stage[h] + st.offs, st.it->offset, st.it->size);
+            }
+            fill(1 - h);
+            sync();
+            h = 1 - h;
+        }
+    }
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            llama_context * lctx, uint8_t * p, size_t len) : lctx(lctx), ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
-        }
+        lctx->state_copy(winfos, /*to_host =*/ true);
     }
 
     void write(const void * src, size_t size) override {
@@ -3303,7 +3442,7 @@ public:
         }
 
         // save the write for later during destruction
-        winfos.push_back({tensor, ptr, size, offset});
+        winfos.push_back({tensor, ptr, offset, size});
 
         ptr += size;
         size_written += size;
@@ -3315,28 +3454,22 @@ public:
     }
 
 private:
+    llama_context * lctx;
+
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
 
-    struct write_info {
-        ggml_tensor * tensor;
-        uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<write_info> winfos;
+    std::vector<llama_context::state_copy_item> winfos;
 };
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(llama_context * lctx, const uint8_t * p, size_t len) : lctx(lctx), ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
         // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
-        }
+        lctx->state_copy(rinfos, /*to_host =*/ false);
     }
 
     void read(void * dst, size_t size) override {
@@ -3354,8 +3487,8 @@ public:
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
 
-        // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset});
+        // save for later during destruction (the copy only reads from ptr)
+        rinfos.push_back({tensor, const_cast<uint8_t *>(ptr), offset, size});
 
         ptr += size;
         size_read += size;
@@ -3371,17 +3504,13 @@ public:
     }
 
 private:
+    llama_context * lctx;
+
     const uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_read = 0;
 
-    struct read_info {
-        ggml_tensor * tensor;
-        const uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<read_info> rinfos;
+    std::vector<llama_context::state_copy_item> rinfos;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -3752,7 +3881,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(this, dst, size);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3762,7 +3891,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(this, src, size);
     try {
         return state_read_data(io);
     } catch (const std::exception & err) {
@@ -3792,7 +3921,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(this, dst, size);
     }
 
     try {
@@ -3810,7 +3939,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(this, src, size);
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
@@ -3825,7 +3954,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(this, src, size);
     }
 
     try {
@@ -3869,7 +3998,7 @@ size_t llama_context::state_seq_get_size_range(llama_seq_id seq_id, llama_pos p0
 }
 
 size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_pos p0, llama_pos p1) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(this, dst, size);
     try {
         io.write(&io_magic_range, sizeof(io_magic_range));
         io.write(&seq_id, sizeof(seq_id));
@@ -3884,7 +4013,7 @@ size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * ds
 }
 
 size_t llama_context::state_seq_set_data_range(llama_seq_id seq_id, const uint8_t * src, size_t size, bool append) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(this, src, size);
     try {
         uint32_t magic_read;
         io.read(&magic_read, sizeof(magic_read));
