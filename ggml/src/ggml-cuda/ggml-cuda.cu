@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/allreduce-ce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1031,6 +1032,9 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ce_ar *           ce_ar        = nullptr;
     size_t                      ce_min_bytes = 0;
 
+    // with NCCL and peer access: reductions smaller than nccl_min_bytes go through the peer-to-peer kernel
+    ggml_cuda_p2p_ar *          p2p_ar       = nullptr;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1043,6 +1047,7 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
         ggml_cuda_ce_ar_free(ce_ar);
+        ggml_cuda_p2p_ar_free(p2p_ar);
     }
 };
 
@@ -1191,6 +1196,10 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
             ggml_cuda_ce_ar_allreduce(comm_ctx->ce_ar, comm_ctx->backends.data(), tensors)) {
         return true;
     }
+    if (comm_ctx->p2p_ar != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
+            ggml_cuda_p2p_ar_allreduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
     if (comm_ctx->ar_pipeline != nullptr && ggml_nbytes(tensors[0]) < comm_ctx->nccl_min_bytes &&
             ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
         return true;
@@ -1257,12 +1266,37 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
     int can_access = 0;
     CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ret->dev_ids[0], ret->dev_ids[1]));
 
-    size_t min_bytes = 512*1024;
-    if (const char * env = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES")) {
-        min_bytes = std::strtoull(env, nullptr, 10);
-    } else if (can_access) {
-        // NCCL takes the peer path, which has not been measured against the internal pipeline
+    // With peer access over PCIe the same holds: NCCL's kernels hold an SM, its small reductions have more latency
+    // than a kernel that writes into the other GPU and polls only its own memory, and a large one is bound by the
+    // link either way. The same GPUs with BAR1 P2P: tg 36.9 -> 37.6 t/s and pp3 97.5 -> 99.7 against the internal
+    // pipeline, with --split-overlap prompt processing 865 -> 1183 t/s against NCCL. A link with native peer atomics
+    // (NVLink) keeps NCCL. GGML_CUDA_AR_P2P_SMALL and GGML_CUDA_AR_CE_P2P (0 or 1) override the choice.
+    int native_atomics = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (can_access) {
+        CUDA_CHECK(cudaDeviceGetP2PAttribute(&native_atomics, cudaDevP2PAttrNativeAtomicSupported, ret->dev_ids[0], ret->dev_ids[1]));
+    }
+    const bool p2p_pcie = can_access && !native_atomics;
+#else
+    const bool p2p_pcie = false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+    auto env_flag = [](const char * name, bool def) {
+        const char * env = getenv(name);
+        return env != nullptr ? atoi(env) != 0 : def;
+    };
+
+    const char * env_min = getenv("GGML_CUDA_AR_NCCL_MIN_BYTES");
+    const bool   small_p2p      = can_access && env_flag("GGML_CUDA_AR_P2P_SMALL", p2p_pcie);
+    const bool   small_internal = !small_p2p && (!can_access || env_min != nullptr);
+    const bool   large_ce       = can_access ? env_flag("GGML_CUDA_AR_CE_P2P", p2p_pcie) : env_flag("GGML_CUDA_AR_CE", true);
+    if (!small_p2p && !small_internal && !large_ce) {
         return;
+    }
+
+    size_t min_bytes = 512*1024;
+    if (env_min != nullptr) {
+        min_bytes = std::strtoull(env_min, nullptr, 10);
     }
 
     if (min_bytes == 0) {
@@ -1271,24 +1305,34 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * 
 
     // the reductions it gets stay below the copy-engine threshold, its 32 MiB staging per GPU is not needed
     // it needs Volta or newer, the copy engines do not
-    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
-    if (ret->ar_pipeline == nullptr) {
-        (void) cudaGetLastError();
-    } else {
-        ret->nccl_min_bytes = min_bytes;
+    if (small_p2p) {
+        ret->p2p_ar = ggml_cuda_p2p_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->p2p_ar != nullptr) {
+            ret->nccl_min_bytes = std::min(min_bytes, ggml_cuda_p2p_ar_max_bytes());
+        }
+    }
+    if (small_internal) {
+        ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size(), /*small_only =*/ true);
+        if (ret->ar_pipeline == nullptr) {
+            (void) cudaGetLastError();
+        } else {
+            ret->nccl_min_bytes = min_bytes;
+        }
     }
 
-    // with peer access NCCL copies from GPU to GPU, the copy engines would go through host memory
-    const char * env_ce = getenv("GGML_CUDA_AR_CE");
-    if (!can_access && (env_ce == nullptr || atoi(env_ce) != 0)) {
-        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (large_ce) {
+        ret->ce_ar = ggml_cuda_ce_ar_init(ret->dev_ids.data(), ret->dev_ids.size(), /*peer =*/ can_access != 0);
         ret->ce_min_bytes = min_bytes;
         if (const char * env = getenv("GGML_CUDA_AR_CE_MIN_BYTES")) {
             ret->ce_min_bytes = std::strtoull(env, nullptr, 10);
         }
     }
 
-    if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
+    if (ret->p2p_ar != nullptr) {
+        GGML_LOG_INFO("%s: AllReduce below %zu bytes through the peer-to-peer kernel, from %zu bytes through %s\n",
+                __func__, ret->nccl_min_bytes, ret->ce_ar != nullptr ? ret->ce_min_bytes : ret->nccl_min_bytes,
+                ret->ce_ar != nullptr ? "the copy engines" : "NCCL");
+    } else if (ret->ar_pipeline != nullptr && ret->ce_ar != nullptr) {
         GGML_LOG_INFO("%s: AllReduce below %zu bytes through the internal pipeline, from %zu bytes through the copy engines\n",
                 __func__, min_bytes, ret->ce_min_bytes);
     } else if (ret->ar_pipeline != nullptr) {

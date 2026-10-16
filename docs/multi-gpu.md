@@ -113,28 +113,32 @@ GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
 
 P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
 
-### 7. Two GPUs without peer access
+### 7. Two GPUs over PCIe
 
-With `--split-mode tensor`, two GPUs that cannot access each other's memory (the usual case for consumer cards) exchange their partial results through host memory. With NCCL compiled in, each reduction takes one of three paths:
+With `--split-mode tensor`, two GPUs exchange their partial results after every layer. With NCCL compiled in, each reduction takes one of these paths:
 
-| Reduction size | Path | Why |
-|---|---|---|
-| below 512 KiB (decode, small batches) | internal pipeline, a single kernel with a handshake through pinned memory | lower latency than NCCL |
-| from 512 KiB (prompt processing) | copy engines: each GPU copies its part to pinned memory in chunks and the other one copies them back as they arrive | no SM is busy, both directions of a link are used at once |
-| anything the two above do not handle | NCCL | |
+| Link | Reduction size | Path | Why |
+|---|---|---|---|
+| no peer access (the usual case for consumer cards) | below 512 KiB (decode, small batches) | internal pipeline: a single kernel with a handshake through pinned memory | lower latency than NCCL |
+| no peer access | from 512 KiB (prompt processing) | copy engines: each GPU copies its part to pinned memory in chunks, the other copies them back as they arrive | no SM is busy, both directions of a link are used at once |
+| peer access over PCIe | below 512 KiB | peer-to-peer kernel: each GPU writes its part and a flag into the memory of the other and polls only its own | lower latency than NCCL and the internal pipeline |
+| peer access over PCIe | from 512 KiB | copy engines from GPU to GPU | as above, without the copy through host memory |
+| NVLink (native peer atomics), or anything the paths above do not handle | | NCCL | |
 
-With peer access, NCCL handles every reduction.
+The paths matter most with `--split-overlap` (recipe 8): NCCL keeps an SM on each GPU busy, which slows down the compute of the other ubatch. Over PCIe, the bandwidth of the slower link limits a large reduction with or without peer access, so peer access mostly lowers the latency of the small ones.
 
 Environment variables:
 
 | Variable | Effect |
 |---|---|
 | `GGML_CUDA_ALLREDUCE=nccl` | NCCL for every reduction |
-| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size from which the internal pipeline is no longer used, and the default of `GGML_CUDA_AR_CE_MIN_BYTES` (0: NCCL for every reduction). Setting it also enables the internal pipeline with peer access; the copy engines stay off there |
-| `GGML_CUDA_AR_CE=0` | NCCL instead of the copy engines for large reductions |
+| `GGML_CUDA_AR_NCCL_MIN_BYTES=N` | size below which the small-reduction path is used, and the default of `GGML_CUDA_AR_CE_MIN_BYTES` (0: NCCL for every reduction). Setting it also enables the internal pipeline with peer access when the peer-to-peer kernel is off |
+| `GGML_CUDA_AR_CE=0` | without peer access: NCCL instead of the copy engines for large reductions |
+| `GGML_CUDA_AR_CE_P2P=0` or `1` | with peer access: copy engines from GPU to GPU off or on (default: on over PCIe) |
+| `GGML_CUDA_AR_P2P_SMALL=0` or `1` | with peer access: peer-to-peer kernel off or on (default: on over PCIe) |
 | `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used |
 
-The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU and per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total.
+The copy engines need 16 MiB of VRAM per GPU, plus 8 MiB of pinned memory without peer access, per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total. The peer-to-peer kernel needs 512 KiB of VRAM per GPU and context.
 
 ### 8. Overlapping the AllReduce with compute (`--split-overlap`)
 

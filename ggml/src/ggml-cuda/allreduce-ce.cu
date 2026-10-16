@@ -20,6 +20,9 @@ static constexpr int64_t GGML_CUDA_CE_AR_CHUNK_ELEMS = GGML_CUDA_CE_AR_CHUNK_BYT
 struct ggml_cuda_ce_ar {
     int devices[2] = { -1, -1 };
 
+    // copy from GPU to GPU with peer access instead of through host memory
+    bool p2p = false;
+
     // the buffers are set up with the first large reduction, a context that never has one allocates nothing (an
     // MTP draft does: it processes the prompt batches as well); if that fails, every call is left to the caller
     bool allocated = false;
@@ -105,7 +108,7 @@ void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar * ar) {
     delete ar;
 }
 
-ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices) {
+ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices, bool peer) {
     if (n_devices != 2) {
         return nullptr;
     }
@@ -113,6 +116,7 @@ ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices) {
     auto * ar = new ggml_cuda_ce_ar;
     ar->devices[0] = devices[0];
     ar->devices[1] = devices[1];
+    ar->p2p        = peer;
     return ar;
 }
 
@@ -127,7 +131,17 @@ static bool ggml_cuda_ce_ar_alloc(ggml_cuda_ce_ar * ar) {
         ok = ok && cudaStreamCreateWithFlags(&ar->h2d[i], cudaStreamNonBlocking) == cudaSuccess;
         ok = ok && cudaMalloc((void **) &ar->own[i],  bytes) == cudaSuccess;
         ok = ok && cudaMalloc((void **) &ar->peer[i], bytes) == cudaSuccess;
-        ok = ok && cudaHostAlloc((void **) &ar->host[i], bytes, cudaHostAllocPortable) == cudaSuccess;
+        if (ar->p2p) {
+            // a direct copy needs peer access, without it cudaMemcpyPeerAsync goes through host memory
+            const cudaError_t err = cudaDeviceEnablePeerAccess(ar->devices[1 - i], 0);
+            if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                (void) cudaGetLastError();
+            } else {
+                ok = ok && err == cudaSuccess;
+            }
+        } else {
+            ok = ok && cudaHostAlloc((void **) &ar->host[i], bytes, cudaHostAllocPortable) == cudaSuccess;
+        }
 
         for (int s = 0; s < GGML_CUDA_CE_AR_N_SLOTS && ok; ++s) {
             for (cudaEvent_t * ev : { &ar->ev_conv[i][s], &ar->ev_d2h_done[i][s], &ar->ev_h2d[i][s], &ar->ev_add[i][s] }) {
@@ -146,8 +160,8 @@ static bool ggml_cuda_ce_ar_alloc(ggml_cuda_ce_ar * ar) {
         return false;
     }
 
-    GGML_LOG_INFO("%s: copy-engine AllReduce: %d slots of %zu KiB per GPU (%zu MiB VRAM and %zu MiB pinned memory per GPU)\n", __func__,
-            GGML_CUDA_CE_AR_N_SLOTS, GGML_CUDA_CE_AR_SLOT_BYTES >> 10, (2*bytes) >> 20, bytes >> 20);
+    GGML_LOG_INFO("%s: copy-engine AllReduce%s: %d slots of %zu KiB per GPU (%zu MiB VRAM and %zu MiB pinned memory per GPU)\n", __func__,
+            ar->p2p ? " from GPU to GPU" : "", GGML_CUDA_CE_AR_N_SLOTS, GGML_CUDA_CE_AR_SLOT_BYTES >> 10, (2*bytes) >> 20, ar->p2p ? (size_t) 0 : bytes >> 20);
 
     return true;
 }
@@ -192,6 +206,46 @@ bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar * ar, ggml_backend_t * backends, 
         ar->slot = (ar->slot + 1) % GGML_CUDA_CE_AR_N_SLOTS;
 
         const int64_t s_off = s*GGML_CUDA_CE_AR_SLOT_ELEMS;
+
+        if (ar->p2p) {
+            // each GPU copies its contribution into the peer buffer of the other one
+            for (int i = 0; i < 2; ++i) {
+                const int p = 1 - i;
+                ggml_cuda_set_device(ar->devices[i]);
+                cudaStream_t stream = cuda_ctx[i]->stream();
+
+                nv_bfloat16 * own = ar->own[i] + s_off;
+
+                // own is read by the copy of the previous use of the slot
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ar->ev_d2h_done[i][s]));
+                if (compute[i]) {
+                    to_bf16((const float *) tensors[i]->data + off, own, n, stream);
+                } else {
+                    CUDA_CHECK(cudaMemsetAsync(own, 0, n*sizeof(nv_bfloat16), stream));
+                }
+                CUDA_CHECK(cudaEventRecord(ar->ev_conv[i][s], stream));
+
+                // the peer buffer of the other GPU is read by its sum of the previous use of the slot
+                CUDA_CHECK(cudaStreamWaitEvent(ar->d2h[i], ar->ev_conv[i][s]));
+                CUDA_CHECK(cudaStreamWaitEvent(ar->d2h[i], ar->ev_add[p][s]));
+                CUDA_CHECK(cudaMemcpyPeerAsync(ar->peer[p] + s_off, ar->devices[p], own, ar->devices[i],
+                        n*sizeof(nv_bfloat16), ar->d2h[i]));
+                CUDA_CHECK(cudaEventRecord(ar->ev_d2h_done[i][s], ar->d2h[i]));
+            }
+            for (int i = 0; i < 2; ++i) {
+                const int p = 1 - i;
+                ggml_cuda_set_device(ar->devices[i]);
+                cudaStream_t stream = cuda_ctx[i]->stream();
+
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ar->ev_d2h_done[p][s]));
+                const int block_size = 256;
+                const int64_t n_blocks = (n + block_size - 1) / block_size;
+                ggml_cuda_ce_ar_add<<<n_blocks, block_size, 0, stream>>>((float *) tensors[i]->data + off, ar->own[i] + s_off, ar->peer[i] + s_off, n);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaEventRecord(ar->ev_add[i][s], stream));
+            }
+            continue;
+        }
 
         // the own contribution to host memory
         for (int i = 0; i < 2; ++i) {
@@ -257,7 +311,7 @@ bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar * ar, ggml_backend_t * backends, 
 #else // defined(GGML_USE_MUSA)
 
 // MUSA lacks cudaHostAlloc / cudaHostAllocPortable (see allreduce.cu): the caller keeps its other AllReduce
-ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int *, size_t) {
+ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int *, size_t, bool) {
     return nullptr;
 }
 void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar *) {

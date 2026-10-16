@@ -14,8 +14,10 @@
 struct ggml_cuda_ce_ar;
 
 // the buffers (16 MiB VRAM and 8 MiB pinned memory per GPU) are allocated with the first reduction
+// peer: the GPUs have peer access, each copies its contribution straight into the other's memory instead of
+// through host memory (no pinned memory then)
 // returns nullptr on MUSA, which lacks the pinned-memory API used here
-ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices);
+ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices, bool peer = false);
 
 void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar * ar);
 
