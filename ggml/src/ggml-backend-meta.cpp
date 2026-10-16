@@ -1836,6 +1836,15 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // Lanes: meta backends of one device that compute consecutive graphs on their own streams, so that the AllReduce
+    // of one graph overlaps with the compute of the other, see ggml_backend_meta_share_lanes().
+    struct lane_group {
+        ggml_backend_meta_context * last = nullptr; // the backend that computed the last graph
+    };
+    std::shared_ptr<lane_group>                    lanes;
+    std::vector<std::vector<ggml_backend_event_t>> lane_events;      // [subgraph][simple backend], recorded once it is computed
+    size_t                                         lane_n_subgraphs = 0; // subgraphs of the last graph
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1870,6 +1879,14 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & events : lane_events) {
+            for (ggml_backend_event_t event : events) {
+                ggml_backend_event_free(event);
+            }
+        }
+        if (lanes && lanes->last == this) {
+            lanes->last = nullptr;
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2466,12 +2483,46 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // With lanes, a subgraph waits on each device for the same subgraph of the previous graph of the other lane: it
+    // reads the KV cache and the recurrent state that one wrote. The AllReduce after a subgraph is not waited for, it
+    // overlaps with the compute of the other lane. A previous graph of another structure is waited for as a whole.
+    ggml_backend_meta_context * lane_prev = nullptr;
+    if (backend_ctx->lanes) {
+        lane_prev = backend_ctx->lanes->last;
+        backend_ctx->lanes->last = backend_ctx;
+        if (lane_prev == backend_ctx || (lane_prev != nullptr && lane_prev->lane_n_subgraphs == 0)) {
+            // the same stream orders it, or nothing was computed there
+            lane_prev = nullptr;
+        }
+
+        while (backend_ctx->lane_events.size() < backend_ctx->n_subgraphs) {
+            std::vector<ggml_backend_event_t> events(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                events[j] = ggml_backend_event_new(ggml_backend_get_device(backend_ctx->backend_configs[j].backend));
+                GGML_ASSERT(events[j] != nullptr);
+            }
+            backend_ctx->lane_events.push_back(std::move(events));
+        }
+    }
+    const bool lane_per_subgraph = lane_prev != nullptr && lane_prev->lane_n_subgraphs == backend_ctx->n_subgraphs;
+    if (lane_prev != nullptr && !lane_per_subgraph) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, lane_prev->lane_events[lane_prev->lane_n_subgraphs - 1][j]);
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            if (lane_per_subgraph) {
+                ggml_backend_event_wait(bcj.backend, lane_prev->lane_events[i][j]);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+            if (backend_ctx->lanes) {
+                ggml_backend_event_record(backend_ctx->lane_events[i][j], bcj.backend);
             }
         }
 
@@ -2496,6 +2547,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    backend_ctx->lane_n_subgraphs = backend_ctx->n_subgraphs;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2537,6 +2589,16 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs.size();
+}
+
+void ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend_a) && ggml_backend_is_meta(meta_backend_b));
+    GGML_ASSERT(meta_backend_a->device == meta_backend_b->device);
+    auto * ctx_a = (ggml_backend_meta_context *) meta_backend_a->context;
+    auto * ctx_b = (ggml_backend_meta_context *) meta_backend_b->context;
+    GGML_ASSERT(!ctx_a->lanes && !ctx_b->lanes);
+    ctx_a->lanes = std::make_shared<ggml_backend_meta_context::lane_group>();
+    ctx_b->lanes = ctx_a->lanes;
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {

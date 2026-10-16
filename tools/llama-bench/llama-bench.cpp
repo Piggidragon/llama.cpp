@@ -359,6 +359,7 @@ struct cmd_params {
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<bool>                flash_attn_native_quants;
+    std::vector<bool>                split_overlap;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<float>>  attn_split;
@@ -407,6 +408,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* flash_attn_native_quants */ { false },
+    /* split_overlap        */ { false },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* attn_split           */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -481,6 +483,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -fanq, --flash-attn-native-quants <0|1>           (default: %s)\n", join(cmd_params_defaults.flash_attn_native_quants, ",").c_str());
+    printf("  -so, --split-overlap <0|1>                        (default: %s)\n", join(cmd_params_defaults.split_overlap, ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
@@ -852,6 +855,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.flash_attn_native_quants.insert(params.flash_attn_native_quants.end(), p.begin(), p.end());
+            } else if (arg == "-so" || arg == "--split-overlap") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.split_overlap.insert(params.split_overlap.end(), p.begin(), p.end());
             } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1182,6 +1192,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.flash_attn_native_quants.empty()) {
         params.flash_attn_native_quants = cmd_params_defaults.flash_attn_native_quants;
     }
+    if (params.split_overlap.empty()) {
+        params.split_overlap = cmd_params_defaults.split_overlap;
+    }
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
     }
@@ -1250,6 +1263,7 @@ struct cmd_params_instance {
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
     bool               flash_attn_native_quants;
+    bool               split_overlap;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<float> attn_split;
@@ -1337,6 +1351,7 @@ struct cmd_params_instance {
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.flash_attn_native_quants = flash_attn_native_quants;
+        cparams.split_overlap            = split_overlap;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1374,6 +1389,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & fanq : params.flash_attn_native_quants)
+    for (const auto & so : params.split_overlap)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1405,6 +1421,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
                 /* .flash_attn_native_quants = */ fanq,
+                /* .split_overlap         = */ so,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .attn_split            = */ as,
@@ -1445,6 +1462,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
                 /* .flash_attn_native_quants = */ fanq,
+                /* .split_overlap         = */ so,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .attn_split            = */ as,
@@ -1485,6 +1503,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
                 /* .flash_attn_native_quants = */ fanq,
+                /* .split_overlap         = */ so,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .attn_split            = */ as,
@@ -1530,6 +1549,7 @@ struct test {
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
     bool                     flash_attn_native_quants;
+    bool                     split_overlap;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<float>       attn_split;
@@ -1573,6 +1593,7 @@ struct test {
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
         flash_attn_native_quants = inst.flash_attn_native_quants;
+        split_overlap  = inst.split_overlap;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
         attn_split     = inst.attn_split;
@@ -1638,7 +1659,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "flash_attn_native_quants", "devices", "tensor_split",
+            "main_gpu",       "no_kv_offload",  "flash_attn",    "flash_attn_native_quants", "split_overlap", "devices", "tensor_split",
             "attn_split",     "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
@@ -1658,7 +1679,7 @@ struct test {
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "flash_attn_native_quants" || field == "cpu_strict" ||
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "flash_attn_native_quants" || field == "split_overlap" || field == "cpu_strict" ||
             field == "embeddings" || field == "no_host" || field == "repack") {
             return BOOL;
         }
@@ -1738,6 +1759,7 @@ struct test {
                                             std::to_string(no_kv_offload),
                                             std::to_string((int) flash_attn),
                                             std::to_string(flash_attn_native_quants),
+                                            std::to_string(split_overlap),
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             attn_split_str,
@@ -1972,6 +1994,9 @@ struct markdown_printer : public printer {
         if (field == "flash_attn_native_quants") {
             return "fanq";
         }
+        if (field == "split_overlap") {
+            return "so";
+        }
         if (field == "load_mode") {
             return "lm";
         }
@@ -2061,6 +2086,9 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn_native_quants.size() > 1 || params.flash_attn_native_quants != cmd_params_defaults.flash_attn_native_quants) {
             fields.emplace_back("flash_attn_native_quants");
+        }
+        if (params.split_overlap.size() > 1 || params.split_overlap != cmd_params_defaults.split_overlap) {
+            fields.emplace_back("split_overlap");
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");

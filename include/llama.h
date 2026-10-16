@@ -422,6 +422,9 @@ extern "C" {
         bool flash_attn_native_quants; // let Flash Attention read a quantized K/V cache in place instead of
                                        // casting it to F16 first; removes the transient F16 copy of the
                                        // attention window. Where no native loader exists the F16 path is used.
+        bool split_overlap;            // split mode tensor: alternate large ubatches between two schedulers, so that
+                                       // the AllReduce of one overlaps with the compute of the other; each has its own
+                                       // compute buffers, so a ubatch of half the size takes the same memory
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

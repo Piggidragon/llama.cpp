@@ -1770,6 +1770,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS"));
     add_opt(common_arg(
+        {"--split-overlap"},
+        {"--no-split-overlap"},
+        "with --split-mode tensor: alternate ubatches of at least 64 tokens between two schedulers, so that the "
+        "AllReduce of one overlaps with the compute of the other. Each scheduler has its own compute buffers: "
+        "half the --ubatch-size takes the same memory and is usually the fastest choice (default: disabled)",
+        [](common_params & params, bool value) {
+            params.split_overlap = value;
+        }
+    ).set_env("LLAMA_ARG_SPLIT_OVERLAP"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
