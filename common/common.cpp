@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -2360,6 +2361,64 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+namespace {
+
+// Freed buffers of common_bytes, reused by resize() for the same size: the context checkpoints of a model all have
+// one size, and a reused buffer is already mapped - a new one page-faults while the device copies the state into it.
+struct common_bytes_pool {
+    static constexpr size_t min_size  = 1u << 20;
+    static constexpr size_t max_count = 3;
+    static constexpr size_t max_bytes = 1ull << 30;
+
+    std::mutex mtx;
+    std::vector<std::pair<size_t, std::unique_ptr<uint8_t[]>>> free;
+    size_t free_bytes = 0;
+
+    std::unique_ptr<uint8_t[]> take(size_t n) {
+        if (n < min_size) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto it = free.begin(); it != free.end(); ++it) {
+            if (it->first == n) {
+                auto res = std::move(it->second);
+                free_bytes -= n;
+                free.erase(it);
+                return res;
+            }
+        }
+        return nullptr;
+    }
+
+    void give(size_t n, std::unique_ptr<uint8_t[]> && buf) {
+        if (n < min_size || n > max_bytes) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        // the oldest ones make room
+        while (!free.empty() && (free.size() >= max_count || free_bytes + n > max_bytes)) {
+            free_bytes -= free.front().first;
+            free.erase(free.begin());
+        }
+        free.emplace_back(n, std::move(buf));
+        free_bytes += n;
+    }
+};
+
+// never destroyed: buffers can be released during static destruction
+common_bytes_pool & bytes_pool() {
+    static common_bytes_pool * pool = new common_bytes_pool;
+    return *pool;
+}
+
+}
+
+common_bytes::storage::~storage() {
+    if (data) {
+        bytes_pool().give(size, std::move(data));
+    }
+}
+
 uint8_t * common_bytes::wdata() {
     if (!buf) {
         return nullptr;
@@ -2380,7 +2439,10 @@ void common_bytes::resize(size_t n) {
         return;
     }
     auto own = std::make_shared<storage>();
-    own->data.reset(new uint8_t[n]); // default-initialized: not zeroed
+    own->data = bytes_pool().take(n);
+    if (!own->data) {
+        own->data.reset(new uint8_t[n]); // default-initialized: not zeroed
+    }
     own->size = n;
     buf = std::move(own);
 }

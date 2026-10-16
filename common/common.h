@@ -1311,6 +1311,9 @@ private:
     struct storage {
         std::unique_ptr<uint8_t[]> data;
         size_t                     size = 0;
+
+        // a large buffer goes back to a small pool, see common_bytes::resize()
+        ~storage();
     };
 
     std::shared_ptr<storage> buf;
