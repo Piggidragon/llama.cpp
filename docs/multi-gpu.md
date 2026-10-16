@@ -37,6 +37,7 @@ Set with `--split-mode` / `-sm`.
 | `-sm` | `--split-mode` | `none` \| `layer` \| `tensor` | `layer` | See modes above. |
 | `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
 | `-as` | `--attn-split` | comma-separated proportions, e.g. `1,3` | follows `-ts` | With `--split-mode tensor`: the share of the attention heads per GPU. The heads take their weights and their KV cache along, the rest of the model follows `--tensor-split`. With GPUs of different speed, give the faster one more of `--tensor-split` and move KV heads to the other one to keep both in memory. The model load logs the KV heads each GPU got. |
+| | `--split-overlap` | - | off | With `--split-mode tensor`: alternate ubatches between two schedulers, so that the AllReduce of one overlaps with the compute of the other. See recipe 8. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
@@ -134,6 +135,33 @@ Environment variables:
 | `GGML_CUDA_AR_CE_MIN_BYTES=N` | size from which the copy engines are used |
 
 The copy engines need 16 MiB of VRAM and 8 MiB of pinned memory per GPU and per context that has large reductions. They are allocated with the first large reduction. An MTP draft context processes the prompt batches as well, so it has its own buffers: 32 MiB of VRAM per GPU in total.
+
+### 8. Overlapping the AllReduce with compute (`--split-overlap`)
+
+```bash
+llama-server -m model.gguf -sm tensor -ub 256 --split-overlap
+```
+
+In `tensor` mode every layer ends with an AllReduce, and the GPUs wait for it. On a slow link this can take a large share of prompt processing: about 40% with an RTX 3060 on PCIe 3.0 x4.
+
+With `--split-overlap`, consecutive ubatches of at least 64 tokens alternate between two schedulers, also across calls. Each scheduler has its own backends, streams and compute buffers. A subgraph waits on each GPU for the subgraphs of the other ubatch that last read or wrote the same state tensors (KV cache, recurrent state). A subgraph without state, such as an FFN, does not wait. So while one ubatch transfers a layer's result, the other computes.
+
+It needs all layers, the KV cache and the experts on the GPUs (the CPU parts of a graph would run outside that order), and devices with events.
+
+The output is the same as without the option. Decode (small ubatches) is not affected.
+
+Notes:
+
+- Each scheduler reserves the compute buffers for a full ubatch. With half the `--ubatch-size`, the memory stays the same, and two ubatches are in flight at once. On the GPUs below, 256 per scheduler was faster than 128, 384 or 512.
+- Each scheduler captures its own CUDA graphs, which takes some more VRAM at run time (about 50 MiB here).
+- The overlap works best with the copy-engine AllReduce of recipe 7: NCCL kernels hold an SM each, and the compute of the other ubatch then runs slower.
+
+Qwen3.8-27B on an RTX 4070 (PCIe 4.0 x16) + RTX 3060 (PCIe 3.0 x4), `-ts 0.625,0.375 -as 1,3`, 262144 tokens of q5_1 cache in 2 slots, with MTP, prompt processing in t/s:
+
+| prompt | `-ub 512` | `-ub 256 --split-overlap` |
+|---|--:|--:|
+| 10k tokens | 733 | 947 |
+| 93k tokens | 570 | 734 |
 
 ---
 

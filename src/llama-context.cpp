@@ -206,6 +206,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.flash_attn_native_quants = params.flash_attn_native_quants;
+    cparams.split_overlap            = params.split_overlap;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -440,6 +441,28 @@ llama_context::llama_context(
             }
         }
 
+        // a second meta backend for the lanes, see llama_context::sched_lane
+        // a draft context only gets small ubatches, it stays on one lane
+        // the CPU parts of a graph run synchronously when the scheduler gets to them, outside of the order between
+        // the lanes: the KV cache, all layers and the experts must be on the devices
+        if (cparams.split_overlap && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+            if (model.devices.size() == 1 && model.devices[0].is_meta && backends.size() == 1 && cparams.n_ubatch >= lanes_min_tokens &&
+                    cparams.offload_kqv && full_offload && !model.has_tensor_overrides() && cparams.moe_cache_size == 0) {
+                backend_lane1.reset(ggml_backend_dev_init(model.devices[0].dev, nullptr));
+                if (backend_lane1 && ggml_backend_meta_share_lanes(backends[0].get(), backend_lane1.get())) {
+                    lanes = true;
+                    LLAMA_LOG_INFO("%s: split overlap: ubatches of at least %u tokens alternate between two schedulers\n", __func__, lanes_min_tokens);
+                } else {
+                    backend_lane1.reset();
+                    LLAMA_LOG_WARN("%s: split overlap needs devices with events, it is not used\n", __func__);
+                }
+            } else {
+                LLAMA_LOG_WARN("%s: split overlap needs split mode tensor, all layers and the KV cache on the devices and a ubatch of at least %u tokens, it is not used\n",
+                        __func__, lanes_min_tokens);
+            }
+        }
+
         // add CPU backend
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
@@ -510,6 +533,11 @@ llama_context::llama_context(
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
+        }
+
+        if (lanes) {
+            lane_other.backend_ptrs = backend_ptrs;
+            lane_other.backend_ptrs[0] = backend_lane1.get();
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -714,6 +742,23 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+void llama_context::lane_switch(int lane) {
+    if (!lanes || lane == lane_active) {
+        return;
+    }
+    std::swap(sched,              lane_other.sched);
+    std::swap(gf_res_prev,        lane_other.gf_res_prev);
+    std::swap(gf_res_prev_active, lane_other.gf_res_prev_active);
+    std::swap(backend_ptrs,       lane_other.backend_ptrs);
+    lane_active = lane;
+
+    // The meta buffers that both lanes use (weights, KV cache) map the views of a graph to the simple tensors of each
+    // device in a rotating pair of containers: a rebuild in the meta backend clears the container of the previous
+    // graph. After the other lane has computed, the views of this lane's previous graph may be gone, so the graph is
+    // built and allocated again instead of reused.
+    gf_res_prev_active = nullptr;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -721,7 +766,17 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    GGML_ASSERT(lane_active == 0);
+    sched_reserve_lane();
+    if (lanes) {
+        lane_switch(1);
+        sched_reserve_lane();
+        lane_switch(0);
+    }
+}
+
+void llama_context::sched_reserve_lane() {
+    LLAMA_LOG_INFO("%s: reserving%s ...\n", __func__, lanes ? (lane_active ? " lane 1" : " lane 0") : "");
 
     synchronize();
 
@@ -876,6 +931,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (lane_other.sched) {
+        ggml_backend_sched_synchronize(lane_other.sched.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2001,7 +2059,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // large ubatches alternate between the lanes, also across calls
+        if (lanes && ubatch.n_tokens >= lanes_min_tokens) {
+            lane_switch(lane_next);
+            lane_next ^= 1;
+        } else {
+            lane_switch(0);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (!res) {
+            lane_switch(0);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2165,6 +2235,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    lane_switch(0);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2860,10 +2932,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                // the backends of the active scheduler lane
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (ggml_backend_get_device(backend) == dev_layer) {
+                        if (ggml_backend_supports_op(backend, cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
                         }
                     }
                 }
@@ -3777,13 +3850,20 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            // the second lane reserves the same buffers
+            ret[buft].compute += backend_buf_exp_size[i] * (lanes ? 2 : 1);
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+        if (lane_other.sched) {
+            for (ggml_backend_t backend : lane_other.backend_ptrs) {
+                ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(lane_other.sched.get(), backend);
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(lane_other.sched.get(), backend);
+            }
         }
     }
     return ret;
@@ -4072,6 +4152,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.flash_attn_native_quants    =*/ false,
+        /*.split_overlap               =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

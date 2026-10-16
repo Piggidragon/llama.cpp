@@ -507,6 +507,7 @@ struct common_params {
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
 
     bool flash_attn_native_quants = false; // read a quantized K/V cache in place instead of casting it to F16
+    bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
