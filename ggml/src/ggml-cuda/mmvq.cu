@@ -100,7 +100,9 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_AMPERE_GA10X,
+    MMVQ_PARAMETERS_ADA,
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -116,6 +118,10 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE_GA10X
+    return MMVQ_PARAMETERS_AMPERE_GA10X;
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_ADA_LOVELACE
+    return MMVQ_PARAMETERS_ADA;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -139,6 +145,12 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE_GA10X) {
+        return MMVQ_PARAMETERS_AMPERE_GA10X;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_ADA_LOVELACE) {
+        return MMVQ_PARAMETERS_ADA;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -449,7 +461,54 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// The types whose vec_dot decodes the weights from grids or lookup tables: more registers and more work per weight.
+static constexpr __host__ __device__ bool mmvq_type_is_grid(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The legacy types with an offset or 8-bit weights, whose vec_dot is the cheapest per weight.
+static constexpr __host__ __device__ bool mmvq_type_is_light(ggml_type type) {
+    return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0;
+}
+
+// Consumer Ampere (sm_86) and Ada (sm_89): narrow blocks, with fewer warps that compute more rows each
+// (calc_rows_per_block), from this ncols_dst on; below it, the generic blocks. Measured on an RTX 3060 and an RTX 4070
+// over all quantized types and k, m of 4096-14336:
+//   - RTX 3060: the grid types gain 4-33% at one column and 6-50% at more, the other types 3-46% from four columns on
+//     (q4_1, q5_1 and q8_0 only from seven on, up to 35%)
+//   - RTX 4070: the grid types gain up to 49% from two columns on, the other types up to 22% at seven and eight
+//     columns (q4_1, q5_1 and q8_0 do not)
+// With these thresholds no type is more than 5% slower at any shape measured.
+static constexpr __host__ __device__ int mmvq_narrow_min_ncols(ggml_type type, mmvq_parameter_table_id table_id) {
+    if (table_id == MMVQ_PARAMETERS_AMPERE_GA10X) {
+        return mmvq_type_is_grid(type) ? 1 : mmvq_type_is_light(type) ? 7 : 4;
+    }
+    if (table_id == MMVQ_PARAMETERS_ADA) {
+        return mmvq_type_is_grid(type) ? 2 : mmvq_type_is_light(type) ? MMVQ_MAX_BATCH_SIZE + 1 : 7;
+    }
+    return MMVQ_MAX_BATCH_SIZE + 1;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (table_id == MMVQ_PARAMETERS_AMPERE_GA10X || table_id == MMVQ_PARAMETERS_ADA) {
+        if (ncols_dst >= mmvq_narrow_min_ncols(type, table_id) && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+            return ncols_dst <= 4 ? 2 : 1;
+        }
+        table_id = MMVQ_PARAMETERS_GENERIC;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -577,6 +636,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_AMPERE_GA10X || table_id == MMVQ_PARAMETERS_ADA) {
+        // the narrow blocks of calc_nwarps (fewer warps than the generic ones) compute more rows
+        const int nwarps_generic = ncols_dst <= 4 ? 4 : 2;
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE && nwarps < nwarps_generic) {
+            return ncols_dst == 1 ? 2 : 4;
+        }
+        table_id = MMVQ_PARAMETERS_GENERIC;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
