@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -2026,6 +2027,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & buf: bufs) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+        }
+    }
+
+    // the attention split gives each layer whole KV heads, rounding toward a different device from layer to layer:
+    // show what it came to over all layers
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && params.attn_split != nullptr && get_split_state_ud.n_devices > 1) {
+        const size_t n_dev = get_split_state_ud.n_devices;
+
+        std::vector<int64_t> n_head_kv_dev(n_dev, 0);
+        int64_t n_head_kv_all = 0;
+
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            const std::string name = "blk." + std::to_string(il) + ".attn_output.weight";
+            const ggml_tensor * attn_out = get_tensor(name.c_str());
+            if (attn_out == nullptr) {
+                continue;
+            }
+
+            const ggml_backend_meta_split_state split_state = llama_meta_device_get_split_state(attn_out, &get_split_state_ud);
+            if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_0) {
+                continue;
+            }
+
+            const int64_t n_embd_head_kv = (int64_t) hparams.n_embd_head_v(il) * hparams.n_gqa(il);
+            for (size_t j = 0; j < n_dev; ++j) {
+                n_head_kv_dev[j] += split_state.ne[j] / n_embd_head_kv;
+            }
+            n_head_kv_all += attn_out->ne[0] / n_embd_head_kv;
+        }
+
+        if (n_head_kv_all > 0) {
+            std::string desc;
+            for (size_t j = 0; j < n_dev; ++j) {
+                desc += format("%sdevice %zu: %" PRId64 " (%.1f%%)", j > 0 ? ", " : "", j, n_head_kv_dev[j], 100.0*n_head_kv_dev[j]/n_head_kv_all);
+            }
+            LLAMA_LOG_INFO("%s: attention split, KV heads of all layers per device: %s\n", __func__, desc.c_str());
         }
     }
 

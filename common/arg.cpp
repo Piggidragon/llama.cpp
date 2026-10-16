@@ -2908,9 +2908,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-as", "--attn-split"}, "N0,N1,N2,...",
         "fraction of the attention heads to give each GPU under --split-mode tensor, comma-separated, "
-        "e.g. 3,1. Only the heads move, the rest of the model still follows --tensor-split. Each share is "
-        "rounded down to whole heads, so a ratio the head count cannot express is not matched exactly. "
-        "Useful when the GPUs differ in host bandwidth or in speed (default: follow --tensor-split)",
+        "e.g. 1,3. The heads take their weights and their KV cache along, the rest of the model (FFN, "
+        "linear attention, output) still follows --tensor-split. Each layer gets whole KV heads, and the "
+        "rounding goes to a different GPU from layer to layer, so the share over all layers follows the "
+        "ratio (the log shows the result). With GPUs of different speed, give the faster one more of "
+        "--tensor-split and move KV heads to the other one to keep both in memory "
+        "(default: follow --tensor-split)",
         [](common_params & params, const std::string & value) {
             const std::regex regex{ R"([,/]+)" };
             std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
