@@ -56,7 +56,17 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    // with the phase-aware or live-context workspace, also when the next batch has n_tokens tokens and its attention
+    // reads up to n_kv cells of the KV cache (0 = the reserved size)
+    void sched_reserve(uint32_t n_tokens = 0, uint32_t n_kv = 0);
+
+    // compute in the buffers of owner (phase-aware workspace), see llama_attach_shared_workspace()
+    int  attach_shared_workspace(llama_context & owner);
+    bool shares_workspace_with(const llama_context & other) const;
+
+    // return the memory that the device memory pools keep after the batch that needed it, see
+    // llama_trim_transient_memory()
+    uint64_t trim_transient_memory();
 
     void synchronize();
 
@@ -281,8 +291,27 @@ private:
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
-    // reserve the compute buffers of the active scheduler lane
-    void sched_reserve_lane();
+    // the compute buffers that sched_reserve() reserves: ubatches of up to n_tokens tokens whose attention reads
+    // up to n_kv cells (0 = the full KV cache)
+    struct sched_plan {
+        uint32_t n_tokens_max = 0; // n_ubatch
+        uint32_t n_tokens     = 0;
+        uint32_t n_kv         = 0;
+    };
+
+    sched_plan sched_make_plan(uint32_t n_tokens, uint32_t n_kv) const;
+
+    // whether the compute buffers follow the plan (phase-aware or live-context workspace)
+    bool sched_resizable() const;
+
+    // reserve the compute buffers of the active scheduler lane, force: also if the plan did not change
+    void sched_reserve_lane(const sched_plan & plan, bool force);
+
+    // the context that shares the compute buffers with this one (phase-aware workspace)
+    llama_context * workspace_peer() const;
+
+    // wait until the peer no longer uses the shared compute buffers
+    void workspace_acquire();
 
     // make a scheduler lane the active one (sched, gf_res_prev, backend_ptrs)
     void lane_switch(int lane);
@@ -379,6 +408,29 @@ private:
 
     bool sched_need_reserve = true;
 
+    // the reservation of the compute buffers of a scheduler lane with the phase-aware or live-context workspace
+    struct sched_ws {
+        uint64_t generation        = 0; // of the buffers: a change invalidates the allocated graphs
+        uint64_t shrink_generation = 0; // a change asks for a new reservation, so that a shared buffer can shrink
+        uint32_t n_tokens          = 0; // 0 = not reserved yet
+        uint32_t n_kv              = 0; // 0 = the full KV cache
+    };
+
+    sched_ws ws; // of the active lane
+
+    // phase-aware workspace: a batch of up to this many tokens reserves only for its size
+    uint32_t ws_decode_tokens = 0;
+
+    // calls in a row whose plan is smaller than the reservation, it shrinks after ws_shrink_after of them
+    uint32_t       ws_shrink_votes = 0;
+    const uint32_t ws_shrink_after = 64;
+
+    // phase-aware workspace: an MTP context computes in the buffers of lane 0 of its target. The two must be used
+    // one after the other: each waits until the other has finished with the buffers (ws_in_flight)
+    llama_context * ws_owner     = nullptr; // the context whose buffers this one uses
+    llama_context * ws_borrower  = nullptr; // the context that uses the buffers of this one
+    bool            ws_in_flight = false;   // graphs were computed since the last synchronize()
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
@@ -437,6 +489,7 @@ private:
         std::array<llm_graph_result_ptr, 2> gf_res_prev;
         llm_graph_result *                  gf_res_prev_active = nullptr;
         std::vector<ggml_backend_t>         backend_ptrs;
+        sched_ws                            ws;
     };
     sched_lane       lane_other;
     int              lane_active = 0;

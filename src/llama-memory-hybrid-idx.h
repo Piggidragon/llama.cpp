@@ -55,6 +55,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // the attention and the indexer cache read the first n_kv cells, the pools follow
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -159,6 +162,9 @@ public:
     // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
 
+    // used to create a context whose attention and indexer read the first n_kv cells (bounded compute buffers)
+    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv);
+
     // used to create an update context
     llama_memory_hybrid_idx_context(
             llama_memory_hybrid_idx * mem,
@@ -221,6 +227,9 @@ private:
     // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
     struct kpool_state;
     kpool_state kpool_build_sizes() const;
+
+    // the pool sizes of a reserve context whose streams hold up to n_kv cells
+    void kpool_reserve(uint32_t n_kv);
     void kpool_build_state(const llama_ubatch & ubatch);
     const kpool_state & kpool_cur() const;
 

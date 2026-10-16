@@ -65,6 +65,9 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // the number of KV cells that the attention of any ubatch of this batch reads at most (padded), 0 if unknown
+    virtual uint32_t get_attn_reserve_n_kv() const { return 0; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -94,6 +97,15 @@ struct llama_memory_i {
 
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
+
+    // like init_full(), but the attention reads only the first n_kv cells (live-context workspace)
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_kv) {
+        GGML_UNUSED(n_kv);
+        return init_full();
+    }
+
+    // the largest n_kv of init_reserve(), 0 if init_reserve() is not bounded
+    virtual uint32_t get_attn_reserve_capacity() const { return 0; }
 
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
