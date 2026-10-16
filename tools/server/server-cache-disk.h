@@ -7,25 +7,35 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // disk level of the prompt cache (--cache-disk)
 //
-// prompt states evicted from the RAM level are written to one file each in the cache directory and are
-// loaded back when a later request shares their prefix. the files are indexed again on startup, so the
-// cache outlives the process. files are written by a background thread: an evicted state stays in memory
-// until its file is complete, and a request that needs it in the meantime takes it back from the queue.
+// prompt states evicted from the RAM level are written to the cache directory and are loaded back when a later
+// request shares their prefix. the files are indexed again on startup, so the cache outlives the process.
+// files are written by a background thread: an evicted state stays in memory until its files are complete, and a
+// request that needs it in the meantime takes it back from the queue.
+//
+// a ranged state (see server_prompt_data) is written as a head file (tokens, block keys, the KV after the last
+// block and the partial state) and one file per KV block. blocks are shared by all heads that hold the same
+// tokens, so a conversation that grows writes only its new blocks. a state of a memory without ranges is written
+// as one file.
 //
 // file names start with a fingerprint of the model files and of the settings that change the KV contents,
 // so several models can share one directory. files of other fingerprints are never loaded, but they count
 // toward the size limit and are removed first when they are the least recently used.
 struct server_prompt_cache_disk {
     using time_point = std::filesystem::file_time_type;
+
+    // KV blocks that the RAM level holds, so that fetch() does not read them from disk; may return nullptr
+    using block_source = std::function<server_kv_block_ptr(uint64_t key)>;
 
     // limit_size:    bytes in the directory, 0 = no limit
     // limit_pending: bytes of states waiting to be written, 0 = no limit; beyond it the oldest waiting state is dropped
@@ -46,9 +56,9 @@ struct server_prompt_cache_disk {
     // updates lcp_best; entries with more than n_tokens_max tokens are skipped
     int64_t find(const server_tokens & tokens_new, size_t n_tokens_max, size_t & lcp_best) const;
 
-    // move the state of an entry into out: a waiting state is taken back, a written one is read from its file
+    // move the state of an entry into out: a waiting state is taken back, a written one is read from its files
     // a corrupt file is deleted
-    bool fetch(int64_t id, server_prompt_cache_state & out);
+    bool fetch(int64_t id, server_prompt_cache_state & out, const block_source & source = nullptr);
 
     // the state fetched for id did not restore into the context (no room, ...): a file is kept but skipped
     // after repeated failures, a state that was taken back is queued again
@@ -75,8 +85,13 @@ private:
 
         server_tokens tokens;
 
+        bool ranged = false;
+
+        // keys of the KV blocks of a ranged state, in position order
+        std::vector<uint64_t> blocks;
+
         size_t size     = 0; // file size once written, state size while waiting
-        size_t size_mem = 0; // bytes of the waiting state
+        size_t size_mem = 0; // bytes of the waiting state that are not on disk yet
 
         time_point t_used; // last use, kept as the file mtime
 
@@ -96,6 +111,19 @@ private:
         bool busy() const { return writing || reading; }
     };
 
+    // a KV block file, shared by the heads that list its key
+    struct block {
+        std::string path;
+
+        size_t size = 0;
+        int    refs = 0;
+
+        bool on_disk = false;
+
+        // the block data while it waits to be written
+        server_kv_block_ptr data;
+    };
+
     std::string dir;
     std::string prefix; // file name prefix for the current fingerprint
 
@@ -111,6 +139,8 @@ private:
     std::list<entry>    entries;
     std::deque<int64_t> queue; // ids of the entries waiting to be written, oldest first
 
+    std::unordered_map<uint64_t, block> blocks;
+
     size_t  size_pending = 0;
     int64_t id_next      = 0;
     bool    stopping     = false;
@@ -123,12 +153,19 @@ private:
 
     void scan();
 
+    std::string block_path(uint64_t key) const;
+
     // must be called with mtx held
     size_t size_on_disk() const;
     bool   make_room(size_t size_new, int64_t id_keep, time_point t_new);
     void   erase_entry(std::list<entry>::iterator it);
     void   drop_superseded(const entry & cur);
+    void   release_blocks(const entry & e);
 
-    bool write_file(const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const;
-    bool read_file (const std::string & path, server_prompt_cache_state & out, bool tokens_only) const;
+    bool write_file (const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const;
+    bool read_file  (const std::string & path, server_prompt_cache_state & out, bool tokens_only) const;
+    bool write_head (const std::string & path, const server_prompt_cache_state & state, const std::atomic<bool> & cancel) const;
+    bool read_head  (const std::string & path, server_prompt_cache_state & out, std::vector<uint64_t> & keys, bool header_only) const;
+    bool write_block(const std::string & path, const server_kv_block & block, const std::atomic<bool> & cancel) const;
+    bool read_block (const std::string & path, server_kv_block & out, bool header_only) const;
 };

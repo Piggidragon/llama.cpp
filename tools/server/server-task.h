@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <filesystem>
 #include <list>
 #include <memory>
@@ -643,12 +644,57 @@ struct server_prompt {
     }
 };
 
+// a block of the KV cache of a prompt: the cells of tokens [n_begin, n_end) that can be rolled back
+// (llama_state_seq_get_data_range). the key hashes tokens [0, n_end), so blocks with the same key hold the same
+// KV and are shared between prompts, in RAM and on disk
+struct server_kv_block {
+    uint64_t key     = 0;
+    size_t   n_begin = 0;
+    size_t   n_end   = 0;
+
+    std::vector<uint8_t> tgt;
+    std::vector<uint8_t> dft;
+
+    size_t size() const {
+        return tgt.size() + dft.size();
+    }
+};
+
+using server_kv_block_ptr = std::shared_ptr<const server_kv_block>;
+
 struct server_prompt_data {
+    // the whole state, for a memory without state ranges
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
+    // with state ranges: KV blocks of server_prompt_cache::n_block tokens, the KV of the tokens after the last
+    // block, and the partial state (llama_state_seq_get_data_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+    bool ranged = false;
+
+    std::vector<server_kv_block_ptr> blocks;
+
+    std::vector<uint8_t> tail_tgt;
+    std::vector<uint8_t> tail_dft;
+
+    std::vector<uint8_t> part_tgt;
+    std::vector<uint8_t> part_dft;
+
+    // the KV after the blocks up to the newest checkpoint, see server_prompt_cache_state::at_checkpoint()
+    std::vector<uint8_t> tail_ckpt_tgt;
+    std::vector<uint8_t> tail_ckpt_dft;
+
+    // bytes not shared with other prompts
+    size_t size_own() const {
+        return main.size() + drft.size() + tail_tgt.size() + tail_dft.size() + part_tgt.size() + part_dft.size() +
+               tail_ckpt_tgt.size() + tail_ckpt_dft.size();
+    }
+
     size_t size() const {
-        return main.size() + drft.size();
+        size_t res = size_own();
+        for (const auto & block : blocks) {
+            res += block->size();
+        }
+        return res;
     }
 };
 
@@ -656,8 +702,8 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
-    size_t size() const {
-        size_t res = data.size();
+    size_t size_own() const {
+        size_t res = data.size_own();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -665,6 +711,15 @@ struct server_prompt_cache_state {
 
         return res;
     }
+
+    size_t size() const {
+        return size_own() + data.size() - data.size_own();
+    }
+
+    // the state at its newest checkpoint, without checkpoints: the form the disk level stores, so that a hybrid model
+    // writes one recurrent state per prompt. a resumed conversation diverges after the checkpoint (in the last reply),
+    // so it would roll back to it anyway. a state without checkpoints stays as it is
+    server_prompt_cache_state at_checkpoint() &&;
 };
 
 struct server_prompt_cache_disk;
@@ -695,9 +750,19 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // tokens per KV block, for a memory with state ranges; 0 stores whole states
+    size_t n_block = 2048;
+
+    // copy the prompt of a slot and its state; KV blocks that a cached prompt holds already are shared
+    bool copy_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, server_prompt_cache_state & out);
+
+    // copy the prompt of a slot into the cache, false if it is cached already or does not fit
+    bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // a KV block held by a cached prompt in RAM, nullptr if there is none
+    server_kv_block_ptr find_block(uint64_t key);
 
     // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
     // for a slot that shares lcp_base tokens with it; lcp_base if there is none
@@ -708,6 +773,11 @@ struct server_prompt_cache {
     // remove the oldest state, handing it to the disk level if there is one
     void evict_oldest();
 
+private:
+    // the KV blocks held in RAM, by key
+    std::unordered_map<uint64_t, std::weak_ptr<const server_kv_block>> blocks_ram;
+
+public:
     // hand all states to the disk level, newest first, and optionally wait until they are written
     // t_newest is the last use given to the newest state, the older ones get earlier times
     void flush_to_disk(bool wait, std::filesystem::file_time_type t_newest);

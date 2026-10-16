@@ -307,53 +307,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
-            return false;
-        }
-
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
-    }
-
-    // copy the prompt and its state in the form the prompt cache stores
-    bool prompt_copy(server_prompt_cache_state & out) const {
-        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        try {
-            out.data.main.resize(size_tgt);
-            out.data.drft.resize(size_dft);
-        } catch (const std::bad_alloc & e) {
-            SLT_WRN(*this, "failed to allocate memory for prompt state: %s\n", e.what());
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, out.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        out.prompt.tokens      = prompt.tokens.clone();
-        out.prompt.checkpoints = server_prompt_cache::newest_checkpoints(prompt.checkpoints);
-
-        return true;
+        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1162,8 +1116,8 @@ private:
             }
 
             server_prompt_cache_state state;
-            if (slot->prompt_copy(state)) {
-                prompt_cache->disk->put(std::move(state), t_used, false);
+            if (prompt_cache->copy_state(slot->prompt, ctx_tgt, ctx_dft, slot->id, state)) {
+                prompt_cache->disk->put(std::move(state).at_checkpoint(), t_used, false);
 
                 // one copy in memory at a time
                 if (wait) {
@@ -1628,6 +1582,7 @@ private:
             std::unique_ptr<server_prompt_cache_disk> disk_prev = prompt_cache ? std::move(prompt_cache->disk) : nullptr;
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->n_block = params_base.cache_block_size;
 
             if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
                 SRV_INF("%s", "disk prompt cache disabled by --cache-disk-size 0\n");

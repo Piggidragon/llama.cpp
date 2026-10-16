@@ -49,6 +49,24 @@ def cache_files():
     return glob.glob(os.path.join(cache_dir, "pc-*.bin"))
 
 
+def head_files():
+    return [f for f in cache_files() if os.path.basename(f).split("-")[2].startswith("h")]
+
+
+def block_files():
+    return [f for f in cache_files() if os.path.basename(f).split("-")[2].startswith("k")]
+
+
+def head_blocks(path: str) -> list[int]:
+    # head: u32 magic, u32 version, u64 fingerprint, u64 n + n packed tokens, u32 n_blocks + n_blocks u64 keys
+    with open(path, "rb") as f:
+        f.seek(16)
+        n_packed = int.from_bytes(f.read(8), "little")
+        f.seek(24 + 4 * n_packed)
+        n_blocks = int.from_bytes(f.read(4), "little")
+        return [int.from_bytes(f.read(8), "little") for _ in range(n_blocks)]
+
+
 # distinct prompts of about 150 tokens each, so that a few of them fill the 1 MiB RAM level
 def make_prompt(i: int) -> str:
     words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett"]
@@ -64,8 +82,10 @@ def complete(prompt: str):
     return res.body
 
 
-def test_restore_after_restart():
+@pytest.mark.parametrize("block_size", [None, 0])
+def test_restore_after_restart(block_size):
     global server
+    server.cache_block_size = block_size
     server.start()
 
     prompt = make_prompt(0)
@@ -88,8 +108,10 @@ def test_restore_after_restart():
     assert res["content"] == first["content"]
 
 
-def test_spill_on_eviction():
+@pytest.mark.parametrize("block_size", [None, 0])
+def test_spill_on_eviction(block_size):
     global server
+    server.cache_block_size = block_size
     server.start()
     log = LogReader(server.log_path)
 
@@ -181,8 +203,10 @@ def test_other_fingerprints_count_toward_limit():
     assert not os.path.exists(other)
 
 
-def test_corrupt_file_removed():
+@pytest.mark.parametrize("block_size", [None, 0])
+def test_corrupt_file_removed(block_size):
     global server
+    server.cache_block_size = block_size
     server.start()
     first = complete(make_prompt(0))
     server.stop()
@@ -236,3 +260,64 @@ def test_cached_prompt_beats_slot():
     assert "prompt cache shares a longer prefix with the task" in log.drain()
     assert res["timings"]["cache_n"] >= a["timings"]["prompt_n"] - 8
     assert res["timings"]["prompt_n"] < 32
+
+
+def test_only_new_blocks_written():
+    global server
+    server.cache_block_size = 64
+    server.n_ctx = 2048
+    server.start()
+
+    prompt = make_prompt(0)[:900]
+    first = complete(prompt)
+    server.stop()
+
+    heads = head_files()
+    assert len(heads) == 1
+    keys_before = set(head_blocks(heads[0]))
+    blocks_before = {f: (os.stat(f).st_ino, os.stat(f).st_mtime_ns) for f in block_files()}
+    assert len(blocks_before) == len(keys_before) > 0
+
+    # the conversation continues after a restart: it is restored from disk and grows by more than a block
+    server = make_server()
+    server.cache_block_size = 64
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete(prompt + first["content"] + " " + make_prompt(5)[:400])
+    assert res["timings"]["cache_n"] >= first["timings"]["prompt_n"] - 8
+    server.stop()
+
+    # the new head lists the old blocks, which are not written again; only the new blocks are
+    newest = max(head_files(), key=os.path.getmtime)
+    keys = set(head_blocks(newest))
+    assert keys_before <= keys
+    for f, sig in blocks_before.items():
+        assert os.path.exists(f)
+        assert (os.stat(f).st_ino, os.stat(f).st_mtime_ns) == sig
+
+    content = log.drain()
+    n_new = sum(int(l.split("(")[1].split(" new KV")[0]) for l in content.splitlines() if "disk prompt cache: wrote prompt" in l)
+    assert n_new == len(keys - keys_before) > 0
+    assert len(block_files()) == len(keys)
+
+
+def test_shared_prefix_blocks_stored_once():
+    global server
+    server.cache_block_size = 64
+    server.n_slots = 2
+    server.n_ctx = 1024
+    server.start()
+
+    # two conversations in two slots that share a long prefix, both written on exit
+    shared = make_prompt(1)[:1400]
+    for i, ending in enumerate([" The first ending is about alpha and bravo.", " The second ending is about charlie and delta, which is longer."]):
+        res = server.make_request("POST", "/completion", data={"prompt": shared + ending, "cache_prompt": True, "id_slot": i})
+        assert res.status_code == 200
+    server.stop()
+
+    heads = head_files()
+    assert len(heads) == 2
+    keys_a, keys_b = (set(head_blocks(h)) for h in heads)
+    assert len(keys_a & keys_b) > 0
+    assert len(block_files()) == len(keys_a | keys_b)

@@ -644,6 +644,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
     int32_t cache_disk_mib      = 32768; // size limit of the disk level of the prompt cache, -1 = no limit, 0 = disable
+    int32_t cache_block_size    = 2048;  // tokens per KV block of a cached prompt, 0 = whole states
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

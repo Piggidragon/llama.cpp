@@ -168,6 +168,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `--cache-disk PATH` | directory for the disk level of the prompt cache: prompts evicted from --cache-ram are written there and loaded back when a later request shares their prefix, also after a restart (default: disabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_DISK) |
 | `--cache-disk-size N` | set the maximum size of the --cache-disk directory in MiB (default: 32768, -1 - no limit, 0 - disable)<br/>(env: LLAMA_ARG_CACHE_DISK_SIZE) |
+| `--cache-block-size N` | tokens per KV block of a cached prompt: prompts that share blocks store them once, in RAM and on disk, and only new blocks are written to --cache-disk; 0 stores whole states (default: 2048)<br/>(env: LLAMA_ARG_CACHE_BLOCK_SIZE) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -341,15 +342,17 @@ services:
 
 ### Prompt cache on disk
 
-With `--cache-disk PATH`, the prompt cache (`--cache-ram`) gets a second level on disk. A prompt state that the RAM level evicts is written to a file in `PATH` by a background thread instead of being dropped. When a later request shares a longer prefix with a file than with any slot or RAM entry, the state is read back, together with its context checkpoints. On exit (and before the server sleeps) the idle slots and the RAM entries are written as well, and on startup the files are indexed again, so the cache outlives the process.
+With `--cache-disk PATH`, the prompt cache (`--cache-ram`) gets a second level on disk. A prompt state that the RAM level evicts is written to `PATH` by a background thread instead of being dropped. When a later request shares a longer prefix with a stored prompt than with any slot or RAM entry, the state is read back. On exit (and before the server sleeps) the idle slots and the RAM entries are written as well, and on startup the files are indexed again, so the cache outlives the process.
 
+- A prompt is stored in KV blocks of `--cache-block-size` tokens (default 2048) plus a head with the KV after the last block and the parts of the state that cannot be rolled back (recurrent states, sliding-window caches). A block is identified by all tokens up to its end, so prompts that share a prefix share its blocks, in RAM and on disk: a conversation that grows writes only its new blocks and its head. This uses `llama_state_seq_get_data_range()`; memories without state ranges (DSA, MSA and indexed hybrid caches), prompts with media and `--cache-block-size 0` store whole states instead.
+- On disk a prompt is stored at its newest context checkpoint, so that a hybrid or sliding-window model writes one partial state per prompt. A resumed conversation diverges in its last reply anyway, after that checkpoint.
 - File names start with a fingerprint of the model, mmproj, draft model, LoRA and control vector files and of the settings that change the KV contents (KV cache types, RoPE/YaRN, metadata overrides), so several models and configurations can share one directory. Files of other fingerprints are never loaded.
-- `--cache-disk-size` limits all files in the directory, including those of other fingerprints; the least recently used file is removed first. 5% of the file system (at least 1 GiB) is always left free. `--cache-disk-size 0` disables the disk level.
-- A state is written once: nothing is written if a file already holds the same tokens or a continuation of them, and a file whose tokens are a prefix of a new one is removed.
-- A cached prompt (in RAM or on disk) keeps only the newest 3 context checkpoints of its slot: a resumed conversation rolls back to the ones near the end of its last prompt. When the history changes further back, the prompt is processed again from an earlier point.
+- `--cache-disk-size` limits all files in the directory, including those of other fingerprints; the least recently used prompt is removed first, with the blocks that no other prompt holds. 5% of the file system (at least 1 GiB) is always left free. `--cache-disk-size 0` disables the disk level.
+- Nothing is written if a stored prompt holds the same tokens or a continuation of them, and a stored prompt whose tokens are a prefix of a new one is removed.
+- A cached prompt in RAM keeps only the newest 3 context checkpoints of its slot.
 - States larger than `--cache-ram` are not cached, as without the disk level. States waiting to be written may hold about half of `--cache-ram` on top of it; when the disk is slower than that, the oldest waiting states are dropped.
-- A file whose state does not restore (for example no free cells in a unified KV cache) is kept, and skipped after the second failure.
-- Writing on exit can take a while for large states. In router mode, raise `stop-timeout` of the model preset, else the router stops the instance before the files are complete (incomplete files are removed on the next start). Before sleeping, the states are only handed to the writer thread.
+- A prompt whose state does not restore (for example no free cells in a unified KV cache) is kept, and skipped after the second failure.
+- Writing on exit can take a while. In router mode, raise `stop-timeout` of the model preset, else the router stops the instance before the files are complete (incomplete files are removed on the next start). Before sleeping, the states are only handed to the writer thread.
 
 ### Multimodal support
 
