@@ -202,6 +202,20 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
     mem_recr->state_read(io, seq_id, flags);
 }
 
+bool llama_memory_hybrid_iswa::state_range_supported() const {
+    return mem_attn->state_range_supported() && mem_recr->state_range_supported();
+}
+
+void llama_memory_hybrid_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    mem_attn->state_write_range(io, seq_id, p0, p1);
+    mem_recr->state_write_range(io, seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, bool append) {
+    mem_attn->state_read_range(io, seq_id, append);
+    mem_recr->state_read_range(io, seq_id, append);
+}
+
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
 }

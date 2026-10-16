@@ -2220,6 +2220,107 @@ const slot_info_vec_t *   sinfos_in) {
     }
 }
 
+void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other || swa_type != LLAMA_SWA_TYPE_NONE) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    io.write(&n_stream, sizeof(n_stream));
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_ranges_t cr { s, {} };
+
+        uint32_t cell_count = 0;
+
+        const auto & cells = v_cells[s];
+
+        // the ranges of cells of seq_id with a position in [p0, p1)
+        uint32_t cell_range_begin = cells.size();
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            bool add_cell = !cells.is_empty(i) && cells.seq_has(i, seq_id);
+
+            if (add_cell) {
+                const llama_pos pos = cells.pos_get(i);
+
+                add_cell = pos >= p0 && (p1 < 0 || pos < p1);
+            }
+
+            if (add_cell) {
+                ++cell_count;
+                if (cell_range_begin == cells.size()) {
+                    cell_range_begin = i;
+                }
+            } else if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+
+        if (cell_range_begin != cells.size()) {
+            cr.data.emplace_back(cell_range_begin, cells.size());
+        }
+
+        io.write(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        state_write_meta(io, cr, seq_id);
+        state_write_data(io, cr);
+    }
+}
+
+void llama_kv_cache::state_read_range(llama_io_read_i & io, llama_seq_id seq_id, bool append) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other || swa_type != LLAMA_SWA_TYPE_NONE) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    uint32_t n_stream_cur;
+    io.read(&n_stream_cur, sizeof(n_stream_cur));
+    if (n_stream_cur != n_stream) {
+        throw std::runtime_error("n_stream mismatch");
+    }
+
+    // the first range replaces the sequence, also when it holds no cells
+    if (!append) {
+        seq_rm(seq_id, -1, -1);
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count;
+        io.read(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        slot_info sinfo;
+
+        bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, append);
+
+        try {
+            res = res && state_read_data(io, strm, cell_count, sinfo);
+        } catch (...) {
+            res = false;
+        }
+
+        if (!res) {
+            state_clear(seq_id, strm, sinfo);
+            throw std::runtime_error("failed to restore kv cache range");
+        }
+    }
+}
+
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
@@ -2354,7 +2455,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2365,7 +2466,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        // an appended range keeps the cells of the sequence, its positions must follow them
+        const llama_pos pos_last = append ? cells.seq_pos_max(dest_seq_id) : -1;
+
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2388,6 +2494,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                return false;
+            }
+
+            if (append && pos <= pos_last) {
+                LLAMA_LOG_ERROR("%s: appended cell at position %d, the sequence already reaches %d\n", __func__, pos, pos_last);
                 return false;
             }
 
