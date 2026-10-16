@@ -211,6 +211,9 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Release the memory that the memory pools of a backend keep beyond what is in use, returns the released bytes
+    typedef size_t (*ggml_backend_trim_pools_t)(ggml_backend_t backend);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -338,6 +341,10 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    GGML_API bool                 ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner);
+    GGML_API void                 ggml_backend_sched_get_buffer_state(ggml_backend_sched_t sched, uint64_t * generation, uint64_t * shrink_generation);
+    GGML_API void                 ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
@@ -435,6 +442,10 @@ extern "C" {
     // recurrent state), so the AllReduce of one lane overlaps with the compute of the other. The graphs must not
     // share intermediate buffers (one scheduler per lane). Returns false if a device has no events.
     GGML_API bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b);
+
+    // ggml_backend_trim_pools_t of the backend (of all simple backends of a meta backend), 0 if it has none
+    // call it while the backend is idle: it synchronizes the backend
+    GGML_API size_t ggml_backend_trim_pools(ggml_backend_t backend);
 
     //
     // Utils
