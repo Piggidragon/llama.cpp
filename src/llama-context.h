@@ -414,6 +414,7 @@ private:
         uint64_t shrink_generation = 0; // a change asks for a new reservation, so that a shared buffer can shrink
         uint32_t n_tokens          = 0; // 0 = not reserved yet
         uint32_t n_kv              = 0; // 0 = the full KV cache
+        size_t   max_nodes         = 0; // the graph size the scheduler was created with
     };
 
     sched_ws ws; // of the active lane
@@ -430,6 +431,7 @@ private:
     llama_context * ws_owner     = nullptr; // the context whose buffers this one uses
     llama_context * ws_borrower  = nullptr; // the context that uses the buffers of this one
     bool            ws_in_flight = false;   // graphs were computed since the last synchronize()
+    bool            ws_reattach  = false;   // the owner has a new scheduler: borrow its buffers at the next reserve
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

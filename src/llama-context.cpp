@@ -879,7 +879,12 @@ void llama_context::sched_reserve(uint32_t n_tokens, uint32_t n_kv) {
 void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     const bool resizable = sched_resizable();
 
-    if (resizable && sched) {
+    // the scheduler keeps the graph size it was created with (its hash set): a larger graph (backend samplers, LoRA,
+    // training) needs a new one, and a borrower whose owner has a new one borrows again
+    const size_t max_nodes = this->graph_max_nodes(plan.n_tokens_max);
+    const bool   sched_new_needed = !resizable || !sched || max_nodes > ws.max_nodes || (lane_active == 0 && ws_reattach);
+
+    if (resizable && sched && !sched_new_needed) {
         if (ws.n_tokens > plan.n_tokens || ws.n_kv > plan.n_kv) {
             ggml_backend_sched_request_buffer_shrink(sched.get());
         }
@@ -925,8 +930,6 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = plan.n_tokens;
 
-    const size_t max_nodes = this->graph_max_nodes(plan.n_tokens_max);
-
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     for (auto & res : gf_res_prev) {
@@ -936,9 +939,19 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     gf_res_prev_active = nullptr;
 
     // the buffers of the workspace options keep their scheduler, it resizes them
-    const bool sched_created = !resizable || !sched;
+    const bool sched_created = sched_new_needed;
     if (sched_created) {
+        // the borrower keeps the buffers of the old scheduler until it borrows the new one at its next reserve
+        if (resizable && sched && lane_active == 0 && ws_borrower != nullptr) {
+            ws_borrower->ws_reattach        = true;
+            ws_borrower->sched_need_reserve = true;
+        }
         sched_new(max_nodes, cparams.pipeline_parallel);
+        ws = {};
+        ws.max_nodes = max_nodes;
+        if (lane_active == 0) {
+            ws_reattach = false;
+        }
     }
     if (resizable && sched_created) {
         // lane 0 of an MTP context computes in the buffers of lane 0 of its target
