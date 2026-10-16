@@ -1,55 +1,40 @@
 # What this fork adds
 
-Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the two features below. The rest of this file is the upstream README.
+Branch `master` mirrors [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Branch `main` is upstream plus the features below. Each one is off until you enable it; without the flags everything runs as upstream. The rest of this file is the upstream README.
 
-## Quantized-native CUDA FlashAttention
+## Features
 
-The CUDA MMA FlashAttention kernel reads a quantized K/V cache in place, instead of casting the visible attention window to F16 first.
+- **Quantized-native FlashAttention (CUDA).** The FlashAttention kernel reads a quantized K/V cache in place instead of first copying the attention window to F16.
+  - Benefit: faster generation at long context (Qwen3.8-27B: +6-11% at 16k, up to +39% at 64k), and no F16 copy in the compute buffer (1.6 GiB less at 262k context).
+  - Enable: `--flash-attn-native-quants` (`-fanq 1` in llama-bench) with a quantized cache, the same type for K and V (`-ctk q5_1 -ctv q5_1`). `q4_1`, `q5_0` and `q5_1` need `-DGGML_CUDA_FA_QUANTS=<pair>` or `all` at build time. [Details](docs/quantized-native-flash-attention.md)
+- **Prompt cache on disk.** A disk level below the RAM prompt cache. Prompts are stored as KV blocks keyed by their prefix, so conversations with a shared prefix share blocks, and a growing conversation writes only its new blocks.
+  - Benefit: conversations survive RAM eviction, restarts and model swaps, and resume without processing the prompt again. The next turn of a 25k-token conversation writes 0.16 GB instead of 2.3 GB.
+  - Enable: `--cache-disk PATH` (server), sized with `--cache-disk-size` (MiB) and `--cache-block-size` (tokens). [Details](tools/server/README.md#prompt-cache-on-disk)
+- **Attention split** (`--split-mode tensor`). The attention heads and their KV cache get their own split across the GPUs, separate from `--tensor-split`.
+  - Benefit: with GPUs of different speed, the faster one takes more of the weights while the other one holds more of the KV cache.
+  - Enable: `--attn-split 1,3` (`-as`), next to e.g. `--tensor-split 0.625,0.375`. [Details](docs/multi-gpu.md)
+- **AllReduce by size** (`--split-mode tensor`, two CUDA GPUs). Small reductions go through a kernel with a handshake instead of NCCL, and large ones through the copy engines. With `p2p`, the GPUs write directly into each other's memory.
+  - Benefit: lower latency per decode step, and prompt processing that keeps every SM free for compute.
+  - Enable: `--allreduce host` (no peer access needed) or `--allreduce p2p` (needs peer access between the GPUs; falls back to `host` without it). [Details](docs/multi-gpu.md#7-two-gpus-over-pcie---allreduce)
+- **Split overlap** (`--split-mode tensor`). Large ubatches alternate between two schedulers, so the AllReduce of one ubatch overlaps with the compute of the next.
+  - Benefit: faster prompt processing when the link between the GPUs is slow (Qwen3.8-27B on two PCIe GPUs: 733 -> 947 t/s at 10k context).
+  - Enable: `--split-overlap`, with half the usual `--ubatch-size` (each scheduler has its own compute buffers). Best together with `--allreduce host` or `p2p`. [Details](docs/multi-gpu.md#8-overlapping-the-allreduce-with-compute---split-overlap)
 
-- It is opt-in with `--flash-attn-native-quants` (`-fanq 1` in `llama-bench`). Without the flag everything runs as upstream.
-- Cache types: `q4_0`, `q4_1`, `q5_0`, `q5_1` and `q8_0`, the same type for K and V. Head sizes 64, 128, 256 and 512, at every query batch size, on Turing (`sm_75`) and newer.
-- Decode and the small batches of speculative decoding take tiles of 8 Q heads, so each K/V row is read once per KV head instead of once per Q head.
-- It is faster at long context. Qwen3.8-27B at 16k context:
-  - token generation +6-11% on an RTX 3060 or 4070;
-  - 2-token speculative steps +14-31%.
+## Upstream vs this fork
 
-  On both GPUs at 64k context the gain is up to +39%. On D=128 models, 4-token batches run up to twice as fast.
-- The F16 copy of the window no longer takes compute buffer: 1.6 GiB less for Qwen3.8-27B at 262k context.
-- `q4_0` and `q8_0` are always compiled. `q4_1`, `q5_0` and `q5_1` are compiled with their pair in `GGML_CUDA_FA_QUANTS` (for example `-DGGML_CUDA_FA_QUANTS="q5_1-q5_1"`) or with `all`.
-- Results differ from the F16 path in rounding only.
+Setup: RTX 4070 (12 GB, PCIe 4.0 x16) + RTX 3060 (12 GB, PCIe 3.0 x4), Qwen3.8-27B UD-Q4_K_S with its MTP head (2 draft tokens), `llama-server` with 2 slots of 131k context, q5_1 K/V cache.
 
-Details, validation and all measurements: [docs/quantized-native-flash-attention.md](docs/quantized-native-flash-attention.md).
+- Upstream: `-sm tensor -fa on -ctk q5_1 -ctv q5_1`, the best split that fits.
+- This fork: additionally `--flash-attn-native-quants -ts 0.625,0.375 --attn-split 1,3 --allreduce p2p --split-overlap -ub 256 --cache-disk ...`.
 
-## Prompt cache hierarchy: slots, RAM, disk
-
-`--cache-disk PATH` adds a disk level below the RAM prompt cache (`--cache-ram`).
-
-- Prompts that RAM evicts are written to disk in the background, and are loaded back when a later request shares their prefix.
-- On exit and before sleeping, the server also writes its slots and RAM entries. Conversations survive restarts and model swaps.
-
-How prompts are stored:
-
-- A prompt is stored as KV blocks of `--cache-block-size` tokens (default 2048), keyed by a hash of their prefix.
-- Prompts that share a prefix share its blocks, in RAM and on disk.
-- A growing conversation writes only its new blocks. In one 25k-token conversation with Qwen3.8-27B, the next turn wrote 0.16 GB instead of 2.3 GB.
-
-The new libllama functions `llama_state_seq_get_data_range()` and `llama_state_seq_set_data_range()` provide the blocks. All model types are supported:
-
-- Attention, sliding-window, recurrent and hybrid models work.
-- Models that roll back only to context checkpoints (hybrid, recurrent, sliding-window) are stored at their newest checkpoint.
-- Caches without state ranges store whole states.
-
-Size limit and sharing:
-
-- `--cache-disk-size` caps the directory (default 32 GiB). The least recently used prompt is removed first, and 5% of the file system always stays free.
-- File names carry a fingerprint of the model files and the KV settings, so several models can share one directory.
-
-Two more server changes come with the disk level:
-
-- Slot selection: if a cached prompt shares at least 256 more tokens with a request than the most similar slot does, the server restores the cached prompt instead of processing those tokens again. One case is a slot that holds another conversation with the same system prompt.
-- SIGINT and SIGTERM are handled on their own thread. A sleeping server now stops cleanly and writes its cache.
-
-Details: [tools/server/README.md](tools/server/README.md#prompt-cache-on-disk).
+| | upstream | this fork |
+|---|--:|--:|
+| prompt processing, 10k context (t/s) | | |
+| prompt processing, 95k context (t/s) | | |
+| generation, 10k context (t/s) | | |
+| generation, 95k context (t/s) | | |
+| resume a 25k-token conversation after a restart (s) | | |
+| VRAM after a 95k request, 4070 / 3060 (MiB) | | |
 
 ---
 

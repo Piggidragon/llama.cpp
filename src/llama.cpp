@@ -47,6 +47,18 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_allreduce_type_name(enum llama_allreduce_type allreduce_type) {
+    switch (allreduce_type) {
+        case LLAMA_ALLREDUCE_TYPE_DEFAULT:
+            return "default";
+        case LLAMA_ALLREDUCE_TYPE_HOST:
+            return "host";
+        case LLAMA_ALLREDUCE_TYPE_P2P:
+            return "p2p";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_AUTO:

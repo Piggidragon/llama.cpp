@@ -516,7 +516,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
-        const std::vector<float> & attn_split = {}, const bool split_overlap = false) {
+        const std::vector<float> & attn_split = {}, const bool split_overlap = false,
+        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -537,6 +538,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     // the ubatches of 64 tokens alternate between the lanes of the split overlap
     ctx_params.split_overlap = split_overlap;
+    ctx_params.allreduce_type = allreduce_type;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -962,11 +964,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         size_t                          moe_cache_size;
         std::vector<float>              attn_split;   // empty: follow the tensor split
         bool                            split_overlap;
+        llama_allreduce_type            allreduce_type;
 
         device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0,
-                std::vector<float> attn_split = {}, bool split_overlap = false)
+                std::vector<float> attn_split = {}, bool split_overlap = false, llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT)
             : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size),
-              attn_split(std::move(attn_split)), split_overlap(split_overlap) {}
+              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -1011,6 +1014,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                 // consecutive ubatches on two schedulers whose AllReduce overlaps
                 dev_configs.emplace_back(devices_meta, "Meta -so", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true);
+
+                // the AllReduce paths by size (two CUDA GPUs with NCCL, otherwise the same as "Meta")
+                dev_configs.emplace_back(devices_meta, "Meta -ar host", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false,
+                        LLAMA_ALLREDUCE_TYPE_HOST);
+                dev_configs.emplace_back(devices_meta, "Meta -ar p2p -so", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true,
+                        LLAMA_ALLREDUCE_TYPE_P2P);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
             }
         }
 
@@ -1117,7 +1127,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
