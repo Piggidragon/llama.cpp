@@ -11516,6 +11516,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // non-contiguous rows around 64 elements, where the CUDA backend switches between a block per row and a thread per
+    // element: with ne_a[0] of 57, 64 and 65, the rows of dst have 57-72 elements, for every dim and element size
+    for (int64_t ne0 : { 57, 64, 65 }) {
+        for (int v : { 1, 2, 3 }) {
+            for (int dim : { 0, 1, 2, 3, }) {
+                for (ggml_type type : { GGML_TYPE_I8, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I64 }) {
+                    test_cases.emplace_back(new test_concat(type, {ne0, 5, 4, 3}, 7, dim, v));
+                }
+            }
+        }
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
