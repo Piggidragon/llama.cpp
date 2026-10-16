@@ -520,3 +520,119 @@ def test_hybrid_restore_at_checkpoint():
     fresh = complete(cont)
     server.stop()
     assert restored["content"] == fresh["content"]
+
+
+def test_shared_directory_keeps_blocks_of_other_server():
+    # a server that evicts another fingerprint's head keeps the blocks that newer heads of it hold
+    global server
+
+    def other_server():
+        srv = make_server()
+        srv.cache_block_size = 32
+        srv.n_ctx = 2048
+        srv.ctk = "f32"
+        srv.server_port = server.server_port + 1
+        return srv
+
+    system = tokens_of(0, 256)
+
+    # the other model writes C1, then this server starts, then the other model writes C2 with the same system prompt
+    b = other_server()
+    b.start()
+    res = b.make_request("POST", "/completion", data={"prompt": system + tokens_of(1, 64), "cache_prompt": True})
+    assert res.status_code == 200
+    b.stop()
+
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.cache_disk_size = 1
+    server.start()
+
+    b = other_server()
+    b.start()
+    c2 = system + tokens_of(2, 64)
+    res = b.make_request("POST", "/completion", data={"prompt": c2, "cache_prompt": True})
+    assert res.status_code == 200
+    b.stop()
+
+    # this server needs room, C1 with its own blocks is enough
+    complete_tokens(tokens_of(3, 1050))
+    server.stop()
+
+    b = other_server()
+    b.start()
+    log = LogReader(b.log_path)
+    res = b.make_request("POST", "/completion", data={"prompt": c2 + tokens_of(4, 20), "cache_prompt": True})
+    b.stop()
+    assert "is missing" not in log.drain()
+    assert res.body["timings"]["cache_n"] > 300
+
+
+def test_broken_head_written_again():
+    # a block whose state does not load (another format) is removed with its head and written again
+    # without unified KV a failed restore cannot be for a lack of cells, so the first failure counts
+    global server
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    prompt = tokens_of(0, 300)
+    complete_tokens(prompt)
+    server.stop()
+
+    # break the magic of the state range inside each block, the file itself stays valid
+    for f in block_files():
+        with open(f, "r+b") as fh:
+            fh.seek(56)
+            fh.write(b"\0\0\0\0")
+
+    server = make_server()
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete_tokens(prompt)
+    server.stop()
+    content = log.drain()
+    assert "did not restore" in content and "removing it and its KV blocks" in content
+    assert res["timings"]["cache_n"] == 0
+
+    # the run wrote the prompt again on exit, with new blocks
+    server = make_server()
+    server.cache_block_size = 32
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+    res = complete_tokens(prompt)
+    server.stop()
+    assert "did not restore" not in log.drain()
+    assert res["timings"]["cache_n"] > 250
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_hybrid_head_not_read_for_earlier_divergence():
+    # a head is stored without checkpoints: a prompt that diverges before its end cannot use it, so it is not read
+    global server
+
+    def hybrid_server():
+        srv = make_server()
+        srv.model_hf_repo = None
+        srv.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+        srv.n_ctx = 4096
+        srv.cache_block_size = 256
+        srv.n_predict = 4
+        return srv
+
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(500))
+    server = hybrid_server()
+    server.start()
+    complete(prompt + " What is the last item?")
+    server.stop()
+
+    server = hybrid_server()
+    server.start()
+    log = LogReader(server.log_path)
+    complete(prompt + " Which item comes first?")
+    server.stop()
+    content = log.drain()
+    assert "disk prompt cache: read prompt" not in content
+    assert "no context checkpoint before the common prefix" not in content

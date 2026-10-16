@@ -771,8 +771,19 @@ struct server_prompt_cache {
     // tokens per KV block, for a memory with state ranges; 0 stores whole states
     size_t n_block = 2048;
 
+    // the memory rolls back only to context checkpoints (recurrent, hybrid, SWA): a prompt stored on disk has none,
+    // so it is used only if the new prompt holds it whole
+    bool needs_checkpoints = false;
+
+    // all slots share one KV stream: a restore can fail for a lack of free cells
+    bool kv_unified = false;
+
     // copy the prompt of a slot and its state; KV blocks that a cached prompt holds already are shared
     bool copy_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, server_prompt_cache_state & out);
+
+    // the bytes copy_state() would allocate, without copying: the KV blocks shared with cached prompts are
+    // returned in shared and not counted
+    size_t copy_size(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, std::vector<server_kv_block_ptr> & shared);
 
     // copy the prompt of a slot into the cache, false if it is cached already or does not fit
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
@@ -784,6 +795,9 @@ struct server_prompt_cache {
 
     // bytes of the cache with an extra state added, blocks shared between prompts counted once
     size_t size_with(const server_prompt_cache_state * extra) const;
+
+    // bytes of the cache with a state of size_own bytes added that holds the shared blocks
+    size_t size_with(size_t size_own, const std::vector<server_kv_block_ptr> & shared) const;
 
     // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
     // for a slot that shares lcp_base tokens with it; lcp_base if there is none

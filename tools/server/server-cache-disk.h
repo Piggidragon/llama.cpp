@@ -54,16 +54,20 @@ struct server_prompt_cache_disk {
     bool contains(const server_tokens & tokens) const;
 
     // id of the entry that shares a longer prefix than lcp_best with tokens_new, -1 if none
-    // updates lcp_best; entries with more than n_tokens_max tokens are skipped
-    int64_t find(const server_tokens & tokens_new, size_t n_tokens_max, size_t & lcp_best) const;
+    // updates lcp_best; entries with more than n_tokens_max tokens are skipped, and with whole_only the heads that
+    // tokens_new does not hold whole (stored without checkpoints, a memory that rolls back only to checkpoints cannot use them)
+    int64_t find(const server_tokens & tokens_new, size_t n_tokens_max, size_t & lcp_best, bool whole_only = false) const;
 
     // move the state of an entry into out: a waiting state is taken back, a written one is read from its files
     // a corrupt file is deleted
     bool fetch(int64_t id, server_prompt_cache_state & out, const block_source & source = nullptr);
 
-    // the state fetched for id did not restore into the context (no room, ...): a file is kept but skipped
-    // after repeated failures, a state that was taken back is queued again
-    void restore_failed(int64_t id, server_prompt_cache_state && state);
+    // the state fetched for id did not restore into the context. permanent: the failure cannot be for a lack of
+    // free cells (each slot has its own KV stream), so the stored state is broken. a broken head is removed with
+    // its blocks, so that the prompts that share them write them again; a whole state is skipped from then on.
+    // a failure that may be for a lack of cells is counted, and treated as permanent the second time.
+    // a state that was taken back from the queue is queued again
+    void restore_failed(int64_t id, server_prompt_cache_state && state, bool permanent);
 
     // block until all waiting states are written
     void flush();
@@ -170,6 +174,9 @@ private:
     std::list<entry>::iterator find_entry(int64_t id);
 
     void scan();
+
+    // index the files of other fingerprints again, with the references of their blocks from their heads on disk
+    void refresh_foreign();
 
     std::string block_path(const server_kv_key & key) const;
 

@@ -1063,9 +1063,9 @@ private:
         // the layout of the stored state: KV streams, V transposition (flash attention), SWA cache size and
         // Hadamard rotation of quantized K/V (the block size is part of the block keys instead)
         const char * rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
-        config += string_format(" seq %u unified %d fa %s swa-full %d rot-disable %s",
+        config += string_format(" seq %u unified %d fa %s swa-full %d rot-disable %s state-version %d %d",
                 llama_n_seq_max(ctx_tgt), params_base.kv_unified ? 1 : 0, llama_flash_attn_type_name(params_base.flash_attn_type),
-                params_base.swa_full ? 1 : 0, rot_disable ? rot_disable : "");
+                params_base.swa_full ? 1 : 0, rot_disable ? rot_disable : "", LLAMA_STATE_SEQ_VERSION, LLAMA_SESSION_VERSION);
 
         for (const auto & la : params_base.lora_adapters) {
             files.push_back(la.path);
@@ -1590,6 +1590,21 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
             prompt_cache->n_block = params_base.cache_block_size;
+
+            prompt_cache->kv_unified = params_base.kv_unified;
+
+            // see the checkpoint rule in update_slots()
+            prompt_cache->needs_checkpoints =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                n_swa > 0;
+
+            // the transposed V cache of a context without flash attention is copied row by row per range,
+            // which takes many small transfers per block on a GPU: such a context stores whole states
+            if (params_base.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED && prompt_cache->n_block > 0) {
+                SRV_INF("%s", "prompt cache stores whole states: flash attention is disabled\n");
+                prompt_cache->n_block = 0;
+            }
 
             if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
                 SRV_INF("%s", "disk prompt cache disabled by --cache-disk-size 0\n");
