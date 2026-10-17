@@ -44,11 +44,16 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
+    // memory_owner: compute in the memory of that context, see llama_init_from_model_shared_memory()
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  llama_context * memory_owner = nullptr);
 
     ~llama_context();
+
+    // see llama_set_stream_priority()
+    bool set_stream_priority(bool high);
 
     // reserve a new backend scheduler (if needed)
     // for example, when:
@@ -357,7 +362,7 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    llama_memory_ptr memory;
+    std::shared_ptr<llama_memory_i> memory; // shared by the contexts of llama_init_from_model_shared_memory()
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

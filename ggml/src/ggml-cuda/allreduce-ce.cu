@@ -108,6 +108,20 @@ void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar * ar) {
     delete ar;
 }
 
+void ggml_cuda_ce_ar_set_stream_priority(ggml_cuda_ce_ar * ar, int priority) {
+    for (int i = 0; i < 2; ++i) {
+        for (cudaStream_t * s : { &ar->d2h[i], &ar->h2d[i] }) {
+            if (*s == nullptr) {
+                continue;
+            }
+            ggml_cuda_set_device(ar->devices[i]);
+            CUDA_CHECK(cudaStreamSynchronize(*s));
+            CUDA_CHECK(cudaStreamDestroy(*s));
+            CUDA_CHECK(cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, priority));
+        }
+    }
+}
+
 ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices, bool peer) {
     if (n_devices != 2) {
         return nullptr;
@@ -315,6 +329,8 @@ ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int *, size_t, bool) {
     return nullptr;
 }
 void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar *) {
+}
+void ggml_cuda_ce_ar_set_stream_priority(ggml_cuda_ce_ar *, int) {
 }
 bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar *, ggml_backend_t *, ggml_tensor **) {
     return false;

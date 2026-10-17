@@ -2746,6 +2746,21 @@ bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t
     return true;
 }
 
+bool ggml_backend_meta_set_stream_priority(ggml_backend_t meta_backend, bool high) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    auto * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
+    bool ok = !backend_ctx->backend_configs.empty();
+    for (const auto & bc : backend_ctx->backend_configs) {
+        ok = ggml_backend_set_stream_priority(bc.backend, high) && ok;
+    }
+    if (backend_ctx->comm_ctx != nullptr) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
+        auto * set = (ggml_backend_comm_set_stream_priority_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_set_stream_priority");
+        ok = set != nullptr && set(backend_ctx->comm_ctx, high) && ok;
+    }
+    return ok;
+}
+
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;

@@ -168,7 +168,8 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              llama_context * memory_owner) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -526,7 +527,17 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        if (memory_owner != nullptr) {
+            const auto & co = memory_owner->cparams;
+            if (&memory_owner->model != &model || !memory_owner->memory ||
+                    co.n_ctx != cparams.n_ctx || co.n_seq_max != cparams.n_seq_max || co.kv_unified != cparams.kv_unified ||
+                    co.ctx_type != cparams.ctx_type) {
+                throw std::runtime_error("the memory owner has another model or other memory parameters");
+            }
+            memory = memory_owner->memory;
+        } else {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
     }
 
     // the workspace options size real buffers: without allocation (fit, memory breakdown) the worst case is measured
@@ -778,6 +789,20 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+}
+
+bool llama_context::set_stream_priority(bool high) {
+    bool ok = !backends.empty();
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ok = ggml_backend_set_stream_priority(backend.get(), high) && ok;
+    }
+    if (backend_lane1) {
+        ok = ggml_backend_set_stream_priority(backend_lane1.get(), high) && ok;
+    }
+    return ok;
 }
 
 void llama_context::lane_switch(int lane) {
@@ -4699,6 +4724,31 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model_shared_memory(
+                 llama_model * model,
+        llama_context_params   params,
+               llama_context * memory_owner) {
+    if (!model || !memory_owner) {
+        LLAMA_LOG_ERROR("%s: model and memory_owner cannot be NULL\n", __func__);
+        return nullptr;
+    }
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED && model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    try {
+        return new llama_context(*model, params, memory_owner);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+    }
+
+    return nullptr;
+}
+
+bool llama_set_stream_priority(llama_context * ctx, bool high) {
+    return ctx->set_stream_priority(high);
 }
 
 // deprecated

@@ -582,6 +582,20 @@ extern "C" {
                      struct llama_model * model,
             struct llama_context_params   params);
 
+    // A context that computes in the memory (KV cache, recurrent state) of another context of the same model, with its
+    // own compute buffers, outputs and streams: for example to process the prompt of one sequence while the other
+    // context generates for other sequences. params must give the same memory as the ones of memory_owner (context
+    // size, sequences, cache types). The two must not compute the same sequence at the same time: synchronize the
+    // context that computed a sequence before the other one uses it. Free it before memory_owner.
+    LLAMA_API struct llama_context * llama_init_from_model_shared_memory(
+                     struct llama_model * model,
+            struct llama_context_params   params,
+                   struct llama_context * memory_owner);
+
+    // Give the streams of the context's backends the greatest priority (high) or the default one, so that its graphs
+    // go first while another context of the same model computes. Returns false if a backend has no priorities.
+    LLAMA_API bool llama_set_stream_priority(struct llama_context * ctx, bool high);
+
     DEPRECATED(LLAMA_API struct llama_context * llama_new_context_with_model(
                      struct llama_model * model,
             struct llama_context_params   params),

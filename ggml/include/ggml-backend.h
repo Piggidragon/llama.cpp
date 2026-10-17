@@ -217,6 +217,12 @@ extern "C" {
     // Release the memory that the memory pools of a backend keep beyond what is in use, returns the released bytes
     typedef size_t (*ggml_backend_trim_pools_t)(ggml_backend_t backend);
 
+    // Give the streams of a backend the greatest priority (high) or the default one, so that its work goes first when
+    // another backend of the same device computes at the same time. Returns false if the backend has no priorities.
+    typedef bool   (*ggml_backend_set_stream_priority_t)(ggml_backend_t backend, bool high);
+    // the same for the streams of an AllReduce context of ggml_backend_comm_init_t
+    typedef bool   (*ggml_backend_comm_set_stream_priority_t)(void * comm_ctx, bool high);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -445,6 +451,12 @@ extern "C" {
     // recurrent state), so the AllReduce of one lane overlaps with the compute of the other. The graphs must not
     // share intermediate buffers (one scheduler per lane). Returns false if a device has no events.
     GGML_API bool ggml_backend_meta_share_lanes(ggml_backend_t meta_backend_a, ggml_backend_t meta_backend_b);
+
+    // ggml_backend_set_stream_priority() of the simple backends and the AllReduce of a meta backend
+    GGML_API bool ggml_backend_meta_set_stream_priority(ggml_backend_t meta_backend, bool high);
+
+    // ggml_backend_set_stream_priority_t of the backend (of all simple backends of a meta backend), false if it has none
+    GGML_API bool ggml_backend_set_stream_priority(ggml_backend_t backend, bool high);
 
     // ggml_backend_trim_pools_t of the backend (of all simple backends of a meta backend), 0 if it has none
     // call it while the backend is idle: it synchronizes the backend

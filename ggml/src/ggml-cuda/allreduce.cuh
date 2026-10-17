@@ -19,6 +19,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
 // Release all resources owned by the pipeline.
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * pipeline);
 
+// Create the streams of the pipeline again with this priority (it synchronizes them first).
+void ggml_cuda_ar_pipeline_set_stream_priority(ggml_cuda_ar_pipeline * pipeline, int priority);
+
 // Execute an in-place AllReduce (sum) across tensors[0..n_devices-1].
 // tensors[i] must live on the device managed by backends[i] and be
 // contiguous F32, F16, or BF16.
