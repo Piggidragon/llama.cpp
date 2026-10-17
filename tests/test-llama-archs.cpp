@@ -690,9 +690,10 @@ static bool check_seq_cells(llama_model * model, const std::vector<llama_token> 
         return true;
     }
 
+    // 4 sequences, 3 used: the reservation ubatch of 64 tokens divides into the sequences
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx      = 3*64;
-    ctx_params.n_seq_max  = 3;
+    ctx_params.n_ctx      = 4*64;
+    ctx_params.n_seq_max  = 4;
     ctx_params.n_ubatch   = 64;
     ctx_params.kv_unified = false;
     ctx_params.n_threads  = 4;
