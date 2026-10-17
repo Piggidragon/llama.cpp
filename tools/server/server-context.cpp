@@ -3448,6 +3448,10 @@ private:
             SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no unified KV cache, no LoRA adapters and a generation model, it is not used\n");
             return;
         }
+        if (!llama_memory_seqs_independent(ctx_tgt)) {
+            SRV_WRN("%s", "--concurrent-prefill: the memory of this model shares cells between the sequences, it is not used\n");
+            return;
+        }
 
         auto cparams = common_context_params_to_llama(params_base);
         cparams.split_overlap = false; // one ubatch at a time
@@ -3480,7 +3484,11 @@ private:
             return false;
         }
         const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
-        return slot.task->n_tokens() - slot.prompt.n_tokens() > n_ubatch + 4;
+        if (slot.task->n_tokens() - slot.prompt.n_tokens() <= n_ubatch + 4) {
+            return false;
+        }
+        // a KV shift or a stream copy is applied by the next decode, over the cells of all sequences
+        return !llama_memory_update_pending(ctx_tgt);
     }
 
     void bg_submit(server_slot & slot) {
@@ -3639,6 +3647,11 @@ private:
         if (batch.size() == 0 && bg_slot != nullptr) {
             bg_wait();
             return;
+        }
+
+        // the decode applies a KV shift or a stream copy over the cells of all sequences: not while ctx_bg computes
+        if (bg_slot != nullptr && llama_memory_update_pending(ctx_tgt)) {
+            bg_wait();
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);

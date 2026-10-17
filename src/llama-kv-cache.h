@@ -170,6 +170,9 @@ public:
 
     bool get_has_shift() const;
 
+    bool has_pending_update() const override;
+    bool get_seqs_independent() const override;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

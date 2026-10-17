@@ -256,6 +256,14 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }
 
+bool llama_kv_cache_iswa::get_seqs_independent() const {
+    return kv_base->get_seqs_independent() && (!kv_swa || kv_swa->get_seqs_independent());
+}
+
+bool llama_kv_cache_iswa::has_pending_update() const {
+    return kv_base->has_pending_update() || (kv_swa && kv_swa->has_pending_update());
+}
+
 bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&

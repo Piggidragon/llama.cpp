@@ -59,6 +59,8 @@ public:
     llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+    bool has_pending_update() const override;
+    bool get_seqs_independent() const override;
 
     void clear(bool data) override;
 

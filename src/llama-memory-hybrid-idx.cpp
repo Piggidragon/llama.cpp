@@ -146,6 +146,14 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_reserve(uint32_t n_kv) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
 }
 
+bool llama_memory_hybrid_idx::get_seqs_independent() const {
+    return mem_idx == nullptr && llama_memory_hybrid::get_seqs_independent(); // the key pools are shared by the sequences
+}
+
+bool llama_memory_hybrid_idx::has_pending_update() const {
+    return llama_memory_hybrid::has_pending_update() || (mem_idx && mem_idx->has_pending_update());
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }

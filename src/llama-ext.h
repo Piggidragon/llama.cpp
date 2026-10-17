@@ -153,6 +153,13 @@ LLAMA_API bool llama_contexts_share_workspace(const struct llama_context * ctx_a
 // when the server is idle; returns the released bytes
 LLAMA_API uint64_t llama_trim_transient_memory(struct llama_context * ctx);
 
+// whether the memory has updates (KV shifts, stream copies) that the next decode applies: such an update computes over
+// the cells of all sequences, no other context on the same memory may compute meanwhile
+LLAMA_API bool llama_memory_update_pending(struct llama_context * ctx);
+
+// whether two contexts on the memory of ctx may compute different sequences at once, see llama_init_from_model_shared_memory()
+LLAMA_API bool llama_memory_seqs_independent(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

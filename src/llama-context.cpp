@@ -5380,3 +5380,13 @@ bool llama_contexts_share_workspace(const llama_context * ctx_a, const llama_con
 uint64_t llama_trim_transient_memory(llama_context * ctx) {
     return ctx != nullptr ? ctx->trim_transient_memory() : 0;
 }
+
+bool llama_memory_seqs_independent(llama_context * ctx) {
+    llama_memory_t mem = ctx != nullptr ? llama_get_memory(ctx) : nullptr;
+    return mem != nullptr && mem->get_seqs_independent();
+}
+
+bool llama_memory_update_pending(llama_context * ctx) {
+    llama_memory_t mem = ctx != nullptr ? llama_get_memory(ctx) : nullptr;
+    return mem != nullptr && mem->has_pending_update();
+}

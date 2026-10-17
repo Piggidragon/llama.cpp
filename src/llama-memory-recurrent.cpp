@@ -729,6 +729,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
+bool llama_memory_recurrent::get_seqs_independent() const {
+    return true; // a ubatch copies and writes the states of its own cells
+}
+
+bool llama_memory_recurrent::has_pending_update() const {
+    return false; // init_update() has nothing to do
+}
+
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
