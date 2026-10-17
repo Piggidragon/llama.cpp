@@ -10,7 +10,7 @@ All measurements: Qwen3.8-27B. The last three rows need `--split-mode tensor`; t
 |---|---|---|---|
 | Quantized-native FlashAttention (CUDA) | Reads a quantized K/V cache in place instead of copying the attention window to F16 | Generation +6-11% at 16k context, up to +39% at 64k; 1.6 GiB less compute buffer at 262k | `--flash-attn-native-quants` (`-fanq 1`), same quantized type for K and V. [Details](docs/quantized-native-flash-attention.md) |
 | Prompt cache on disk | Stores prompts as KV blocks, keyed by their prefix, on disk below the RAM cache | Conversations survive RAM eviction, restarts and model swaps; a growing conversation writes only its new blocks (0.16 GB instead of 2.3 GB at 25k tokens) | `--cache-disk PATH`, `--cache-disk-size` (MiB). [Details](tools/server/README.md#prompt-cache-on-disk) |
-| Compute buffers that follow the batches | Sizes the compute buffers by the current batch; an MTP draft context uses its target's buffers | Up to 212 MiB less VRAM per GPU (106 MiB at full context), prompt processing 1-2% slower | `--phase-aware-workspace`, `--live-context-workspace`. [Details](docs/compute-workspace.md) |
+| Compute buffers that follow the batches (by [@GenerelSchwerz](https://github.com/GenerelSchwerz)) | Sizes the compute buffers by the current batch; an MTP draft context uses its target's buffers | Up to 212 MiB less VRAM per GPU (106 MiB at full context), prompt processing 1-2% slower | `--phase-aware-workspace`, `--live-context-workspace`. [Details](docs/compute-workspace.md) |
 | Faster generation steps | MMVQ launch parameters for RTX 30 and 40 cards (compute capability 8.6, 8.9); a penalties sampler that skips its hash map; one thread per element for short non-contiguous concats | Generation with MTP 63.5 -> 68.8 t/s; matmuls of 2-8 tokens (MTP verify) up to +17%; with a repetition penalty, 845 -> 1.6 us of sampling per token | Always on |
 | Faster context checkpoints | Hybrid and recurrent models: a slot shares its checkpoints with the RAM prompt cache instead of copying them, and state copies run through pinned memory on all GPUs at once | A request with a 1k-token prompt 1.51 -> 1.23 s; a 150 MB checkpoint copies in 28 ms | Always on |
 | Prefill budget | While a slot generates, the prompts of the other slots go in steps of N tokens instead of `--batch-size` | Generation next to a 20k-token prompt 1.7 -> 11 t/s (N = 64) or 14 t/s (N = 32); that prompt 841 -> 393 or 245 t/s | `--prefill-budget N` |
@@ -40,6 +40,7 @@ Setup: RTX 4070 (12 GB, PCIe 4.0 x16) + RTX 3060 (12 GB, PCIe 3.0 x4), Qwen3.8-2
 | generation, 10k context (t/s) | | |
 | generation, 95k context (t/s) | | |
 | resume a 25k-token conversation after a restart (s) | | |
+| generation while the other slot processes a 20k-token prompt (t/s) | | |
 | VRAM after a 95k request, 4070 / 3060 (MiB) | | |
 
 ---
