@@ -30,6 +30,7 @@ struct ggml_cuda_ce_ar {
 
     cudaStream_t d2h[2] = {}; // copies the own contribution to host memory
     cudaStream_t h2d[2] = {}; // copies the contribution of the peer from host memory
+    int stream_priority = 0;  // of the streams above, they are created with the first large reduction
 
     nv_bfloat16 * host[2] = {}; // pinned, written by device i: [slot][elems]
     nv_bfloat16 * own [2] = {}; // device i: the own contribution in BF16
@@ -109,6 +110,7 @@ void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar * ar) {
 }
 
 void ggml_cuda_ce_ar_set_stream_priority(ggml_cuda_ce_ar * ar, int priority) {
+    ar->stream_priority = priority;
     for (int i = 0; i < 2; ++i) {
         for (cudaStream_t * s : { &ar->d2h[i], &ar->h2d[i] }) {
             if (*s == nullptr) {
@@ -141,8 +143,8 @@ static bool ggml_cuda_ce_ar_alloc(ggml_cuda_ce_ar * ar) {
     for (int i = 0; i < 2 && ok; ++i) {
         ggml_cuda_set_device(ar->devices[i]);
 
-        ok = ok && cudaStreamCreateWithFlags(&ar->d2h[i], cudaStreamNonBlocking) == cudaSuccess;
-        ok = ok && cudaStreamCreateWithFlags(&ar->h2d[i], cudaStreamNonBlocking) == cudaSuccess;
+        ok = ok && cudaStreamCreateWithPriority(&ar->d2h[i], cudaStreamNonBlocking, ar->stream_priority) == cudaSuccess;
+        ok = ok && cudaStreamCreateWithPriority(&ar->h2d[i], cudaStreamNonBlocking, ar->stream_priority) == cudaSuccess;
         ok = ok && cudaMalloc((void **) &ar->own[i],  bytes) == cudaSuccess;
         ok = ok && cudaMalloc((void **) &ar->peer[i], bytes) == cudaSuccess;
         if (ar->p2p) {

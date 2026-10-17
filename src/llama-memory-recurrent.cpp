@@ -614,7 +614,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
-            auto & empty_cell = cells[next_empty_cell];
+            // a sequence takes the cell of its own index when it is free: a ubatch of consecutive sequences then covers
+            // exactly their cells, the gather below moves nothing and no other sequence's cell is read or written,
+            // so two contexts on this memory can compute different sequences at once (see get_seqs_independent())
+            const uint32_t cell_id = (uint32_t) seq_id < size && cells[seq_id].is_empty() ? (uint32_t) seq_id : next_empty_cell;
+            auto & empty_cell = cells[cell_id];
             GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
@@ -625,9 +629,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
             }
-            seq_meta.tail = next_empty_cell;
+            seq_meta.tail = cell_id;
             // find next empty cell
-            if (s + 1 < n_seqs) {
+            if (s + 1 < n_seqs && cell_id == next_empty_cell) {
                 for (uint32_t j = 0; j < size; ++j) {
                     next_empty_cell += 1;
                     if (next_empty_cell >= size) { next_empty_cell -= size; }
@@ -730,7 +734,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 }
 
 bool llama_memory_recurrent::get_seqs_independent() const {
-    return true; // a ubatch copies and writes the states of its own cells
+    // a ubatch reads and writes only its own cells while every used cell holds just the sequence of its index, see
+    // find_slot(): it gathers the cells of a ubatch into one range and copies the cells of other sequences inside it
+    for (uint32_t i = 0; i < size; ++i) {
+        const auto & cell = cells[i];
+        if (!cell.is_empty() && (cell.seq_id.size() != 1 || *cell.seq_id.begin() != (llama_seq_id) i)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool llama_memory_recurrent::has_pending_update() const {

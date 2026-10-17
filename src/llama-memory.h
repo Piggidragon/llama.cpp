@@ -119,7 +119,8 @@ struct llama_memory_i {
     virtual bool has_pending_update() const { return true; }
 
     // whether the graph of a ubatch reads and writes only the cells of its own sequences (no unified KV cells, no
-    // pool shared by the sequences): two contexts on this memory may then compute different sequences at once
+    // pool shared by the sequences, no recurrent cell of one sequence inside the cell range of others), right now:
+    // two contexts on this memory may then compute different sequences at once
     virtual bool get_seqs_independent() const { return false; }
 
     //

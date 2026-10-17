@@ -6264,6 +6264,13 @@ static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, bool h
             CUDA_CHECK(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, priority));
             if (cuda_ctx->cublas_handles[device][stream] != nullptr) {
                 CUBLAS_CHECK(cublasSetStream(cuda_ctx->cublas_handles[device][stream], s));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+                // cublasSetStream() resets the workspace to the default pool, see cublas_handle()
+                if (cuda_ctx->cublas_workspaces[device][stream] != nullptr) {
+                    CUBLAS_CHECK(cublasSetWorkspace(cuda_ctx->cublas_handles[device][stream],
+                        cuda_ctx->cublas_workspaces[device][stream], cuda_ctx->cublas_workspace_sizes[device]));
+                }
+#endif
             }
         }
     }

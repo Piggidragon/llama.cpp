@@ -3444,8 +3444,8 @@ private:
     // --concurrent-prefill: the second context, on the memory of ctx_tgt
     void bg_init() {
         if (params_base.n_parallel < 2 || params_base.kv_unified || !params_base.lora_adapters.empty() ||
-                params_base.embedding || llama_get_memory(ctx_tgt) == nullptr) {
-            SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no unified KV cache, no LoRA adapters and a generation model, it is not used\n");
+                !params_base.control_vectors.empty() || params_base.embedding || llama_get_memory(ctx_tgt) == nullptr) {
+            SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no unified KV cache, no LoRA adapters or control vectors and a generation model, it is not used\n");
             return;
         }
         if (!llama_memory_seqs_independent(ctx_tgt)) {
@@ -3453,7 +3453,12 @@ private:
             return;
         }
 
+        // the memory parameters as the target resolved them (the fit may have changed the context size)
         auto cparams = common_context_params_to_llama(params_base);
+        cparams.n_ctx         = llama_n_ctx(ctx_tgt);
+        cparams.n_seq_max     = llama_n_seq_max(ctx_tgt);
+        cparams.n_batch       = llama_n_batch(ctx_tgt);
+        cparams.n_ubatch      = llama_n_ubatch(ctx_tgt);
         cparams.split_overlap = false; // one ubatch at a time
         ctx_bg.reset(llama_init_from_model_shared_memory(model_tgt, cparams, ctx_tgt));
         if (!ctx_bg) {
@@ -3487,8 +3492,9 @@ private:
         if (slot.task->n_tokens() - slot.prompt.n_tokens() <= n_ubatch + 4) {
             return false;
         }
-        // a KV shift or a stream copy is applied by the next decode, over the cells of all sequences
-        return !llama_memory_update_pending(ctx_tgt);
+        // a KV shift or a stream copy is applied by the next decode, over the cells of all sequences; the target's
+        // ubatches must not reach the cells of this sequence (recurrent cells: see llama_memory_seqs_independent())
+        return !llama_memory_update_pending(ctx_tgt) && llama_memory_seqs_independent(ctx_tgt);
     }
 
     void bg_submit(server_slot & slot) {
@@ -3517,26 +3523,40 @@ private:
         });
     }
 
-    // the background ubatch is computed: the draft contexts follow it, it counts as processed prompt
+    // the background ubatch is computed: the draft contexts follow it, it counts as processed prompt; if the draft
+    // contexts fail on it, only its slot ends with an error
     void bg_finish() {
         GGML_ASSERT(bg_slot != nullptr);
         if (bg_waiter.joinable()) {
             bg_waiter.join();
         }
+        server_slot & slot = *bg_slot;
+        bg_slot = nullptr;
 
-        if (spec && !common_speculative_process_from(spec.get(), batch_bg.view, ctx_bg.get())) {
-            throw std::runtime_error("failed to process speculative batch");
+        bool ok = true;
+        if (spec) {
+            try {
+                ok = common_speculative_process_from(spec.get(), batch_bg.view, ctx_bg.get());
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "concurrent prefill: %s\n", e.what());
+                ok = false;
+            }
         }
 
         const int64_t t_now = ggml_time_us();
         metrics.add_prompt(batch_bg.size(), t_now - t_bg_submit);
-        if (bg_slot->stats.is_set()) {
-            bg_slot->stats.n_prompt_processed += batch_bg.size();
-            bg_slot->stats.set_prompt_last(t_now);
+        if (slot.stats.is_set()) {
+            slot.stats.n_prompt_processed += batch_bg.size();
+            slot.stats.set_prompt_last(t_now);
         }
-
         batch_bg.clear();
-        bg_slot = nullptr;
+
+        if (!ok) {
+            SLT_ERR(slot, "%s", "failed to process speculative batch\n");
+            send_error(slot, "failed to process speculative batch", ERROR_TYPE_SERVER);
+            slot.release();
+            slot.prompt_clear();
+        }
     }
 
     // wait for the background ubatch: before anything else may touch its slot
@@ -4591,9 +4611,15 @@ private:
             });
         }
 
-        // the ubatch of ctx_bg starts before the batch of ctx_tgt
+        // the ubatch of ctx_bg starts before the batch of ctx_tgt; a slot that ended meanwhile (an error while its
+        // tokens were added) does not get it, its prompt is cleared instead: its tokens are not in the memory
         if (bg_next != nullptr && batch_bg.size() > 0) {
-            bg_submit(*bg_next);
+            if (bg_next->state == SLOT_STATE_PROCESSING_PROMPT) {
+                bg_submit(*bg_next);
+            } else {
+                batch_bg.clear();
+                bg_next->prompt_clear();
+            }
         }
     }
 

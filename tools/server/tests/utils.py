@@ -72,6 +72,7 @@ class ServerProcess:
     n_ubatch: int | None = None
     prefill_budget: int | None = None
     concurrent_prefill: bool = False
+    cache_reuse: int | None = None
     n_ctx: int | None = None
     n_ga: int | None = None
     n_ga_w: int | None = None
@@ -202,6 +203,8 @@ class ServerProcess:
             server_args.extend(["--prefill-budget", self.prefill_budget])
         if self.concurrent_prefill:
             server_args.append("--concurrent-prefill")
+        if self.cache_reuse is not None:
+            server_args.extend(["--cache-reuse", self.cache_reuse])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
         if self.n_gpu_layer:

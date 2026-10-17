@@ -113,3 +113,87 @@ def test_concurrent_prefill_single_slot():
     assert res.status_code == 200
     server.stop()
     assert "--concurrent-prefill needs --parallel >= 2" in read_log()
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_concurrent_prefill_hybrid_three_slots():
+    # the recurrent cell of the prompt's sequence (slot 0) lies between the cells of slots 1 and 2, which generate in
+    # one ubatch of the target while the prompt goes through the second context: the target's ubatch must not reach
+    # that cell (see llama_memory_recurrent::find_slot()). The prompt's text is the one without the flag.
+    hybrid = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(450))
+    gen = lambda id_slot: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT + f" {id_slot}", "n_predict": 400, "ignore_eos": True, "id_slot": id_slot, "cache_prompt": False})
+    short = lambda: server.make_request("POST", "/completion", data={"prompt": "Hello", "n_predict": 4, "id_slot": 0, "cache_prompt": False})
+    long = lambda: server.make_request("POST", "/completion", data={"prompt": prompt, "n_predict": 8, "id_slot": 0, "cache_prompt": False})
+
+    def run3(concurrent: bool):
+        global server
+        server.n_slots = 3
+        server.n_ctx = 3 * 2048
+        start(concurrent, hybrid)
+        # slot 1 generates in the first cell, slot 0 takes the second one, slot 2 generates in the third one
+        def slot0():
+            time.sleep(0.2)
+            assert short().status_code == 200
+            time.sleep(0.2) # slot 2 starts meanwhile
+            return long()
+        def slot2():
+            time.sleep(0.3)
+            return gen(2)
+        res = parallel_function_calls([(gen, (1,)), (slot2, ()), (slot0, ())])
+        server.stop()
+        log = read_log()
+        os.remove(server.log_path)
+        assert all(r.status_code == 200 for r in res)
+        return res[2].body["content"], log
+
+    ref, _ = run3(False)
+    out, log = run3(True)
+    assert "prompt tokens in the second context" in log
+    assert out == ref
+
+
+def test_concurrent_prefill_cache_reuse():
+    # the prompt of slot 1 reuses shifted chunks of its previous prompt (a KV shift for the next decode) while slot 0
+    # generates: the shift is applied when the second context does not compute, the text is the one without the flag
+    chunk_a = " ".join(f"alpha{k}" for k in range(40))
+    chunk_b = " ".join(f"beta{k}" for k in range(40))
+    # the second prompt drops a part of the first one: the chunks after it move to the left (a KV shift)
+    first  = "Intro. " + " ".join(f"gamma{k}" for k in range(30)) + " " + chunk_a + " " + chunk_b
+    second = "Intro. " + chunk_a + " " + chunk_b + " " + " ".join(f"delta{k}" for k in range(60))
+
+    def run_reuse(concurrent: bool):
+        global server
+        server.cache_reuse = 8
+        start(concurrent)
+        res = server.make_request("POST", "/completion", data={"prompt": first, "n_predict": 4, "id_slot": 1, "cache_prompt": True})
+        assert res.status_code == 200
+        gen = lambda: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT, "n_predict": 1024, "ignore_eos": True, "id_slot": 0, "cache_prompt": False})
+        def reuse():
+            time.sleep(0.05)
+            return server.make_request("POST", "/completion", data={"prompt": second, "n_predict": 8, "id_slot": 1, "cache_prompt": True})
+        res_gen, res_reuse = parallel_function_calls([(gen, ()), (reuse, ())])
+        server.stop()
+        log = read_log()
+        os.remove(server.log_path)
+        assert res_gen.status_code == 200 and res_reuse.status_code == 200
+        return res_reuse.body["content"], res_reuse.body["timings"]["cache_n"], log
+
+    ref, _, _ = run_reuse(False)
+    out, cache_n, log = run_reuse(True)
+    # far more than the common prefix "Intro. " came from the cache: the shifted chunks were reused
+    assert cache_n > 40
+    assert "prompt tokens in the second context" in log
+    assert out == ref
+
+
+def test_concurrent_prefill_fitted_context():
+    # without -c the target's context size comes from the fit, the second context takes it from the target
+    server.n_ctx = None
+    start(True)
+    prompt = " ".join(f"w{k}" for k in range(60))
+    gen, long = gen_and_long(prompt)
+    server.stop()
+    log = read_log()
+    assert "failed to create the second context" not in log
+    assert "prompt tokens in the second context" in log
