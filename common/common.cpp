@@ -15,6 +15,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -60,6 +61,10 @@
 
 #if defined(_AIX)
 #include <sys/systemcfg.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/mman.h>
 #endif
 
 #if defined(_MSC_VER)
@@ -2360,6 +2365,65 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+namespace {
+
+// Large buffers ask for transparent huge pages: a device writes a state into them a few hundred KiB at a time, and
+// faulting the buffer in 4 KiB pages takes longer than the copy (a 150 MB checkpoint from two GPUs: 85 ms instead of 49 ms).
+constexpr size_t bytes_huge_page = 2u << 20;
+
+uint8_t * bytes_alloc(size_t n) {
+    void * p = nullptr;
+#if defined(__linux__)
+    if (n >= bytes_huge_page) {
+        if (posix_memalign(&p, bytes_huge_page, n) != 0) {
+            throw std::bad_alloc();
+        }
+        madvise(p, n, MADV_HUGEPAGE); // a hint, the buffer works without it
+        return (uint8_t *) p;
+    }
+#endif
+    p = malloc(n);
+    if (!p) {
+        throw std::bad_alloc();
+    }
+    return (uint8_t *) p;
+}
+
+}
+
+common_bytes::storage::storage(size_t n) : data(bytes_alloc(n)), size(n) {} // not zeroed
+
+common_bytes::storage::~storage() {
+    free(data);
+}
+
+uint8_t * common_bytes::wdata() {
+    if (!buf) {
+        return nullptr;
+    }
+    if (buf.use_count() > 1) {
+        auto own = std::make_shared<storage>(buf->size);
+        memcpy(own->data, buf->data, buf->size);
+        buf = std::move(own);
+    } else {
+        std::atomic_thread_fence(std::memory_order_acquire); // see resize()
+    }
+    return buf->data;
+}
+
+void common_bytes::resize(size_t n) {
+    if (n == 0) {
+        buf.reset();
+        return;
+    }
+    // a checkpoint refreshed in place (the speculative one, every draft round) keeps its buffer
+    if (buf && buf->size == n && buf.use_count() == 1) {
+        std::atomic_thread_fence(std::memory_order_acquire); // after the last use of a copy released on another thread
+        return;
+    }
+    buf = std::make_shared<storage>(n);
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2400,7 +2464,7 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.wdata(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2418,7 +2482,7 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.wdata(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }

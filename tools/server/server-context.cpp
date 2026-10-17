@@ -2706,6 +2706,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // a checkpoint of this task's tokens at this position exists, e.g. the slot was just restored from it:
+        // keep it instead of copying the same state again
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & cur : slot.prompt.checkpoints) {
+                if (cur.n_tokens == n_tokens_new && cur.pos_min == pos_min && cur.pos_max == pos_max &&
+                        cur.id_task != -1 && !cur.data_tgt.empty() && (ctx_dft == nullptr || !cur.data_dft.empty())) {
+                    SLT_TRC(slot, "keeping the context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
+                    cur.id_task = id_task; // spared by the min-step eviction like a new one
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2791,9 +2805,27 @@ private:
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }
 
+    static bool ckpt_read_buf(std::ifstream & ifs, common_bytes & buf, size_t n_avail, size_t & n_read) {
+        uint64_t n = 0;
+        // check the size against the bytes left in the file before allocating, the size field may be corrupted
+        if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
+            return false;
+        }
+        buf.resize(n);
+        return n == 0 || ckpt_read(ifs, buf.wdata(), n, n_read);
+    }
+
     static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
         ofs.write((const char *) src, size);
         n_written += size;
+    }
+
+    static void ckpt_write_buf(std::ofstream & ofs, const common_bytes & buf, size_t & n_written) {
+        const uint64_t n = buf.size();
+        ckpt_write(ofs, &n, sizeof(n), n_written);
+        if (n > 0) {
+            ckpt_write(ofs, buf.data(), n, n_written);
+        }
     }
 
     static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
@@ -4059,10 +4091,11 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // erase any checkpoints with pos_max > pos_next, and the ones past the common prefix:
+                                // the last token of a checkpoint at pos_max == pos_next is not the one of this prompt
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    if (cur.pos_max > pos_next || cur.n_tokens > n_past) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {

@@ -198,6 +198,17 @@ struct llama_context {
                 size_t   n_token_capacity,
                 size_t * n_token_count_out);
 
+    // a copy between host memory and a range of a state tensor
+    struct state_copy_item {
+        ggml_tensor * tensor;
+        uint8_t     * host;
+        size_t        offset;
+        size_t        size;
+    };
+
+    // copies the tensor ranges to host memory (to_host) or from it, through pinned memory when a device offers it
+    void state_copy(const std::vector<state_copy_item> & items, bool to_host);
+
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
@@ -459,6 +470,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // pinned host memory of state_copy(), allocated on first use
+    ggml_backend_buffer_ptr state_stage;
+    bool                    state_stage_tried = false;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

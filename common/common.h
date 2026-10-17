@@ -12,6 +12,7 @@
 #include <list>
 #include <set>
 #include <sstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1283,6 +1284,44 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Bytes whose copies share one buffer until a copy is written (copy on write). A context checkpoint of a recurrent
+// model holds the whole recurrent state of a sequence (~150 MB for a 27B Gated DeltaNet model); the prompt cache and
+// its disk level keep copies of the checkpoints of a slot, which now share the bytes instead of duplicating them.
+// The bytes of resize() are not initialized: they are about to be overwritten.
+class common_bytes {
+public:
+    common_bytes() = default;
+
+    size_t          size()  const { return buf ? buf->size : 0; }
+    bool            empty() const { return size() == 0; }
+    const uint8_t * data()  const { return buf ? buf->data : nullptr; }
+
+    // writable bytes, copied first if another copy shares them (not data(): reading must never copy)
+    uint8_t * wdata();
+
+    // bytes for this copy only, the same ones if no other copy shares them and the size matches (the content is undefined)
+    void resize(size_t n);
+
+    void clear() { buf.reset(); }
+
+    // whether two copies share their bytes
+    bool shares_with(const common_bytes & other) const { return buf && buf == other.buf; }
+
+private:
+    struct storage {
+        uint8_t * data = nullptr;
+        size_t    size = 0;
+
+        explicit storage(size_t n);
+        ~storage();
+
+        storage(const storage &) = delete;
+        storage & operator=(const storage &) = delete;
+    };
+
+    std::shared_ptr<storage> buf;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1292,8 +1331,9 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    // shared with the copies in the prompt cache, see common_bytes
+    common_bytes data_tgt;
+    common_bytes data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

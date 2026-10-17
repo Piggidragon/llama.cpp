@@ -15,7 +15,8 @@ class LogReader:
         self.path = path
         self.pos = 0
     def drain(self):
-        with open(self.path) as f:
+        # token pieces in the verbose log are not always valid UTF-8
+        with open(self.path, errors="replace") as f:
             f.seek(self.pos)
             content = f.read()
             self.pos = f.tell()
@@ -520,6 +521,42 @@ def test_hybrid_restore_at_checkpoint():
     fresh = complete(cont)
     server.stop()
     assert restored["content"] == fresh["content"]
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_hybrid_keeps_restored_checkpoint():
+    # a prompt that differs in its last two tokens restores the checkpoint 4 tokens before the end, and its own last
+    # batch starts there again: the slot keeps that checkpoint instead of copying the same state again, and the
+    # answer is the one of a fresh server
+    global server
+    prompt = tokens_of(5, 600)
+    other = prompt[:-2] + tokens_of(6, 2)
+
+    def start():
+        global server
+        server = make_server()
+        server.model_hf_repo = None
+        server.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+        server.n_ctx = 4096
+        server.n_predict = 16
+        server.cache_disk = None
+        server.start()
+
+    start()
+    log = LogReader(server.log_path)
+    complete_tokens(prompt)
+    log.drain()
+    second = complete_tokens(other)
+    content = log.drain()
+    server.stop()
+    assert "restored context checkpoint" in content
+    assert "keeping the context checkpoint" in content
+    assert "created context checkpoint" not in content
+
+    start()
+    fresh = complete_tokens(other)
+    server.stop()
+    assert second["content"] == fresh["content"]
 
 
 def test_shared_directory_keeps_blocks_of_other_server():
