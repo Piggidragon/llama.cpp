@@ -397,6 +397,18 @@ static void ggml_cuda_ar_wait_for_compute(
 // Init / free
 // ---------------------------------------------------------------------------
 
+void ggml_cuda_ar_pipeline_set_stream_priority(ggml_cuda_ar_pipeline * p, int priority) {
+    for (int i = 0; i < p->n_devices; ++i) {
+        if (p->streams[i] == nullptr) {
+            continue;
+        }
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+        CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&p->streams[i], cudaStreamNonBlocking, priority));
+    }
+}
+
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices, bool small_only) {
 
     if (n_devices != 2) {
@@ -973,6 +985,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t, bool) {
     return nullptr;
 }
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
+}
+void ggml_cuda_ar_pipeline_set_stream_priority(ggml_cuda_ar_pipeline *, int) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;

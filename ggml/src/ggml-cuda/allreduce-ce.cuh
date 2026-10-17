@@ -21,6 +21,9 @@ ggml_cuda_ce_ar * ggml_cuda_ce_ar_init(const int * devices, size_t n_devices, bo
 
 void ggml_cuda_ce_ar_free(ggml_cuda_ce_ar * ar);
 
+// Create the streams again with this priority (it synchronizes them first).
+void ggml_cuda_ce_ar_set_stream_priority(ggml_cuda_ce_ar * ar, int priority);
+
 // in-place sum of tensors[0] and tensors[1], contiguous F32 of the same size on the devices of backends[0] and [1]
 // returns false without enqueuing anything if the tensors are not supported or the buffers cannot be allocated
 bool ggml_cuda_ce_ar_allreduce(ggml_cuda_ce_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);

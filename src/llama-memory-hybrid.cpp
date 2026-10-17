@@ -138,6 +138,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
+bool llama_memory_hybrid::get_seqs_independent() const {
+    return mem_attn->get_seqs_independent() && mem_recr->get_seqs_independent();
+}
+
+bool llama_memory_hybrid::has_pending_update() const {
+    return mem_attn->has_pending_update() || mem_recr->has_pending_update();
+}
+
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();

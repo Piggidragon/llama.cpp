@@ -21,6 +21,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -29,6 +30,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -975,6 +977,15 @@ private:
 
     server_batch batch;
 
+    // --concurrent-prefill: a second context on the memory of ctx_tgt computes one ubatch of the prompt of bg_slot
+    // while ctx_tgt decodes the generating slots, see bg_wait()
+    llama_context_ptr  ctx_bg;
+    server_batch       batch_bg;
+    server_slot *      bg_slot = nullptr;
+    std::thread        bg_waiter;          // synchronizes ctx_bg, nothing else
+    std::atomic<bool>  bg_done{false};
+    int64_t            t_bg_submit = 0;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1026,6 +1037,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        bg_wait();
+        ctx_bg.reset();
+
         spec.reset();
         spec_init.reset();
 
@@ -1584,6 +1598,10 @@ private:
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
+        }
+
+        if (params_base.concurrent_prefill) {
+            bg_init();
         }
 
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
@@ -3019,6 +3037,21 @@ private:
             return false;
         }
 
+        // a cancel, the slot actions and the adapters may touch the slot of the background ubatch
+        switch (task.type) {
+            case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_DECISION:
+            case SERVER_TASK_TYPE_NEXT_RESPONSE:
+            case SERVER_TASK_TYPE_METRICS:
+            case SERVER_TASK_TYPE_SLOT_GET:
+                break;
+            default:
+                bg_wait();
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -3408,7 +3441,141 @@ private:
         }
     }
 
+    // --concurrent-prefill: the second context, on the memory of ctx_tgt
+    void bg_init() {
+        if (params_base.n_parallel < 2 || params_base.kv_unified || !params_base.lora_adapters.empty() ||
+                !params_base.control_vectors.empty() || params_base.embedding || llama_get_memory(ctx_tgt) == nullptr) {
+            SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no unified KV cache, no LoRA adapters or control vectors and a generation model, it is not used\n");
+            return;
+        }
+        if (!llama_memory_seqs_independent(ctx_tgt)) {
+            SRV_WRN("%s", "--concurrent-prefill: the memory of this model shares cells between the sequences, it is not used\n");
+            return;
+        }
+
+        // the memory parameters as the target resolved them (the fit may have changed the context size)
+        auto cparams = common_context_params_to_llama(params_base);
+        cparams.n_ctx         = llama_n_ctx(ctx_tgt);
+        cparams.n_seq_max     = llama_n_seq_max(ctx_tgt);
+        cparams.n_batch       = llama_n_batch(ctx_tgt);
+        cparams.n_ubatch      = llama_n_ubatch(ctx_tgt);
+        cparams.split_overlap = false; // one ubatch at a time
+        ctx_bg.reset(llama_init_from_model_shared_memory(model_tgt, cparams, ctx_tgt));
+        if (!ctx_bg) {
+            SRV_WRN("%s", "--concurrent-prefill: failed to create the second context, it is not used\n");
+            return;
+        }
+
+        // the speculative contexts read the target outputs of the prompt batches from ctx_bg as well
+        common_speculative_configure_target(spec.get(), ctx_bg.get());
+
+        if (!llama_set_stream_priority(ctx_tgt, true) || (ctx_dft != nullptr && !llama_set_stream_priority(ctx_dft, true))) {
+            SRV_WRN("%s", "--concurrent-prefill: the devices have no stream priorities, the generating slots do not go first\n");
+        }
+
+        batch_bg.init(ctx_bg.get(), llama_n_ubatch(ctx_bg.get()), llama_model_n_embd_inp(model_tgt));
+        SRV_INF("%s", "concurrent prefill: a prompt is computed in a second context while other slots generate\n");
+    }
+
+    // whether the next prompt tokens of the slot go through ctx_bg: while other slots generate, the middle of a long
+    // prompt, one ubatch at a time; the end of the prompt (the last checkpoints, the sampling) stays in ctx_tgt
+    bool bg_eligible(const server_slot & slot, bool generating) const {
+        if (!ctx_bg || bg_slot != nullptr || !generating) {
+            return false;
+        }
+        return bg_candidate(slot);
+    }
+
+    // a prompt slot that ctx_bg could take now if it were free
+    bool bg_candidate(const server_slot & slot) const {
+        if (!ctx_bg) {
+            return false;
+        }
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.can_split() || slot.need_embd() ||
+                slot.task->is_parent() || slot.task->is_child() || slot.task->n_tokens_shared > 0 ||
+                !slot.task->decision.order.empty() || slot.task->tokens.has_mtmd) {
+            return false;
+        }
+        const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        if (slot.task->n_tokens() - slot.prompt.n_tokens() <= n_ubatch + 4) {
+            return false;
+        }
+        // a KV shift or a stream copy is applied by the next decode, over the cells of all sequences; the target's
+        // ubatches must not reach the cells of this sequence (recurrent cells: see llama_memory_seqs_independent())
+        return !llama_memory_update_pending(ctx_tgt) && llama_memory_seqs_independent(ctx_tgt);
+    }
+
+    void bg_submit(server_slot & slot) {
+        GGML_ASSERT(bg_slot == nullptr && batch_bg.size() > 0);
+
+        batch_bg.render(0, batch_bg.size());
+        t_bg_submit = ggml_time_us();
+        const int32_t ret = llama_process(ctx_bg.get(), LLAMA_PROCESS_TYPE_DECODE, batch_bg.view.get());
+        if (ret != 0) {
+            SLT_ERR(slot, "concurrent prefill: decode failed, ret = %d\n", ret);
+            llama_synchronize(ctx_bg.get());
+            batch_bg.clear();
+            send_error(slot, "Compute error.");
+            slot.release();
+            slot.prompt_clear();
+            return;
+        }
+
+        SLT_DBG(slot, "concurrent prefill: %d prompt tokens in the second context\n", batch_bg.size());
+
+        bg_slot = &slot;
+        bg_done = false;
+        bg_waiter = std::thread([this]() {
+            llama_synchronize(ctx_bg.get());
+            bg_done = true;
+        });
+    }
+
+    // the background ubatch is computed: the draft contexts follow it, it counts as processed prompt; if the draft
+    // contexts fail on it, only its slot ends with an error
+    void bg_finish() {
+        GGML_ASSERT(bg_slot != nullptr);
+        if (bg_waiter.joinable()) {
+            bg_waiter.join();
+        }
+        server_slot & slot = *bg_slot;
+        bg_slot = nullptr;
+
+        bool ok = true;
+        if (spec) {
+            try {
+                ok = common_speculative_process_from(spec.get(), batch_bg.view, ctx_bg.get());
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "concurrent prefill: %s\n", e.what());
+                ok = false;
+            }
+        }
+
+        const int64_t t_now = ggml_time_us();
+        metrics.add_prompt(batch_bg.size(), t_now - t_bg_submit);
+        if (slot.stats.is_set()) {
+            slot.stats.n_prompt_processed += batch_bg.size();
+            slot.stats.set_prompt_last(t_now);
+        }
+        batch_bg.clear();
+
+        if (!ok) {
+            SLT_ERR(slot, "%s", "failed to process speculative batch\n");
+            send_error(slot, "failed to process speculative batch", ERROR_TYPE_SERVER);
+            slot.release();
+            slot.prompt_clear();
+        }
+    }
+
+    // wait for the background ubatch: before anything else may touch its slot
+    void bg_wait() {
+        if (bg_slot != nullptr) {
+            bg_finish();
+        }
+    }
+
     void abort_all_slots(const std::string & reason) {
+        bg_wait();
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3448,6 +3615,11 @@ private:
 #endif
 
     void update_slots() {
+        // the background ubatch is computed: its slot continues with this step
+        if (bg_slot != nullptr && bg_done) {
+            bg_finish();
+        }
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3497,6 +3669,17 @@ private:
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return;
+        }
+
+        // only the background ubatch is computing: wait for it, its slot continues in the next step
+        if (batch.size() == 0 && bg_slot != nullptr) {
+            bg_wait();
+            return;
+        }
+
+        // the decode applies a KV shift or a stream copy over the cells of all sequences: not while ctx_bg computes
+        if (bg_slot != nullptr && llama_memory_update_pending(ctx_tgt)) {
+            bg_wait();
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
@@ -3775,6 +3958,24 @@ private:
         const int32_t n_fill = !generating.empty() && params_base.n_prefill_budget > 0 ?
             std::min(n_batch, batch.size() + params_base.n_prefill_budget) : n_batch;
 
+        // the slot whose next prompt ubatch goes to ctx_bg in this step
+        server_slot * bg_next = nullptr;
+
+        // with several prompts the one with the fewest tokens left goes through ctx_bg first (the shortest time to the
+        // first token on average); a prompt that starts in this step can take it when none was waiting
+        server_slot * bg_pick = nullptr;
+        if (ctx_bg && bg_slot == nullptr && !generating.empty()) {
+            for (auto & other : slots) {
+                if (other.state != SLOT_STATE_PROCESSING_PROMPT || !bg_candidate(other)) {
+                    continue;
+                }
+                const int32_t n_left = other.task->n_tokens() - other.prompt.n_tokens();
+                if (bg_pick == nullptr || n_left < bg_pick->task->n_tokens() - bg_pick->prompt.n_tokens()) {
+                    bg_pick = &other;
+                }
+            }
+        }
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -3785,6 +3986,11 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // its prompt ubatch is still computing in ctx_bg
+                if (&slot == bg_slot) {
                     return;
                 }
 
@@ -3804,7 +4010,7 @@ private:
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
-                    const auto n_tokens_prev = batch.size();
+                    auto n_tokens_prev = batch.size();
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -4261,6 +4467,40 @@ private:
                     // a prompt that cannot be split goes into one batch, see above
                     int32_t n_fill_slot = slot.can_split() ? n_fill : n_batch;
 
+                    // --concurrent-prefill: one ubatch of this prompt goes into batch_bg and is computed in ctx_bg,
+                    // the swap is undone at the end of this block
+                    struct batch_swap {
+                        server_batch & a;
+                        server_batch & b;
+                        bool active;
+                        batch_swap(server_batch & a, server_batch & b, bool active) : a(a), b(b), active(active) {
+                            if (active) {
+                                std::swap(a, b);
+                            }
+                        }
+                        ~batch_swap() {
+                            if (active) {
+                                std::swap(a, b);
+                            }
+                        }
+                    };
+                    const bool bg_ok = !wait_shared && alora_scale <= 0.0f && !has_mtmd;
+                    const bool use_bg = bg_ok && bg_next == nullptr && (bg_pick == nullptr || &slot == bg_pick) &&
+                        bg_eligible(slot, !generating.empty());
+
+                    // while slots generate, a long prompt that ctx_bg cannot take now waits for it, instead of
+                    // stalling the generating slots in the batch of the target
+                    if (!use_bg && bg_ok && !generating.empty() && bg_candidate(slot)) {
+                        return;
+                    }
+
+                    batch_swap swap_bg(batch, batch_bg, use_bg);
+                    if (use_bg) {
+                        n_tokens_prev = batch.size();
+                        n_fill_slot   = std::min<int32_t>(n_ubatch, batch.n_tokens_alloc);
+                        bg_next       = &slot;
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill_slot) {
                         // get next token to process
@@ -4396,10 +4636,21 @@ private:
                     }
                 }
 
-                if (!slot_batched) {
+                if (!slot_batched && &slot != bg_next) {
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // the ubatch of ctx_bg starts before the batch of ctx_tgt; a slot that ended meanwhile (an error while its
+        // tokens were added) does not get it, its prompt is cleared instead: its tokens are not in the memory
+        if (bg_next != nullptr && batch_bg.size() > 0) {
+            if (bg_next->state == SLOT_STATE_PROCESSING_PROMPT) {
+                bg_submit(*bg_next);
+            } else {
+                batch_bg.clear();
+                bg_next->prompt_clear();
+            }
         }
     }
 
@@ -4527,6 +4778,8 @@ private:
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                    bg_wait();
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {

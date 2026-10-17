@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h" // llama_memory_seqs_independent
 
 #include <cinttypes>
 #include <cmath>
@@ -681,6 +682,67 @@ static bool check_state_ranges(llama_model * model, llama_context * lctx, const 
     return ok;
 }
 
+// recurrent and hybrid memory: each sequence keeps the cell of its own index, so that a ubatch reads and writes only
+// the cells of its sequences (two contexts on one memory compute different sequences at once). The order of use
+// 1, 0, 2 left the cell of sequence 0 between the cells of 1 and 2, and a ubatch {1, 2} gathered across it.
+static bool check_seq_cells(llama_model * model, const std::vector<llama_token> & tokens, std::string & status) {
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        return true;
+    }
+
+    // 4 sequences, 3 used: the reservation ubatch of 64 tokens divides into the sequences
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx      = 4*64;
+    ctx_params.n_seq_max  = 4;
+    ctx_params.n_ubatch   = 64;
+    ctx_params.kv_unified = false;
+    ctx_params.n_threads  = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create the context of the cell check");
+    }
+    llama_memory_t mem = llama_get_memory(ctx.get());
+
+    // a memory that does not claim independent sequences (e.g. shared key pools) is not checked
+    if (!llama_memory_seqs_independent(ctx.get())) {
+        return true;
+    }
+
+    auto decode = [&](const std::vector<llama_seq_id> & seq_ids, llama_pos pos) {
+        common_batch batch(ctx.get());
+        for (size_t i = 0; i < seq_ids.size(); i++) {
+            batch.add(tokens[i], pos, seq_ids[i], true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode batch");
+        }
+    };
+    auto get_state = [&](llama_seq_id seq_id) {
+        std::vector<uint8_t> buf(llama_state_seq_get_size_ext(ctx.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        GGML_ASSERT(llama_state_seq_get_data_ext(ctx.get(), buf.data(), buf.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == buf.size());
+        return buf;
+    };
+
+    decode({1}, 0);
+    decode({0}, 0);
+    decode({2}, 0);
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    decode({0}, 0);
+
+    bool ok = llama_memory_seqs_independent(ctx.get());
+
+    // the state of sequence 0 stays where it is and as it is
+    const std::vector<uint8_t> state0 = get_state(0);
+    decode({1, 2}, 1);
+    ok = ok && llama_memory_seqs_independent(ctx.get()) && get_state(0) == state0;
+
+    if (!ok) {
+        status = "\033[1;31mFAIL\033[0m";
+    }
+    return ok;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1217,6 +1279,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
 
                         if (!encode && !check_state_ranges(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, status_range)) {
+                            test_ok = false;
+                        }
+                        if (!encode && !check_seq_cells(model_and_ctx_dev.first.get(), tokens, status_range)) {
                             test_ok = false;
                         }
 

@@ -146,6 +146,17 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_reserve(uint32_t n_kv) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
 }
 
+bool llama_memory_hybrid_idx::get_seqs_independent() const {
+    // with a stream per sequence a ubatch writes only the indexer rows of its own sequences: its new and stale pooled
+    // keys, and pad cells from its own streams (see kpool_build_state, set_input_kpool). It reads the pooled keys of
+    // the other sequences' pools, masked out (-inf): a concurrent write there leaves finite values, never selected
+    return llama_memory_hybrid::get_seqs_independent() && (mem_idx == nullptr || mem_idx->get_seqs_independent());
+}
+
+bool llama_memory_hybrid_idx::has_pending_update() const {
+    return llama_memory_hybrid::has_pending_update() || (mem_idx && mem_idx->has_pending_update());
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -545,9 +556,15 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
 llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
 bool llama_memory_hybrid_idx_context::next() {
-    // Clear only after a successful ubatch.
-    if (i_cur == 0 && mem != nullptr) {
-        mem->mem_idx_stale_clear();
+    // Clear only after a successful ubatch, and only for the sequences it re-pooled: the others keep their stale
+    // pools for their own next ubatch
+    if (mem != nullptr) {
+        for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+            if (stale_cur[s]) {
+                mem->mem_idx_stale_clear(s);
+                stale_cur[s] = false;
+            }
+        }
     }
 
     if (ctx_idx) {
@@ -667,6 +684,13 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 
     std::array<uint32_t, LLAMA_MAX_SEQ> pool_start;
 
+    std::array<bool, LLAMA_MAX_SEQ> in_ubatch = {};
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            in_ubatch[ubatch.seq_id[i][k]] = true;
+        }
+    }
+
     // a pool is marked once per rep: sequences sharing cells (a seq_cp, or tokens decoded for several sequences)
     // share their pools, whose single pooled row they all read through pool_cells, so the scatter rows stay unique
     auto mark = [&](llama_seq_id s, size_t k) {
@@ -685,9 +709,14 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         pool_start[s] = ip;
         ip += (uint32_t) sq.pools.size();
 
-        // A sequence edit invalidates only pools ending after the edited position.
-        const llama_pos stale_from = i_cur == 0 ?
+        // A sequence edit invalidates only pools ending after the edited position. The first ubatch of the batch
+        // with the sequence re-pools them: a ubatch writes only the pooled keys of its own sequences.
+        const llama_pos stale_from = in_ubatch[s] && !stale_done[s] ?
             mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN;
+        if (in_ubatch[s] && !stale_done[s]) {
+            stale_done[s] = true;
+            stale_cur[s]  = mem_idx_stale_batch[s] != llama_memory_hybrid_idx::POS_CLEAN;
+        }
         if (stale_from == llama_memory_hybrid_idx::POS_CLEAN) {
             continue;
         }
@@ -904,16 +933,35 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
+    // The cells come from the streams of this ubatch's sequences: another context may compute the other streams
+    // meanwhile, and a pad cell there could be the rep that it writes.
     if (n_new_g > n_new) {
         std::vector<int64_t> reps(pcell, pcell + pool_end.size());
         std::sort(reps.begin(), reps.end());
 
-        int64_t pad_cell = 0;
+        std::vector<uint32_t> strms;
+        for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+            if (seq_in_ub[s] && std::find(strms.begin(), strms.end(), lay.seqs[s].strm) == strms.end()) {
+                strms.push_back(lay.seqs[s].strm);
+            }
+        }
+        std::sort(strms.begin(), strms.end());
+        GGML_ASSERT(!strms.empty());
+
+        size_t  i_strm   = 0;
+        int64_t pad_cell = (int64_t) strms[0]*kv_size;
         for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+            for (;;) {
+                if (pad_cell >= (int64_t) (strms[i_strm] + 1)*kv_size) {
+                    ++i_strm;
+                    GGML_ASSERT(i_strm < strms.size() && "no free pad cell in the streams of the ubatch");
+                    pad_cell = (int64_t) strms[i_strm]*kv_size;
+                }
+                if (!std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+                    break;
+                }
                 ++pad_cell;
             }
-            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
             for (uint32_t k = 0; k < kpool; ++k) {
                 nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
             }

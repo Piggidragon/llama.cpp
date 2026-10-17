@@ -2064,6 +2064,20 @@ size_t ggml_backend_trim_pools(ggml_backend_t backend) {
     return trim != nullptr ? trim(backend) : 0;
 }
 
+bool ggml_backend_set_stream_priority(ggml_backend_t backend, bool high) {
+    if (backend == nullptr) {
+        return false;
+    }
+    if (ggml_backend_is_meta(backend)) {
+        return ggml_backend_meta_set_stream_priority(backend, high);
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * set = reg != nullptr ?
+        (ggml_backend_set_stream_priority_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_stream_priority") : nullptr;
+    return set != nullptr && set(backend, high);
+}
+
 bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner) {
     GGML_ASSERT(sched != nullptr);
     return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);

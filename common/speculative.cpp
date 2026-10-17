@@ -206,6 +206,14 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // another context that computes target batches (on the target's memory): keep the same target outputs in it
+    virtual void configure_target(llama_context * /*ctx*/) {}
+
+    // the context that computed the batch of the current process() call, nullptr for the target
+    llama_context * ctx_src = nullptr;
+
+    llama_context * src_or(llama_context * ctx_tgt) const { return ctx_src != nullptr ? ctx_src : ctx_tgt; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -597,15 +605,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' hidden states
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            if (target_layer_ids[k] < n_layer_tgt) {
-                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
-            } else if (target_layer_ids[k] == n_layer_tgt) {
-                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-            } else {
-                GGML_ABORT("EAGLE3: target layer id %d exceeds target n_layer %d", target_layer_ids[k], n_layer_tgt);
-            }
-        }
+        configure_target(ctx_tgt);
 
         // turn on extraction of the draft model's pre-norm hidden state
         // (used both for the encoder output g_embd and the decoder pre-norm output).
@@ -649,6 +649,18 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
+    void configure_target(llama_context * ctx) override {
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (target_layer_ids[k] < n_layer_tgt) {
+                llama_set_embeddings_layer_inp(ctx, (uint32_t) target_layer_ids[k], true);
+            } else if (target_layer_ids[k] == n_layer_tgt) {
+                llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
+            } else {
+                GGML_ABORT("EAGLE3: target layer id %d exceeds target n_layer %d", target_layer_ids[k], n_layer_tgt);
+            }
+        }
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -676,7 +688,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_tgt = src_or(this->params.ctx_tgt); // the context that computed the batch
         auto * ctx_dft = this->params.ctx_dft;
 
         // Interleave each extract_layer's hidden state into a contiguous buffer of
@@ -1129,9 +1141,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
-        }
+        configure_target(ctx_tgt);
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
@@ -1170,6 +1180,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
+    void configure_target(llama_context * ctx) override {
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) target_layer_ids[k], true);
+        }
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1201,7 +1217,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_tgt = src_or(this->params.ctx_tgt); // the context that computed the batch
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
@@ -1516,7 +1532,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        configure_target(ctx_tgt);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
@@ -1577,6 +1593,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void configure_target(llama_context * ctx) override {
+        llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1603,7 +1623,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_tgt = src_or(this->params.ctx_tgt); // the context that computed the batch
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -2927,6 +2947,28 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+void common_speculative_configure_target(common_speculative * spec, llama_context * ctx) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->configure_target(ctx);
+    }
+}
+
+bool common_speculative_process_from(common_speculative * spec, const common_batch & batch, llama_context * ctx) {
+    if (spec == nullptr) {
+        return true;
+    }
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        impl->ctx_src = ctx;
+        result = result && impl->process(batch);
+        impl->ctx_src = nullptr;
+    }
     return result;
 }
 

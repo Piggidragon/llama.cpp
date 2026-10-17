@@ -393,7 +393,7 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
                     ggml_view_1d(ctx0, y_ssm, n_heads * head_dim * d_state * n_seqs,
                                  n_heads * head_dim * n_seq_tokens * n_seqs * ggml_element_size(y_ssm)),
                     ggml_view_1d(ctx0, ssm_states_all, n_heads * head_dim * d_state * n_seqs,
-                                 kv_head * n_seqs * n_heads * head_dim * d_state * ggml_element_size(ssm_states_all))));
+                                 kv_head * n_heads * head_dim * d_state * ggml_element_size(ssm_states_all))));
         cb(ssm_states_all, "mamba_ssm_states", il);
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_heads, n_seq_tokens, n_seqs,
