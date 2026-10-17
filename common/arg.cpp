@@ -1840,6 +1840,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFILL_BUDGET").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--concurrent-prefill"},
+        {"--no-concurrent-prefill"},
+        "while slots generate, compute the prompt of another slot at the same time in a second context on the same\n"
+        "memory, the generating slots first (default: disabled, needs --parallel >= 2 and no unified KV cache)",
+        [](common_params & params, bool value) {
+            params.concurrent_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_CONCURRENT_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
