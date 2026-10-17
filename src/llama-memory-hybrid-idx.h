@@ -114,6 +114,7 @@ public:
 
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
+    void mem_idx_stale_clear(llama_seq_id seq_id) { mem_idx_stale[seq_id] = POS_CLEAN; }
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -246,4 +247,9 @@ private:
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
+
+    // the sequences whose stale pools a ubatch of this batch re-pooled, and those of the current ubatch: a ubatch
+    // re-pools only the pools of its own sequences (another context may compute the others meanwhile)
+    std::array<bool, LLAMA_MAX_SEQ> stale_done = {};
+    std::array<bool, LLAMA_MAX_SEQ> stale_cur  = {};
 };

@@ -197,3 +197,67 @@ def test_concurrent_prefill_fitted_context():
     log = read_log()
     assert "failed to create the second context" not in log
     assert "prompt tokens in the second context" in log
+
+
+def test_concurrent_prefill_two_prompts():
+    # three slots: slot 0 generates while slots 1 and 2 bring long prompts; the second prompt waits for the second
+    # context instead of going into the target's batch, both go through it, both texts as without the flag
+    def run_two(concurrent: bool):
+        global server
+        server.n_slots = 3
+        server.n_ctx = 3 * 2048
+        start(concurrent)
+        gen = lambda: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT, "n_predict": 2048, "ignore_eos": True, "id_slot": 0, "cache_prompt": False})
+        def long(id_slot, n):
+            time.sleep(0.05)
+            return server.make_request("POST", "/completion", data={"prompt": " ".join(f"tok{(k * 29 + id_slot) % 977}" for k in range(n)), "n_predict": 8, "id_slot": id_slot, "cache_prompt": False})
+        res = parallel_function_calls([(gen, ()), (long, (1, 140)), (long, (2, 120))])
+        server.stop()
+        log = read_log()
+        os.remove(server.log_path)
+        assert all(r.status_code == 200 for r in res)
+        return [res[1].body["content"], res[2].body["content"]], log
+
+    ref, _ = run_two(False)
+    out, log = run_two(True)
+    assert "id  1 | task" in log and "id  2 | task" in log
+    bg = [l for l in log.splitlines() if "prompt tokens in the second context" in l]
+    assert any("id  1 |" in l for l in bg) and any("id  2 |" in l for l in bg)
+    assert out == ref
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_QWEN4EXP_MODEL"), reason="needs LLAMA_TEST_QWEN4EXP_MODEL, e.g. from test-llama-archs -a qwen4exp -o DIR")
+def test_concurrent_prefill_qwen4exp():
+    # the indexer memory of qwen4exp: a ubatch writes only the pooled keys of its own sequences, so its prompt can go
+    # through the second context; token prompts (the test model has a synthetic vocabulary), outputs as alone
+    model = os.environ["LLAMA_TEST_QWEN4EXP_MODEL"]
+    toks = lambda seed, n: [1 + ((seed * 13 + k * 7) % 120) for k in range(n)]
+
+    def run_q(concurrent: bool, alone: bool):
+        global server
+        server.n_slots = 3
+        server.n_ctx = 3 * 256
+        server.n_batch = 32
+        server.n_ubatch = 16
+        start(concurrent, model)
+        gen = lambda id_slot: server.make_request("POST", "/completion", data={"prompt": toks(id_slot, 20), "n_predict": 220, "ignore_eos": True, "id_slot": id_slot, "cache_prompt": False})
+        def prompts():
+            if not alone:
+                time.sleep(0.15)
+            r1 = server.make_request("POST", "/completion", data={"prompt": toks(7, 200), "n_predict": 16, "id_slot": 0, "cache_prompt": True, "return_tokens": True})
+            r2 = server.make_request("POST", "/completion", data={"prompt": toks(7, 150) + toks(9, 80), "n_predict": 16, "id_slot": 0, "cache_prompt": True, "return_tokens": True})
+            return [r1.body["tokens"], r2.body["tokens"]]
+        if alone:
+            out = prompts()
+        else:
+            out = parallel_function_calls([(gen, (1,)), (gen, (2,)), (prompts, ())])[2]
+        server.stop()
+        log = read_log()
+        os.remove(server.log_path)
+        return out, log
+
+    ref, _ = run_q(False, alone=True)
+    out, log = run_q(True, alone=False)
+    assert "it is not used" not in log
+    assert "prompt tokens in the second context" in log
+    assert out == ref

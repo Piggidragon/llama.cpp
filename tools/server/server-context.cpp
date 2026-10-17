@@ -3483,6 +3483,14 @@ private:
         if (!ctx_bg || bg_slot != nullptr || !generating) {
             return false;
         }
+        return bg_candidate(slot);
+    }
+
+    // a prompt slot that ctx_bg could take now if it were free
+    bool bg_candidate(const server_slot & slot) const {
+        if (!ctx_bg) {
+            return false;
+        }
         if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.can_split() || slot.need_embd() ||
                 slot.task->is_parent() || slot.task->is_child() || slot.task->n_tokens_shared > 0 ||
                 !slot.task->decision.order.empty() || slot.task->tokens.has_mtmd) {
@@ -3952,6 +3960,21 @@ private:
 
         // the slot whose next prompt ubatch goes to ctx_bg in this step
         server_slot * bg_next = nullptr;
+
+        // with several prompts the one with the fewest tokens left goes through ctx_bg first (the shortest time to the
+        // first token on average); a prompt that starts in this step can take it when none was waiting
+        server_slot * bg_pick = nullptr;
+        if (ctx_bg && bg_slot == nullptr && !generating.empty()) {
+            for (auto & other : slots) {
+                if (other.state != SLOT_STATE_PROCESSING_PROMPT || !bg_candidate(other)) {
+                    continue;
+                }
+                const int32_t n_left = other.task->n_tokens() - other.prompt.n_tokens();
+                if (bg_pick == nullptr || n_left < bg_pick->task->n_tokens() - bg_pick->prompt.n_tokens()) {
+                    bg_pick = &other;
+                }
+            }
+        }
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
@@ -4461,8 +4484,16 @@ private:
                             }
                         }
                     };
-                    const bool use_bg = bg_next == nullptr && !wait_shared && alora_scale <= 0.0f && !has_mtmd &&
+                    const bool bg_ok = !wait_shared && alora_scale <= 0.0f && !has_mtmd;
+                    const bool use_bg = bg_ok && bg_next == nullptr && (bg_pick == nullptr || &slot == bg_pick) &&
                         bg_eligible(slot, !generating.empty());
+
+                    // while slots generate, a long prompt that ctx_bg cannot take now waits for it, instead of
+                    // stalling the generating slots in the batch of the target
+                    if (!use_bg && bg_ok && !generating.empty() && bg_candidate(slot)) {
+                        return;
+                    }
+
                     batch_swap swap_bg(batch, batch_bg, use_bg);
                     if (use_bg) {
                         n_tokens_prev = batch.size();
