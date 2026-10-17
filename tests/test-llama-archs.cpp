@@ -703,6 +703,11 @@ static bool check_seq_cells(llama_model * model, const std::vector<llama_token> 
     }
     llama_memory_t mem = llama_get_memory(ctx.get());
 
+    // a memory that does not claim independent sequences (e.g. shared key pools) is not checked
+    if (!llama_memory_seqs_independent(ctx.get())) {
+        return true;
+    }
+
     auto decode = [&](const std::vector<llama_seq_id> & seq_ids, llama_pos pos) {
         common_batch batch(ctx.get());
         for (size_t i = 0; i < seq_ids.size(); i++) {
