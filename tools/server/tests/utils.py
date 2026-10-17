@@ -70,6 +70,7 @@ class ServerProcess:
     n_gpu_layer: int | None = None
     n_batch: int | None = None
     n_ubatch: int | None = None
+    prefill_budget: int | None = None
     n_ctx: int | None = None
     n_ga: int | None = None
     n_ga_w: int | None = None
@@ -196,6 +197,8 @@ class ServerProcess:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
             server_args.extend(["--ubatch-size", self.n_ubatch])
+        if self.prefill_budget is not None:
+            server_args.extend(["--prefill-budget", self.prefill_budget])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
         if self.n_gpu_layer:

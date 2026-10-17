@@ -3770,12 +3770,17 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // the prompt tokens of this step: while slots generate, at most n_prefill_budget of them, so that a long
+        // prompt does not stall the generating slots for a whole n_batch
+        const int32_t n_fill = !generating.empty() && params_base.n_prefill_budget > 0 ?
+            std::min(n_batch, batch.size() + params_base.n_prefill_budget) : n_batch;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_fill) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4253,8 +4258,11 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // a prompt that cannot be split goes into one batch, see above
+                    int32_t n_fill_slot = slot.can_split() ? n_fill : n_batch;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4267,8 +4275,11 @@ private:
                         }
 
                         // the outputs of a decision are read from one batch, do not split them
-                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
-                            break;
+                        if (slot.prompt.n_tokens() == n_decision_first) {
+                            if (batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
+                                break;
+                            }
+                            n_fill_slot = n_batch;
                         }
 
                         // if this is an alora request with pre-invocation
@@ -4326,6 +4337,10 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    if (n_fill_slot < n_batch && batch.size() >= n_fill_slot && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        SLT_DBG(slot, "prefill budget: %d prompt tokens in this step\n", (int) n_tokens_cur);
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
