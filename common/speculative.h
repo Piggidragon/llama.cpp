@@ -89,6 +89,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// another context that computes target batches for some sequences, on the memory of the target (see
+// llama_init_from_model_shared_memory()): it keeps the target outputs that the speculative contexts read
+void common_speculative_configure_target(common_speculative * spec, llama_context * ctx);
+
+// common_speculative_process() for a batch that ctx computed instead of the target
+bool common_speculative_process_from(common_speculative * spec, const common_batch & batch, llama_context * ctx);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

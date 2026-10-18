@@ -114,6 +114,15 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether the next init_update() has work (KV shifts, stream copies), without side effects; such an update may
+    // compute over the cells of all sequences. The default is the safe answer for a memory that does not tell.
+    virtual bool has_pending_update() const { return true; }
+
+    // whether the graph of a ubatch reads and writes only the cells of its own sequences (no unified KV cells, no
+    // pool shared by the sequences, no recurrent cell of one sequence inside the cell range of others), right now:
+    // two contexts on this memory may then compute different sequences at once
+    virtual bool get_seqs_independent() const { return false; }
+
     //
     // ops
     //

@@ -172,6 +172,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--prefill-budget N` | while a slot generates, process at most N prompt tokens of the other slots per step (default: 0 = up to --batch-size);<br/>a smaller budget keeps the generating slot fast next to a long prompt, the prompt takes longer<br/>(env: LLAMA_ARG_PREFILL_BUDGET) |
+| `--concurrent-prefill, --no-concurrent-prefill` | while slots generate, compute the prompt of another slot at the same time in a second context on the same<br/>memory, the generating slots first (default: disabled, needs --parallel >= 2 and no unified KV cache)<br/>(env: LLAMA_ARG_CONCURRENT_PREFILL) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |

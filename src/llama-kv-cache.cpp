@@ -768,6 +768,14 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
     return get_size();
 }
 
+bool llama_kv_cache::get_seqs_independent() const {
+    return n_stream > 1 && !other; // one stream per sequence, no cells shared with another cache
+}
+
+bool llama_kv_cache::has_pending_update() const {
+    return get_has_shift() || !sc_info.empty();
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
