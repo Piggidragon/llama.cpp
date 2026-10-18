@@ -2002,7 +2002,7 @@ size_t server_prompt_cache::copy_size(const server_prompt & prompt, llama_contex
 }
 
 size_t server_prompt_cache::n_usable(const server_prompt & prompt, size_t lcp) const {
-    if (!needs_checkpoints || lcp >= prompt.tokens.size()) {
+    if (!rolls_back_to_checkpoints || lcp >= prompt.tokens.size()) {
         return lcp;
     }
     size_t res = 0;
@@ -2407,6 +2407,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             common_prompt_checkpoint ckpt;
             ckpt.n_tokens = prompt.n_tokens();
+            ckpt.id_task  = COMMON_CHECKPOINT_FROM_CACHE; // kept by create_checkpoint() instead of copied again
             ckpt.root     = true;
             ckpt.pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
             ckpt.pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot);
@@ -2434,17 +2435,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::evict_oldest() {
     GGML_ASSERT(!states.empty());
 
-    // the root prompts go last
-    auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & state) { return !state.root; });
-    if (it == states.end()) {
-        it = states.begin();
-    }
-
+    // least recently used first, also a root prompt: one that its conversations use is moved to the back when they are
+    // saved or when it is loaded (save_root(), load())
     if (disk) {
-        disk->put(std::move(*it).at_checkpoint());
+        disk->put(std::move(states.front()).at_checkpoint());
     }
 
-    states.erase(it);
+    states.pop_front();
 }
 
 void server_prompt_cache::flush_to_disk(bool wait, std::filesystem::file_time_type t_newest) {

@@ -45,9 +45,10 @@ def chat(messages, id_slot=-1):
     return res.body["timings"]["cache_n"], {"role": "assistant", "content": res.body["choices"][0]["message"]["content"] or ""}
 
 
-def n_system_tokens():
+def n_system_tokens(head=None):
     # the tokens of the prompt up to the first user message
-    res = server.make_request("POST", "/apply-template", data={"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "x"}]})
+    head = head if head is not None else [{"role": "system", "content": SYSTEM}]
+    res = server.make_request("POST", "/apply-template", data={"messages": head + [{"role": "user", "content": "x"}]})
     prompt = res.body["prompt"]
     head = prompt[:prompt.rindex("x")]
     head = head[:head.rindex("<|im_start|>")] if "<|im_start|>" in head else head
@@ -151,3 +152,63 @@ def test_edit_far_back(spread):
         assert cache_n > n_sys + 64
     else:
         assert cache_n <= n_sys + 8
+
+
+def test_root_from_disk_without_checkpoints():
+    # a root file from a server with checkpoints, restored by one with --ctx-checkpoints 0: no checkpoint is made
+    global server
+    cache_dir = tempfile.mkdtemp(prefix='checkpoint-root-')
+    try:
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir)
+        server.start()
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which tests does m5 need?"}])
+        server.stop()
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir, ctx_checkpoints=0)
+        server.start()
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m3 need?"}])
+    finally:
+        server.stop()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def test_nested_roots():
+    # the root of a conversation that starts with an assistant greeting after a system prompt whose own root the slot
+    # holds: the new root reaches the cache too
+    global server
+    server = make_server(n_slots=2, cache_ram=1024, checkpoint_root=256)
+    server.start()
+    greeting = {"role": "assistant", "content": "Hello! I am the build assistant. " + " ".join(f"Module m{k} is owned by team t{k % 5}." for k in range(40))}
+    chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which tests does m5 need?"}], id_slot=0)
+    chat([{"role": "system", "content": SYSTEM}, greeting, {"role": "user", "content": "Which docs does m9 need?"}], id_slot=0)
+    n_root = n_system_tokens([{"role": "system", "content": SYSTEM}, greeting])
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, greeting, {"role": "user", "content": "Who owns m3?"}], id_slot=1)
+    assert cache_n >= n_root - 8
+
+
+def test_root_after_slot_restore():
+    # a slot file has no root flags: the checkpoint at the end of the system prompt becomes the root again, and survives
+    # the rotation of the other checkpoints
+    global server
+    slot_dir = tempfile.mkdtemp(prefix='checkpoint-root-slots-')
+    try:
+        server = make_server(checkpoint_root=256, ctx_checkpoints=3, checkpoint_min_step=0, slot_save_path=slot_dir)
+        server.start()
+        n_sys = n_system_tokens()
+        msgs = long_chat(1)
+        res = server.make_request("POST", "/slots/0?action=save", data={"filename": "root.bin"})
+        assert res.status_code == 200
+        server.stop()
+        server = make_server(checkpoint_root=256, ctx_checkpoints=3, checkpoint_min_step=0, slot_save_path=slot_dir)
+        server.start()
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "root.bin"})
+        assert res.status_code == 200
+        for t in range(1, 6):
+            msgs.append({"role": "user", "content": f"Turn {t}: " + " ".join(f"what does m{(t * 7 + k) % 60} need?" for k in range(30))})
+            _, reply = chat(msgs)
+            msgs.append(reply)
+        cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+        assert cache_n >= n_sys - 4
+    finally:
+        server.stop()
+        shutil.rmtree(slot_dir, ignore_errors=True)

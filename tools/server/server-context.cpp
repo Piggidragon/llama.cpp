@@ -1638,6 +1638,9 @@ private:
                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                 n_swa > 0;
+            prompt_cache->rolls_back_to_checkpoints =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
 
             // the transposed V cache of a context without flash attention is copied row by row per range,
             // which takes many small transfers per block on a GPU: such a context stores whole states
@@ -2765,9 +2768,22 @@ private:
         return best;
     }
 
+    // --checkpoint-root: ckpt becomes the root checkpoint of the slot, the one of its current task; an earlier root (of
+    // another system prompt) is in the prompt cache already and rotates like the other checkpoints from now on
+    void set_checkpoint_root(server_slot & slot, common_prompt_checkpoint & ckpt) {
+        for (auto & cur : slot.prompt.checkpoints) {
+            cur.root = false;
+        }
+        ckpt.root = true;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     // root: the checkpoint is at the end of the system prompt and is kept for good (--checkpoint-root)
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool root = false) {
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
         const int id_task = slot.task->id;
 
         // a checkpoint of this task's tokens at this position exists, e.g. the slot was just restored from it:
@@ -2779,7 +2795,9 @@ private:
                         cur.id_task != -1 && !cur.data_tgt.empty() && (ctx_dft == nullptr || !cur.data_dft.empty())) {
                     SLT_TRC(slot, "keeping the context checkpoint at n_tokens = %" PRId64 "\n", cur.n_tokens);
                     cur.id_task = id_task; // spared by the min-step eviction like a new one
-                    cur.root   |= root;
+                    if (root) {
+                        set_checkpoint_root(slot, cur);
+                    }
                     return;
                 }
             }
@@ -2850,7 +2868,9 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
-        cur.root    = root;
+        if (root) {
+            set_checkpoint_root(slot, cur);
+        }
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -4434,16 +4454,29 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
-                        // --checkpoint-root: a slot that starts at the end of the system prompt (a root prompt from the
-                        // disk level, which carries no checkpoints) keeps that state as its root checkpoint
-                        if (n_past > 0 && n_past == checkpoint_root_pos(slot.task->params.message_spans) &&
-                                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
-                                std::none_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
-                                    [n_past](const common_prompt_checkpoint & ckpt) { return ckpt.n_tokens == n_past; })) {
-                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-                            if (pos_min >= 0 && pos_max + 1 == slot.prompt.tokens.pos_next()) {
-                                create_checkpoint(slot, 0, pos_min, pos_max, true);
+                        // --checkpoint-root: the root checkpoint of this task's system prompt, if the slot holds it
+                        const int32_t root_pos = checkpoint_root_pos(slot.task->params.message_spans);
+                        if (params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                                root_pos > 0 && n_past >= root_pos &&
+                                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS)) {
+                            auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                                [root_pos](const common_prompt_checkpoint & ckpt) { return ckpt.n_tokens == root_pos; });
+                            if (it != slot.prompt.checkpoints.end()) {
+                                // a checkpoint at the root that is not marked (e.g. from a slot file)
+                                if (!it->root) {
+                                    set_checkpoint_root(slot, *it);
+                                    if (prompt_cache) {
+                                        prompt_cache->save_root(slot.prompt, ctx_tgt, ctx_dft, slot.id);
+                                    }
+                                }
+                            } else if (n_past == root_pos) {
+                                // the slot starts at the end of the system prompt (a root prompt from the disk level,
+                                // which carries no checkpoints): that state is the root checkpoint
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                if (pos_min >= 0 && pos_max + 1 == slot.prompt.tokens.pos_next()) {
+                                    create_checkpoint(slot, 0, pos_min, pos_max, true);
+                                }
                             }
                         }
 

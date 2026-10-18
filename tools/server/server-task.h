@@ -722,7 +722,7 @@ struct server_prompt_cache_state {
     server_prompt_data data;
 
     // the prompt up to the root checkpoint of a conversation (--checkpoint-root), the end of its system prompt:
-    // shared by every conversation that starts with it, restored by copy and evicted after the other states
+    // shared by every conversation that starts with it, restored by copy; it stays recent while they are saved
     bool root = false;
 
     size_t size_own() const {
@@ -769,8 +769,9 @@ struct server_prompt_cache {
     // the newest n_checkpoints of a prompt
     static std::list<common_prompt_checkpoint> newest_checkpoints(const std::list<common_prompt_checkpoint> & checkpoints);
 
-    // the prefix of tokens_new that a state restores: its common prefix with tokens_new, or, for a model that rolls
-    // back only to checkpoints, the newest checkpoint within it (all of it if the state is a prefix of tokens_new)
+    // the prefix of tokens_new that a state restores: its common prefix with tokens_new, or, for a memory that rolls
+    // back only to checkpoints (rolls_back_to_checkpoints), the newest checkpoint within it (all of it if the state is a
+    // prefix of tokens_new)
     size_t n_usable(const server_prompt & prompt, size_t lcp) const;
 
     size_t size() const;
@@ -783,6 +784,10 @@ struct server_prompt_cache {
     // the memory rolls back only to context checkpoints (recurrent, hybrid, SWA): a prompt stored on disk has none,
     // so it is used only if the new prompt holds it whole
     bool needs_checkpoints = false;
+
+    // the memory rolls back only to a context checkpoint (recurrent state, not a sliding window): a cached prompt
+    // restores up to its newest checkpoint within the common prefix, see n_usable()
+    bool rolls_back_to_checkpoints = false;
 
     // all slots share one KV stream: a restore can fail for a lack of free cells
     bool kv_unified = false;

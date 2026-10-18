@@ -1327,10 +1327,14 @@ private:
     std::shared_ptr<storage> buf;
 };
 
+// common_prompt_checkpoint::id_task of a checkpoint that the prompt cache restored together with the slot's state
+#define COMMON_CHECKPOINT_FROM_CACHE -2
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
-    // (optional) id of the task that created the checkpoint
+    // (optional) id of the task that created the checkpoint; -1: none (e.g. restored from a slot file, not guaranteed
+    // to load), COMMON_CHECKPOINT_FROM_CACHE: restored from the prompt cache with the state of the slot
     int id_task = -1;
 
     // at the end of the system prompt, kept for good (--checkpoint-root)
