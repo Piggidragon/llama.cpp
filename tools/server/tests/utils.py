@@ -123,6 +123,11 @@ class ServerProcess:
     cache_disk: str | None = None
     cache_disk_size: int | None = None
     cache_block_size: int | None = None
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    checkpoint_root: int | None = None
+    checkpoint_spread: bool = False
+    cache_save_min: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -307,6 +312,16 @@ class ServerProcess:
             server_args.extend(["--cache-disk-size", self.cache_disk_size])
         if self.cache_block_size is not None:
             server_args.extend(["--cache-block-size", self.cache_block_size])
+        if self.ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
+        if self.checkpoint_root is not None:
+            server_args.extend(["--checkpoint-root", self.checkpoint_root])
+        if self.checkpoint_spread:
+            server_args.append("--checkpoint-spread")
+        if self.cache_save_min is not None:
+            server_args.extend(["--cache-save-min", self.cache_save_min])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
