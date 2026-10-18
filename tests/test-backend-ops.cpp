@@ -8540,11 +8540,12 @@ struct test_flash_attn_ext_kv_rows : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "ranges") == 0) {
-                // causal prefixes of the live part, the last query sees all of it
+                // causal prefixes of the live part, the last query sees all of it; odd queries see a later segment
+                // only (the list of several sequences, one segment each)
                 std::vector<int32_t> data(2*nb);
                 for (int64_t i = 0; i < nb; ++i) {
-                    data[2*i + 0] = 0;
                     data[2*i + 1] = (int32_t) std::max<int64_t>(1, n_live - (nb - 1 - i)*7);
+                    data[2*i + 0] = i % 2 == 1 ? std::min<int32_t>(data[2*i + 1] - 1, (int32_t) (n_live/3)) : 0;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {

@@ -781,6 +781,20 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_kv_rows) {
         if (cparams.flash_attn && cparams.kv_unified) {
             resolve(llm_fused_op_kv_rows_probe, cparams.kv_unified_gather);
+
+            // a model whose attention never reads the cache through a list (e.g. its mask feeds more than the
+            // attention, ALiBi, SWA only, no KV cache): the flag would only keep the cells of idle sequences
+            bool any_rows = false;
+            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                any_rows = any_rows || (node.op == LLM_FUSED_OP_FLASH_ATTN && node.tensor->src[5] != nullptr);
+            }
+            if (cparams.kv_unified_gather && !any_rows) {
+                LLAMA_LOG_INFO("%s: kv_unified_gather: no attention of this model reads the KV cache through a list, it is not used\n", func);
+                cparams.kv_unified_gather = false;
+            }
+        } else {
+            // a list exists only for a unified KV cache, with FlashAttention
+            cparams.kv_unified_gather = false;
         }
         cparams.auto_kv_rows = false;
     }

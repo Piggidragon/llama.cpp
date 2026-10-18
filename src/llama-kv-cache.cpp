@@ -1341,7 +1341,8 @@ uint32_t llama_kv_cache::get_reserve_n_kv(const slot_info_vec_t & sinfos) const 
 }
 
 uint32_t llama_kv_cache::get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
-    // a token sees only cells of its own sequences (see set_input_kq_mask()); a shared cell counts once per sequence
+    // a token sees only cells of its own sequences (see set_input_kq_mask()); a shared cell counts once per sequence,
+    // as the segments of get_kv_rows() hold it, unless they do not fit n_kv: then the union of the cells
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
     uint32_t result = 0;
@@ -1355,6 +1356,20 @@ uint32_t llama_kv_cache::get_n_kv_union(const slot_info & sinfo, const llama_uba
             const llama_seq_id seq_id = ubatch.seq_id_unq[i];
             if (seq_to_stream[seq_id] == strm) {
                 n += cells.seq_pos_get(seq_id).size();
+            }
+        }
+        if (n > n_kv) {
+            std::vector<bool> seen(cells.size(), false);
+            n = 0;
+            for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id_unq[i];
+                if (seq_to_stream[seq_id] != strm) {
+                    continue;
+                }
+                for (const auto & [pos, idx] : cells.seq_pos_get(seq_id)) {
+                    n += !seen[idx];
+                    seen[idx] = true;
+                }
             }
         }
 
@@ -1884,12 +1899,20 @@ bool llama_kv_cache::can_causal_prefix() const {
     return !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE;
 }
 
+bool llama_kv_cache::can_kv_rows() const {
+    return can_causal_prefix() && n_stream == 1 && n_seq_max > 1;
+}
+
+bool llama_kv_cache::can_compact() const {
+    return can_causal_prefix() && !(n_stream == 1 && n_seq_max > 1);
+}
+
 bool llama_kv_cache::get_causal_prefix(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
     GGML_UNUSED(sinfo);
 
     // the streams of the mask, see set_input_kq_mask()
     const uint32_t n_stream_mask = n_stream == 1 ? 1 : ubatch.n_seqs_unq;
-    if (!can_causal_prefix() || ubatch.n_tokens == 0 || ubatch.n_tokens % n_stream_mask != 0) {
+    if (!can_compact() || ubatch.n_tokens == 0 || ubatch.n_tokens % n_stream_mask != 0) {
         return false;
     }
 
@@ -1973,17 +1996,35 @@ void llama_kv_cache::set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch *
     }
 }
 
-size_t llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows) const {
+size_t llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows, std::vector<uint32_t> * seg) const {
     GGML_ASSERT(n_stream == 1);
     const auto & cells = v_cells[0];
 
+    size_t n_cells = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        n_cells += cells.seq_pos_get(ubatch.seq_id_unq[s]).size();
+    }
+
     rows.clear();
     rows.reserve(n_rows);
-    if (ubatch.n_seqs_unq == 1) {
-        for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[0])) {
-            rows.push_back((int32_t) idx);
+    if (seg) {
+        seg->clear();
+    }
+    if (n_cells <= n_rows) {
+        // a segment per sequence, its cells in the causal order
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            if (seg) {
+                seg->push_back((uint32_t) rows.size());
+            }
+            for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[s])) {
+                rows.push_back((int32_t) idx);
+            }
+        }
+        if (seg) {
+            seg->push_back((uint32_t) rows.size());
         }
     } else {
+        // the union of the cells, a shared cell once
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[s])) {
                 rows.push_back((int32_t) idx);
@@ -1991,6 +2032,9 @@ size_t llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows,
         }
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        if (seg) {
+            seg->clear();
+        }
     }
     const size_t n_live = rows.size();
     GGML_ASSERT(n_live <= n_rows);
@@ -1999,38 +2043,52 @@ size_t llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows,
     return n_live;
 }
 
-bool llama_kv_cache::get_rows_prefix(const llama_ubatch & ubatch) const {
-    if (n_stream != 1 || !can_causal_prefix() || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+bool llama_kv_cache::get_rows_prefix(const llama_ubatch & ubatch, uint32_t n_rows) const {
+    if (!can_kv_rows() || ubatch.n_tokens == 0) {
         return false;
     }
 
-    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+    // the segments of get_kv_rows()
+    const auto & cells = v_cells[0];
+    size_t n_cells = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        n_cells += cells.seq_pos_get(ubatch.seq_id_unq[s]).size();
+    }
+    if (n_cells > n_rows) {
+        return false;
+    }
+
+    // the tokens of each sequence are not decreasing in the causal order
     const bool is_2d = ubatch.is_pos_2d();
+    std::vector<int32_t> prev(ubatch.n_seqs_unq, -1);
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.n_seq_id[i] != 1) {
             return false;
         }
-        if (i > 0) {
-            const llama_kv_cell_ext ext_prev = { is_2d ? ubatch.pos[i - 1 + ubatch.n_tokens*2] : 0, is_2d ? ubatch.pos[i - 1 + ubatch.n_tokens] : 0 };
-            if (!llama_kv_causal_leq(ubatch.pos[i - 1], ext_prev, ubatch.pos[i],
+        int32_t & ip = prev[ubatch.seq_idx[ubatch.seq_id[i][0]]];
+        if (ip >= 0) {
+            const llama_kv_cell_ext ext_prev = { is_2d ? ubatch.pos[ip + ubatch.n_tokens*2] : 0, is_2d ? ubatch.pos[ip + ubatch.n_tokens] : 0 };
+            if (!llama_kv_causal_leq(ubatch.pos[ip], ext_prev, ubatch.pos[i],
                         is_2d ? ubatch.pos[i + ubatch.n_tokens*2] : 0, is_2d ? ubatch.pos[i + ubatch.n_tokens] : 0, is_2d)) {
                 return false;
             }
         }
+        ip = (int32_t) i;
     }
 
     // the cells are ordered by position (seq_pos), and for M-RoPE the ties must be in the causal order too
     if (is_2d) {
-        const auto & cells = v_cells[0];
-        int32_t prev = -1;
-        for (const auto & [pos, idx] : cells.seq_pos_get(seq_id)) {
-            if (prev >= 0) {
-                const llama_kv_cell_ext ext = cells.ext_get(idx);
-                if (!llama_kv_causal_leq(cells.pos_get(prev), cells.ext_get(prev), pos, ext.x, ext.y, true)) {
-                    return false;
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            int32_t p = -1;
+            for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[s])) {
+                if (p >= 0) {
+                    const llama_kv_cell_ext ext = cells.ext_get(idx);
+                    if (!llama_kv_causal_leq(cells.pos_get(p), cells.ext_get(p), pos, ext.x, ext.y, true)) {
+                        return false;
+                    }
                 }
+                p = (int32_t) idx;
             }
-            prev = (int32_t) idx;
         }
     }
 
@@ -2046,7 +2104,7 @@ void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * u
     memcpy(dst->data, rows.data(), rows.size()*sizeof(int32_t));
 }
 
-void llama_kv_cache::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     const auto & cells = v_cells[0];
     const bool is_2d = ubatch->is_pos_2d();
@@ -2057,53 +2115,62 @@ void llama_kv_cache::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatc
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
+    std::vector<int32_t>  rows;
+    std::vector<uint32_t> seg;
+    const size_t n_live = get_kv_rows(*ubatch, n_rows, rows, &seg);
+
     if (dst->type == GGML_TYPE_I32) {
-        // one sequence, its cells in the causal order: token i sees the list up to the last cell not after it
-        GGML_ASSERT(causal_attn && dst->ne[0] == 2 && dst->ne[1] == n_tokens);
-        const auto & sp = cells.seq_pos_get(ubatch->seq_id_unq[0]);
+        // the segment of each sequence holds its cells in the causal order: token i sees its segment up to the last
+        // cell not after it
+        GGML_ASSERT(causal_attn && dst->ne[0] == 2 && dst->ne[1] == n_tokens && !seg.empty());
         int32_t * data = (int32_t *) dst->data;
-        auto it = sp.begin();
-        int32_t j = 0;
+        std::vector<uint32_t> j(ubatch->n_seqs_unq);
+        for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+            j[s] = seg[s];
+        }
         for (uint32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t s  = ubatch->seq_idx[ubatch->seq_id[i][0]];
             const llama_pos p1 = ubatch->pos[i];
             const llama_pos x1 = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
             const llama_pos y1 = is_2d ? ubatch->pos[i + n_tokens]   : 0;
-            while (it != sp.end() && llama_kv_causal_leq(it->first, is_2d ? cells.ext_get(it->second) : llama_kv_cell_ext{}, p1, x1, y1, is_2d)) {
-                ++it;
-                ++j;
+            while (j[s] < seg[s + 1]) {
+                const uint32_t idx = (uint32_t) rows[j[s]];
+                if (!llama_kv_causal_leq(cells.pos_get(idx), is_2d ? cells.ext_get(idx) : llama_kv_cell_ext{}, p1, x1, y1, is_2d)) {
+                    break;
+                }
+                ++j[s];
             }
-            data[2*i + 0] = 0;
-            data[2*i + 1] = j;
+            data[2*i + 0] = (int32_t) seg[s];
+            data[2*i + 1] = (int32_t) j[s];
         }
         return;
     }
 
-    // several sequences: the dense mask over the list
-    const int64_t n_rows = dst->ne[0];
-    GGML_ASSERT(dst->ne[1] == n_tokens && dst->ne[3] == 1);
-    std::vector<int32_t> rows;
-    const size_t n_live = get_kv_rows(*ubatch, n_rows, rows);
+    // the dense mask over the list: a token sees the cells of its segment, or of its sequence in the union
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_rows && dst->ne[1] == n_tokens && dst->ne[3] == 1);
 
     std::vector<float> row(n_rows);
     for (uint32_t i = 0; i < n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const uint32_t s  = ubatch->seq_idx[seq_id];
         const llama_pos p1 = ubatch->pos[i];
         const llama_pos x1 = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
         const llama_pos y1 = is_2d ? ubatch->pos[i + n_tokens]   : 0;
-        for (int64_t c = 0; c < n_rows; ++c) {
+        for (uint32_t c = 0; c < n_rows; ++c) {
             bool visible = false;
             // past the list: the padding
-            if ((size_t) c < n_live) {
-                const uint32_t j = rows[c];
-                visible = !cells.is_empty(j) && cells.seq_has(j, seq_id) &&
-                    (!causal_attn || llama_kv_causal_leq(cells.pos_get(j), is_2d ? cells.ext_get(j) : llama_kv_cell_ext{}, p1, x1, y1, is_2d));
+            if (c < n_live) {
+                const uint32_t idx = (uint32_t) rows[c];
+                const bool own = seg.empty() ? cells.seq_has(idx, seq_id) : (c >= seg[s] && c < seg[s + 1]);
+                visible = own && !cells.is_empty(idx) &&
+                    (!causal_attn || llama_kv_causal_leq(cells.pos_get(idx), is_2d ? cells.ext_get(idx) : llama_kv_cell_ext{}, p1, x1, y1, is_2d));
             }
             row[c] = visible ? 0.0f : -INFINITY;
         }
         if (dst->type == GGML_TYPE_F16) {
-            ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) dst->data + i*n_rows, n_rows);
+            ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) dst->data + (size_t) i*n_rows, n_rows);
         } else {
-            memcpy((float *) dst->data + i*n_rows, row.data(), n_rows*sizeof(float));
+            memcpy((float *) dst->data + (size_t) i*n_rows, row.data(), n_rows*sizeof(float));
         }
     }
 }
@@ -3241,11 +3308,12 @@ llama_kv_cache_context::llama_kv_cache_context(
     this->n_kv   = std::max(1u, std::min(n_kv, kv->get_size()));
     reserve_n_kv = this->n_kv;
 
-    // the compute buffers are reserved for the usual case of the batches, see get_causal_prefix(); with one stream, for
-    // a list of rows over all cells (--kv-unified-gather), the largest one
-    causal_prefix = kv->can_causal_prefix();
-    rows_prefix   = kv->can_causal_prefix();
-    n_kv_union    = kv->get_n_stream() == 1 ? this->n_kv : 0;
+    // the compute buffers are reserved for the graph shape every causal ubatch of the cache takes (see can_kv_rows()):
+    // with one stream of several sequences a list over all cells with column ranges (--kv-unified-gather), else the
+    // ranges over the cells (--compact-attn-mask)
+    causal_prefix = kv->can_compact();
+    rows_prefix   = kv->can_kv_rows();
+    n_kv_union    = kv->can_kv_rows() ? this->n_kv : 0;
     is_reserve    = true;
 
     has_n_kv_union    = true;
@@ -3350,7 +3418,7 @@ bool llama_kv_cache_context::get_causal_prefix() const {
 
 bool llama_kv_cache_context::get_rows_prefix() const {
     if (!has_rows_prefix) {
-        rows_prefix     = kv->get_rows_prefix(ubatches[i_cur]);
+        rows_prefix     = kv->get_rows_prefix(ubatches[i_cur], get_n_kv_union());
         has_rows_prefix = true;
     }
     return rows_prefix;
@@ -3361,25 +3429,20 @@ bool llama_kv_cache_context::get_unified() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
-    if (kv->get_n_stream() != 1 || !kv->can_causal_prefix()) {
+    // every ubatch of one stream of several sequences reads through the list, also one whose cells are a prefix of
+    // the cells: the graphs keep the shape of the reserve graphs, so the compute buffers are not planned again
+    if (!kv->can_kv_rows()) {
         return 0;
     }
-    // a list shorter than the used cells, or, for one sequence whose cells are not a prefix of the cells (other
-    // sequences hold some of them), a list that gives it the column ranges of a causal prefix instead of a dense mask;
-    // the reserve graphs take the list over all cells
-    const uint32_t n_union = get_n_kv_union();
-    if (is_reserve || n_union < (uint32_t) n_kv || (get_rows_prefix() && !get_causal_prefix())) {
-        return n_union;
-    }
-    return 0;
+    return get_n_kv_union();
 }
 
 void llama_kv_cache_context::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_kv_rows(dst, ubatch);
 }
 
-void llama_kv_cache_context::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask_rows(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const {
+    kv->set_input_kq_mask_rows(dst, ubatch, causal_attn, n_rows);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

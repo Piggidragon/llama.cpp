@@ -260,22 +260,30 @@ public:
     // The graph then builds the mask from one bound per token, see set_input_kq_bounds().
     bool get_causal_prefix(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
 
-    // whether a ubatch can see a prefix at all: the reserve graphs are built that way, the usual case
+    // whether a ubatch can see a prefix at all (no ALiBi or SWA)
     bool can_causal_prefix() const;
 
-    // --kv-unified-gather, one stream: the attention reads the cells of the ubatch's sequences through a list of
-    // n_rows rows (get_n_kv_union()). One sequence: its cells in the causal order; several: their cells by index.
-    // The rest of the list repeats cell 0, masked. Returns the length of the list before that.
-    size_t get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows) const;
+    // the two layouts are exclusive, so that every causal ubatch of a cache has the graph shape of the reserve graphs:
+    // --kv-unified-gather reads one stream of several sequences through a list (can_kv_rows()), --compact-attn-mask
+    // applies to the other caches (a stream per sequence, or one sequence)
+    bool can_kv_rows() const;
+    bool can_compact() const;
 
-    // whether every token of a ubatch of one sequence sees a prefix of the list of get_kv_rows()
-    bool get_rows_prefix(const llama_ubatch & ubatch) const;
+    // --kv-unified-gather, one stream: the attention reads the cells of the ubatch's sequences through a list of
+    // n_rows rows (get_n_kv_union()): the cells of each sequence in the causal order, one segment per sequence of the
+    // ubatch (seg_begin[seq_idx]), so that a token sees a range of the list; where the segments do not fit n_rows
+    // (several sequences share many cells) the union of the cells by index instead, *seg empty. The rest of the list
+    // repeats cell 0, masked. Returns the length of the list before that.
+    size_t get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows, std::vector<uint32_t> * seg = nullptr) const;
+
+    // whether every token of a ubatch sees a range of its segment of the list of get_kv_rows()
+    bool get_rows_prefix(const llama_ubatch & ubatch, uint32_t n_rows) const;
 
     // I32 [n_rows]
     void set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    // the mask over the list: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // the mask over the list of n_rows: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const;
 
     // I32 [2, n_tokens/n_stream, 1, n_stream]: the column range [0, n) of the cells token i sees
     void set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const;
@@ -466,7 +474,7 @@ public:
     uint32_t get_n_kv_rows() const;
 
     void set_input_kv_rows     (ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

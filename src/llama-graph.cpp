@@ -181,7 +181,7 @@ static void set_input_kq_mask_compact(
         const llama_kv_cache_context * mctx, ggml_tensor * kq_mask, ggml_tensor * kv_rows, const llama_ubatch * ubatch, bool causal_attn) {
     if (kv_rows != nullptr) {
         mctx->set_input_kv_rows(kv_rows, ubatch);
-        mctx->set_input_kq_mask_rows(kq_mask, ubatch, causal_attn);
+        mctx->set_input_kq_mask_rows(kq_mask, ubatch, causal_attn, kv_rows->ne[0]);
         return;
     }
     mctx->set_input_kq_mask(kq_mask, ubatch, causal_attn);

@@ -1775,7 +1775,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "where every token of a ubatch sees a prefix of the KV cells (a causal mask over the cells of one sequence in "
         "position order, no SWA or ALiBi), build the attention mask on the device from one bound per token instead of "
         "uploading a mask of n_kv x n_tokens; for long prompts that is up to tens of MB per ubatch less to copy to "
-        "each GPU (default: disabled)",
+        "each GPU; for a KV cache per sequence or of one sequence (a unified cache of several sequences gets the same "
+        "with --kv-unified-gather) (default: disabled)",
         [](common_params & params, bool value) {
             params.compact_attn_mask = value;
         }
