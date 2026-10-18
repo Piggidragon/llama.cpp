@@ -4395,7 +4395,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-vocab"}, "FNAME",
         "MTP: draft over these tokens only, a file of token ids (whitespace separated, # starts a comment), e.g. from "
         "llama-draft-vocab: a copy of their rows of the output head is made at load, a draft step reads and samples "
-        "only those; a token outside the list is never drafted (default: the whole vocabulary)",
+        "only those; a token outside the list is never drafted, and a sequence whose recent text is often outside it "
+        "(a language the list lacks) drafts over the whole vocabulary, see --spec-draft-vocab-max-miss (default: the "
+        "whole vocabulary)",
         [](common_params & params, const std::string & value) {
             std::ifstream file(value);
             if (!file) {
@@ -4423,6 +4425,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.vocab = std::move(ids);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab-max-miss"}, "P",
+        string_format("with --spec-draft-vocab: draft over the whole vocabulary while more than this share of the last 64 "
+                      "tokens of a sequence is outside the list (a language the list does not cover), back below half of "
+                      "it; 1 = never (default: %.2f)", (double) params.speculative.draft.vocab_max_miss),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_max_miss = std::stof(value);
+            if (!(params.speculative.draft.vocab_max_miss >= 0.0f)) {
+                throw std::invalid_argument("--spec-draft-vocab-max-miss must be >= 0");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAX_MISS"));
     add_opt(common_arg(
         {"--spec-draft-sampling"}, "{greedy,probabilistic}",
         string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "

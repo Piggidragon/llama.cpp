@@ -1736,6 +1736,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_draft_vocab(bool value) {
+    // the graphs compare their head (llm_graph_params::head_draft), a switch builds a new one
+    draft_vocab_on = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3135,8 +3140,8 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.head_src    =*/ cparams.draft_vocab ? model.output       : nullptr,
-        /*.head_draft  =*/ cparams.draft_vocab ? model.output_draft : nullptr,
+        /*.head_src    =*/ cparams.draft_vocab && draft_vocab_on ? model.output       : nullptr,
+        /*.head_draft  =*/ cparams.draft_vocab && draft_vocab_on ? model.output_draft : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4867,6 +4872,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_draft_vocab(llama_context * ctx, bool enabled) {
+    ctx->set_draft_vocab(enabled);
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

@@ -1618,15 +1618,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    // llama_context_params::draft_vocab: the output head of a draft graph has the rows of the draft vocabulary only
-    if (w == head_src && head_draft != nullptr && w_s == nullptr) {
+    // llama_context_params::draft_vocab: the output head of a draft graph has the rows of the draft vocabulary only;
+    // its input transforms and precision are those of the output head (w_key), LoRA adapters of the output head (all
+    // its rows) are not applied to it
+    ggml_tensor * w_key = w;
+    const bool draft_head = w == head_src && head_draft != nullptr && w_s == nullptr;
+    if (draft_head) {
         w = head_draft;
     }
-    cur = build_hadamard_input(w, cur);
+    cur = build_hadamard_input(w_key, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (prec_policy) {
-        prec_policy->apply(res);
+        prec_policy->apply(res, w_key);
     }
 
     if (w->type == GGML_TYPE_NVFP4) {
@@ -1638,7 +1642,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     for (const auto & lora : *loras) {
-        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        llama_adapter_lora_weight * lw = draft_head ? nullptr : lora.first->get_weight(w);
         if (lw == nullptr) {
             continue;
         }

@@ -1453,6 +1453,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_params_sampling> smpls_cfg;
 
+    // --spec-draft-vocab: the tokens of the draft head, and whether the context drafts over the whole vocabulary now,
+    // because the recent text of a sequence is often outside the list (see vocab_max_miss)
+    std::vector<bool> vocab_in;
+    bool              vocab_full = false;
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1514,6 +1519,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        if (const llama_token * ids = llama_model_draft_vocab(llama_get_model(ctx_dft))) {
+            vocab_in.assign(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft))), false);
+            for (uint32_t k = 0; k < llama_model_n_draft_vocab(llama_get_model(ctx_dft)); ++k) {
+                vocab_in[ids[k]] = true;
+            }
         }
 
         // offload draft sampling to the backend (not with a draft vocabulary: the context hands its logits to the CPU
@@ -1751,6 +1763,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
+        }
+
+        // the list holds the tokens of the corpus it was made from: a sequence whose recent text is often outside it
+        // (e.g. another language) gets few good drafts from it, so the context drafts over the whole vocabulary then
+        if (!vocab_in.empty() && params.vocab_max_miss < 1.0f) {
+            constexpr size_t n_recent = 64;
+            const float thr = vocab_full ? 0.5f*params.vocab_max_miss : params.vocab_max_miss;
+            bool miss = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id] || dparams[seq_id].prompt == nullptr) {
+                    continue;
+                }
+                const auto & prompt = *dparams[seq_id].prompt;
+                const size_t n = std::min(prompt.size(), n_recent);
+                size_t n_out = 0;
+                for (size_t k = prompt.size() - n; k < prompt.size(); ++k) {
+                    const llama_token t = prompt[k];
+                    n_out += t >= 0 && (size_t) t < vocab_in.size() && !vocab_in[t];
+                }
+                miss = miss || (n > 0 && (float) n_out > thr*n);
+            }
+            if (miss != vocab_full) {
+                vocab_full = miss;
+                llama_set_draft_vocab(ctx_dft, !vocab_full);
+                SPC_DBG("drafting over the %s\n", vocab_full ? "whole vocabulary" : "draft vocabulary");
             }
         }
 
@@ -2693,6 +2731,12 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // the MTP draft head of a separate draft model, see common_model_params_to_llama()
+        if (spec_mtp && !params.speculative.draft.vocab.empty()) {
+            mparams.draft_vocab   = params.speculative.draft.vocab.data();
+            mparams.n_draft_vocab = (uint32_t) params.speculative.draft.vocab.size();
+        }
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {

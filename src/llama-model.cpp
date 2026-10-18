@@ -1314,12 +1314,12 @@ struct llama_model::impl {
     std::vector<float> attn_split_owned;
 };
 
-bool llama_prec_policy::apply(ggml_tensor * res) const {
+bool llama_prec_policy::apply(ggml_tensor * res, const ggml_tensor * key) const {
     if (!res || !res->src[0]) {
         return false;
     }
 
-    const auto it = prec_src1.find(res->src[0]);
+    const auto it = prec_src1.find(key ? key : res->src[0]);
     if (it == prec_src1.end()) {
         return false;
     }
@@ -2117,6 +2117,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        // the draft head counts in the memory breakdown (e.g. of a fit)
+        load_draft_head(ml);
         return true;
     }
 
@@ -2198,6 +2200,20 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
     const int64_t n_rows = (int64_t) draft_vocab.size();
     ggml_tensor * head = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_rows);
     ggml_set_name(head, "output_draft.weight");
+
+    if (ml.no_alloc) {
+        // a dummy buffer: the size is counted, nothing is read (see memory_breakdown())
+        ggml_backend_buffer_ptr dummy { ggml_backend_buft_alloc_buffer(buft, 0) };
+        if (!dummy) {
+            throw std::runtime_error(format("unable to allocate the %s buffer of the draft head", ggml_backend_buft_name(buft)));
+        }
+        head->buffer = dummy.get();
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(dummy));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+        output_draft = head;
+        return;
+    }
 
     ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
     if (!buffer) {
@@ -3601,6 +3617,10 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 
 uint32_t llama_model_n_draft_vocab(const llama_model * model) {
     return model->output_draft ? (uint32_t) model->draft_vocab.size() : 0;
+}
+
+const llama_token * llama_model_draft_vocab(const llama_model * model) {
+    return model->output_draft ? model->draft_vocab.data() : nullptr;
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

@@ -15,11 +15,14 @@ llama-server -m model.gguf --spec-type draft-mtp --spec-draft-vocab draft-vocab.
 ```
 
 - `-f FILE` (several allowed): text like the one the model will write: code in the languages you use, the
-  languages of the answers, the format of the tool calls. The list is only as good as the corpus: a language the
-  corpus lacks gets few drafts.
+  languages of the answers, the format of the tool calls. The list is only as good as the corpus: in a language the
+  corpus lacks, the drafts from the list are mostly rejected (German with a code/English list: a quarter accepted
+  instead of half, slower than no list). While more than `--spec-draft-vocab-max-miss` (default 0.10) of the last 64
+  tokens of a sequence are outside the list, the drafter uses the whole vocabulary instead, so such a conversation
+  runs as without a list; include the languages you use in the corpus to keep the gain there too.
 - `--coverage P` (default 0.995): the most frequent tokens that together make up this share of the corpus's tokens.
 - `--max-tokens N`: at most N tokens.
-- Control and end-of-generation tokens are always added.
+- Control, user-defined (e.g. `<think>`, `<tool_call>`) and end-of-generation tokens are always added.
 
 The output has one token id per line (`#` starts a comment); `--spec-draft-vocab` reads the same format, so a list can
 also be written by hand or by another tool. The ids depend on the tokenizer, not on the weights: a list works for

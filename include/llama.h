@@ -657,6 +657,9 @@ extern "C" {
 
     // the number of tokens of the draft head (llama_model_params::draft_vocab), 0 if the model has none
     LLAMA_API uint32_t llama_model_n_draft_vocab(const struct llama_model * model);
+
+    // the token ids of the draft head, sorted, llama_model_n_draft_vocab() of them; NULL if the model has none
+    LLAMA_API const llama_token * llama_model_draft_vocab(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -1202,6 +1205,10 @@ extern "C" {
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
+    // An MTP context created with llama_context_params::draft_vocab drafts over the draft vocabulary (true, the
+    // default) or over the whole vocabulary (false), e.g. while the text leaves the list
+    LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, bool enabled);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

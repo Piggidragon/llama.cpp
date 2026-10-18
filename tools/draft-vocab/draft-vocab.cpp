@@ -1,7 +1,7 @@
 // llama-draft-vocab: the token ids for --spec-draft-vocab, from the token frequencies of a text corpus
 //
-// The most frequent tokens of the files that together cover --coverage of the token occurrences, plus every control
-// and end-of-generation token, written as ids one per line. Use text like the one the model will write (code, the
+// The most frequent tokens of the files that together cover --coverage of the token occurrences, plus every control,
+// user-defined and end-of-generation token, written as ids one per line. Use text like the one the model will write (code, the
 // languages of the answers, the format of tool calls): a token outside the list is never drafted.
 
 #include "llama.h"
@@ -137,10 +137,13 @@ int main(int argc, char ** argv) {
         n_covered += counts[id];
         n_kept++;
     }
-    // a draft can end a turn or emit the markup tokens of the template
+    // a draft can end a turn or emit the markup tokens of the template (control tokens, and user-defined ones such as
+    // <think> or <tool_call>)
     int64_t n_control = 0;
     for (int32_t id = 0; id < n_vocab; id++) {
-        if (!keep[id] && (llama_vocab_is_control(vocab, id) || llama_vocab_is_eog(vocab, id))) {
+        const bool markup = llama_vocab_is_control(vocab, id) || llama_vocab_is_eog(vocab, id) ||
+            (llama_vocab_get_attr(vocab, id) & LLAMA_TOKEN_ATTR_USER_DEFINED);
+        if (!keep[id] && markup) {
             keep[id] = true;
             n_control++;
         }
@@ -149,7 +152,7 @@ int main(int argc, char ** argv) {
     std::ostringstream out;
     out << "# llama-draft-vocab: " << (n_kept + n_control) << " of " << n_vocab << " tokens of " << path_model << "\n";
     out << "# " << n_kept << " cover " << 100.0*n_covered/n_total << "% of the " << n_total << " tokens of the corpus, "
-        << n_control << " control and end-of-generation tokens\n";
+        << n_control << " control, user-defined and end-of-generation tokens\n";
     for (int32_t id = 0; id < n_vocab; id++) {
         if (keep[id]) {
             out << id << "\n";
@@ -165,7 +168,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    fprintf(stderr, "%" PRId64 " tokens (%.1f%% of the vocabulary) cover %.2f%% of %" PRIu64 " corpus tokens, plus %" PRId64 " control tokens\n",
+    fprintf(stderr, "%" PRId64 " tokens (%.1f%% of the vocabulary) cover %.2f%% of %" PRIu64 " corpus tokens, plus %" PRId64 " markup tokens\n",
             n_kept, 100.0*n_kept/n_vocab, 100.0*n_covered/n_total, n_total, n_control);
 
     llama_model_free(model);

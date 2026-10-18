@@ -899,6 +899,7 @@ struct llm_graph_params {
         }
 
         return
+            head_draft                      == other.head_draft                      &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
