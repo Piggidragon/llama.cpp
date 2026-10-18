@@ -287,7 +287,7 @@ def test_concurrent_prefill_mmproj():
             return server.make_request("POST", "/v1/chat/completions", data={"messages": messages, "max_tokens": 8, "id_slot": 1, "cache_prompt": False})
         res_gen, res_chat = parallel_function_calls([(gen, ()), (chat, ())])
         assert res_gen.status_code == 200 and res_chat.status_code == 200
-        return res_chat.body["choices"][0]["message"]["content"], read_log().count("prompt tokens in the second context")
+        return res_chat.body["choices"][0]["message"]["content"], read_log()
 
     def run_mm(concurrent: bool):
         global server
@@ -296,16 +296,21 @@ def test_concurrent_prefill_mmproj():
         server.n_ctx = 8192
         server.temperature = 0.0
         start(concurrent)
-        text, n_text = chat_and_gen(text_only)
-        image_text, n_all = chat_and_gen(with_image)
+        text, log_text = chat_and_gen(text_only)
+        image_text, log_all = chat_and_gen(with_image)
         server.stop()
         os.remove(server.log_path)
-        return text, image_text, n_text, n_all - n_text
+        return text, image_text, log_text, log_all[len(log_text):]
 
+    bg_line = "prompt tokens in the second context"
     text_ref, image_ref, _, _ = run_mm(False)
-    text, image_text, n_text, n_image = run_mm(True)
-    assert n_text >= 1
-    assert n_image >= 2 # before and after the image
+    text, image_text, log_text, log_image = run_mm(True)
+    assert bg_line in log_text
+    # the text after the image goes through the second context too
+    i_image = log_image.find("image decoded")
+    assert i_image >= 0
+    assert bg_line in log_image[:i_image]
+    assert bg_line in log_image[i_image:]
     assert text == text_ref
     assert image_text == image_ref
 

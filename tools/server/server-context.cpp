@@ -4016,8 +4016,14 @@ private:
         if (ctx_bg && bg_slot == nullptr && !generating.empty()) {
             constexpr int32_t bg_passed_max = 8;
             auto n_left = [](const server_slot & slot) { return slot.task->n_tokens() - slot.prompt.n_tokens(); };
+            // a slot whose next input is a media chunk decodes it in ctx_tgt and its text waits for the next step:
+            // it is not picked, so that another prompt can take ctx_bg in this step
+            auto pickable = [this](const server_slot & slot) {
+                return slot.state == SLOT_STATE_PROCESSING_PROMPT && bg_candidate(slot) &&
+                    slot.task->tokens[slot.prompt.n_tokens()] != LLAMA_TOKEN_NULL;
+            };
             for (auto & other : slots) {
-                if (other.state != SLOT_STATE_PROCESSING_PROMPT || !bg_candidate(other)) {
+                if (!pickable(other)) {
                     continue;
                 }
                 if (bg_pick == nullptr) {
@@ -4032,7 +4038,7 @@ private:
             }
             if (bg_pick != nullptr) {
                 for (auto & other : slots) {
-                    if (&other != bg_pick && other.state == SLOT_STATE_PROCESSING_PROMPT && bg_candidate(other)) {
+                    if (&other != bg_pick && pickable(other)) {
                         other.bg_passed++;
                     }
                 }
