@@ -208,7 +208,7 @@ public:
     uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // a bound on the cells the tokens of an applied ubatch can see in a stream: the cells of its sequences, padded
-    // like n_kv; 0 if that is not fewer than n_kv (see ggml_flash_attn_ext_set_n_kv_union())
+    // like n_kv; 0 if that is not fewer than n_kv: the length of the list of get_kv_rows()
     uint32_t get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
 
     // get views of the current state of the cache
