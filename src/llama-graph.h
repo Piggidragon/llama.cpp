@@ -364,8 +364,12 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
-    // --kv-unified-gather: the cells the ubatch's tokens can see, see ggml_flash_attn_ext_set_n_kv_union()
-    uint32_t n_kv_union = 0;
+    // --kv-unified-gather: I32 [n_rows], the cells of the ubatch's sequences the attention reads (the mask has their
+    // columns), see ggml_flash_attn_ext_set_kv_rows(); null if it reads the first n_kv cells
+    ggml_tensor * self_kv_rows = nullptr;
+
+    // whether the model reads the attention mask only through the attention (a list of rows changes its columns)
+    bool allow_rows = true;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -540,9 +544,8 @@ public:
     ggml_tensor * self_v_rot_swa = nullptr;
 
     const llama_hparams hparams;
-    // --kv-unified-gather, see llm_graph_input_attn_kv::n_kv_union
-    uint32_t n_kv_union     = 0;
-    uint32_t n_kv_union_swa = 0;
+    // --kv-unified-gather, the cells of the non-SWA layers, see llm_graph_input_attn_kv::self_kv_rows
+    ggml_tensor * self_kv_rows = nullptr;
 
     const llama_cparams cparams;
 
@@ -1259,7 +1262,7 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il,
-                int64_t   n_kv_union = 0) const;
+          ggml_tensor * kv_rows = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

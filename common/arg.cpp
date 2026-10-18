@@ -1770,6 +1770,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_GATHER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--compact-attn-mask"},
+        {"--no-compact-attn-mask"},
+        "where every token of a ubatch sees a prefix of the KV cells (a causal mask over the cells of one sequence in "
+        "position order, no SWA or ALiBi), build the attention mask on the device from one bound per token instead of "
+        "uploading a mask of n_kv x n_tokens; for long prompts that is up to tens of MB per ubatch less to copy to "
+        "each GPU (default: disabled)",
+        [](common_params & params, bool value) {
+            params.compact_attn_mask = value;
+        }
+    ).set_env("LLAMA_ARG_COMPACT_ATTN_MASK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
         {"--flash-attn-native-quants"},
         {"--no-flash-attn-native-quants"},
         "read quantized K/V caches directly in the CUDA MMA FlashAttention kernel instead of casting them to F16 "
@@ -1854,7 +1865,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--concurrent-prefill"},
         {"--no-concurrent-prefill"},
         "while slots generate, compute the prompt of another slot at the same time in a second context on the same\n"
-        "memory, the generating slots first (default: disabled, needs --parallel >= 2 and no unified KV cache)",
+        "memory, the generating slots first (default: disabled, needs --parallel >= 2; with a unified KV cache, use\n"
+        "--kv-unified-gather)",
         [](common_params & params, bool value) {
             params.concurrent_prefill = value;
         }

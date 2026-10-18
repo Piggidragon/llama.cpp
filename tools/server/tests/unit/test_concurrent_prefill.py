@@ -342,32 +342,40 @@ def test_concurrent_prefill_unified_hybrid():
 
 @pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
 def test_concurrent_prefill_unified_hybrid_straddle():
-    # unified: slots 0 and 2 generate in one ubatch of the target while the prompt of slot 1 goes through the second
-    # context; the recurrent memory gathers the cells of a ubatch {0, 2} into one range, over the cell of slot 1, so the
-    # target waits for the second context then (see batch_straddles()); the prompt's text is the one without the flag
+    # unified: slot 0 generates, the prompt of slot 1 goes through the second context, then slot 2 starts; the target's
+    # ubatches {0, 2} make the recurrent memory gather their cells into one range, over the cell of slot 1 (see
+    # llama_memory_recurrent::find_slot()), so the target waits for the second context (batch_straddles()); the cells
+    # are reordered afterwards and the rest of the prompt goes through the target. The prompt's text is the one
+    # without the flag.
     hybrid = os.environ["LLAMA_TEST_HYBRID_MODEL"]
-    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(450))
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(1500))
     gen = lambda id_slot: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT + f" {id_slot}", "n_predict": 400, "ignore_eos": True, "id_slot": id_slot, "cache_prompt": False})
     long = lambda: server.make_request("POST", "/completion", data={"prompt": prompt, "n_predict": 8, "id_slot": 1, "cache_prompt": False})
 
     def run3(concurrent: bool):
         global server
         server.n_slots = 3
-        server.n_ctx = 3 * 2048
+        server.n_ctx = 3 * 8192
+        server.n_batch = 128
+        server.n_ubatch = 128
         server.kv_unified = True
         server.kv_unified_gather = True
         start(concurrent, hybrid)
         def slot1():
-            time.sleep(0.3) # slots 0 and 2 generate
+            time.sleep(0.2) # slot 0 generates
             return long()
-        res = parallel_function_calls([(gen, (0,)), (gen, (2,)), (slot1, ())])
+        def slot2():
+            time.sleep(0.6) # the prompt of slot 1 is in progress
+            return gen(2)
+        res = parallel_function_calls([(gen, (0,)), (slot1, ()), (slot2, ())])
         server.stop()
         log = read_log()
         os.remove(server.log_path)
         assert all(r.status_code == 200 for r in res)
-        return res[2].body["content"], log
+        return res[1].body["content"], log
 
     ref, _ = run3(False)
     out, log = run3(True)
     assert "prompt tokens in the second context" in log
+    assert "sequences on both sides of this one, waiting" in log
     assert out == ref

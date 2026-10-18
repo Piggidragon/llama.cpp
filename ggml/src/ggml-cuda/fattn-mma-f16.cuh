@@ -703,9 +703,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     // For a quantized K/V nstages selects the staging mode, see ggml_cuda_fattn_mma_nstages_quant.
     constexpr bool is_quant_kv     = ggml_cuda_fattn_mma_quant_type(type_K) || ggml_cuda_fattn_mma_quant_type(type_V);
-    // use_sparse: an F16 K/V gathers its mask per element; a quantized one gathers only its K/V rows, the host compacts
-    // the mask along the index lists and pads them to whole tiles (see launch_fattn())
-    constexpr bool sparse_f16      = use_sparse && !is_quant_kv;
+    // use_sparse: the K/V rows of the index lists are gathered, the mask has their columns (the host compacts it along
+    // the lists, or it comes that way with a row list) and the lists are padded to whole tiles (see launch_fattn()).
+    // The per-element mask gather of sparse_f16 is not used.
+    constexpr bool sparse_f16      = false;
     constexpr bool gather_quant    = use_sparse && is_quant_kv;
     constexpr int  nstages         = is_quant_kv ?
         ggml_cuda_fattn_mma_get_nstages_quant(type_K, type_V, DKQ, DV, ncols1, ncols2) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
@@ -1500,9 +1501,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr bool is_quant_kv     = ggml_cuda_fattn_mma_quant_type(type_K) || ggml_cuda_fattn_mma_quant_type(type_V);
-    // use_sparse: an F16 K/V gathers its mask per element; a quantized one gathers only its K/V rows, the host compacts
-    // the mask along the index lists and pads them to whole tiles (see launch_fattn())
-    constexpr bool sparse_f16      = use_sparse && !is_quant_kv;
+    // use_sparse: the K/V rows of the index lists are gathered, the mask has their columns (the host compacts it along
+    // the lists, or it comes that way with a row list) and the lists are padded to whole tiles (see launch_fattn()).
+    // The per-element mask gather of sparse_f16 is not used.
+    constexpr bool sparse_f16      = false;
     constexpr bool gather_quant    = use_sparse && is_quant_kv;
     constexpr int  nstages         = is_quant_kv ?
         ggml_cuda_fattn_mma_get_nstages_quant(type_K, type_V, DKQ, DV, ncols1, ncols2) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
@@ -2099,7 +2101,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-// The quantized-native shapes that gather the K/V rows listed by the sparse index lists (the n_kv_union hint).
+// The quantized-native shapes that gather the K/V rows of a list of rows (ggml_flash_attn_ext_set_kv_rows()).
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_quant_may_gather(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     GGML_UNUSED_VARS(ncols1, ncols2);
@@ -2108,7 +2110,10 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_quant_may
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+    // every shape at D = 128 and 256 (tiles of at least 8 columns, like the dense ones): a list of K/V rows
+    // (ggml_flash_attn_ext_set_kv_rows()) takes whatever shape the batch gets
+    return (DKQ == DV && (DKQ == 128 || DKQ == 256) && ncols1*ncols2 >= 8) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
@@ -2438,7 +2443,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         // The native route takes no sparse K/V set (n_kv_max, see ggml_cuda_fattn_native_supported()), but it gathers
-        // the rows of the cells the queries can see with the n_kv_union hint.
+        // the rows of a list of K/V rows (ggml_flash_attn_ext_set_kv_rows()).
         if constexpr (is_quant_kv && ggml_cuda_flash_attn_ext_mma_quant_may_gather(DKQ, DV, ncols1, ncols2)) {
             use_sparse = ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2);
         }

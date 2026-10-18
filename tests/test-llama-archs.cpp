@@ -537,7 +537,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         const std::vector<float> & attn_split = {}, const bool split_overlap = false,
-        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false) {
+        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false,
+        const bool compact_mask = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -562,6 +563,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     // the compute buffers follow the batches: prompt and generation sizes, the KV extent
     ctx_params.phase_aware_workspace  = workspace;
     ctx_params.live_context_workspace = workspace;
+    // causal masks built on the device from one column range per token
+    ctx_params.compact_attn_mask = compact_mask;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -762,6 +765,10 @@ static bool check_seq_scripts(llama_model * model, std::string & status) {
         ctx_params.n_batch    = 64;
         ctx_params.n_ubatch   = 64;
         ctx_params.kv_unified = unified;
+        // the single-sequence references take the compact masks, the scripts of several sequences in a unified cache the
+        // lists of their cells (--kv-unified-gather) or the dense masks: each checks the other
+        ctx_params.compact_attn_mask = true;
+        ctx_params.kv_unified_gather = true;
         ctx_params.n_threads  = 4;
         ctx_params.n_threads_batch = 4;
         llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
@@ -1208,12 +1215,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         bool                            split_overlap;
         llama_allreduce_type            allreduce_type;
         bool                            workspace;    // phase-aware and live-context workspace
+        bool                            compact_mask; // --compact-attn-mask
 
         device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0,
                 std::vector<float> attn_split = {}, bool split_overlap = false, llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT,
-                bool workspace = false)
+                bool workspace = false, bool compact_mask = false)
             : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size),
-              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type), workspace(workspace) {}
+              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type), workspace(workspace),
+              compact_mask(compact_mask) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -1233,6 +1242,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     continue;
                 }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+                // the causal masks from one column range per token
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, std::string(ggml_backend_dev_description(dev)) + " -cam",
+                        LLAMA_SPLIT_MODE_LAYER, false, 0, std::vector<float>{}, false, LLAMA_ALLREDUCE_TYPE_DEFAULT, false, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
@@ -1277,6 +1291,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 dev_configs.emplace_back(devices_meta, "Meta -so -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true,
                         LLAMA_ALLREDUCE_TYPE_DEFAULT, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+                // the causal masks from one column range per token, built on each device
+                dev_configs.emplace_back(devices_meta, "Meta -cam", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false,
+                        LLAMA_ALLREDUCE_TYPE_DEFAULT, false, true);
             }
         }
 
@@ -1383,7 +1401,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type, dc.workspace);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type, dc.workspace, dc.compact_mask);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

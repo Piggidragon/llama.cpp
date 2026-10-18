@@ -447,6 +447,9 @@ extern "C" {
         bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a
                                        // ubatch reads only the cells of the ubatch's sequences (CUDA, where a gather
                                        // kernel exists), not every used cell
+        bool compact_attn_mask;        // a causal attention mask whose visible cells are a prefix of the cells for
+                                       // every token is built on the device from one bound per token instead of
+                                       // being uploaded
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

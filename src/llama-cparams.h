@@ -43,6 +43,7 @@ struct llama_cparams {
     bool phase_aware_workspace;    // see llama_context_params::phase_aware_workspace
     bool live_context_workspace;   // see llama_context_params::live_context_workspace
     bool kv_unified_gather;        // see llama_context_params::kv_unified_gather
+    bool compact_attn_mask;        // see llama_context_params::compact_attn_mask
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)

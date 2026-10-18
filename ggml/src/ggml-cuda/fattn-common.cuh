@@ -723,34 +723,27 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// The sparse index lists of the groups of ncols1 queries, see fattn.cu. chunk_counts is scratch of
+// ggml_cuda_flash_attn_ext_compact_mask_scratch() ints. With mask_dst, also the mask of each query row at the listed
+// columns, -inf for the padding: a kernel that gathers only the K/V rows reads it like a dense mask of n_kv_max columns.
+int64_t ggml_cuda_flash_attn_ext_compact_mask_scratch(const ggml_tensor * mask, int32_t n_queries, int32_t ncols1);
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t * chunk_counts, half * mask_dst,
+        int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
-// The mask of each query row at the cells of the index list of its group of ncols1 queries, -inf for the padding:
-// a kernel that gathers only the K/V rows reads it like a dense mask of n_kv_max columns.
-void ggml_cuda_flash_attn_ext_gather_mask(
-        const ggml_tensor * mask, const int32_t * indices, half * dst, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
-
-// see ggml_backend_cuda_fattn_gather_count()
-void ggml_cuda_fattn_count_gather(const ggml_tensor * dst);
+// the index lists of a list of K/V rows (ggml_flash_attn_ext_set_kv_rows()): the same for every group of queries of a
+// mask sequence, all n_cols entries live
+void ggml_cuda_flash_attn_ext_rows_lists(
+        const ggml_tensor * rows, int32_t * indices, int32_t * counts, int32_t n_groups, int32_t n_seq, cudaStream_t stream);
 
 // The length of the column list a group of ncols1 queries gathers: a bound on the union of their finite mask entries,
-// from the bound per row (op param 4) and/or the bound for all rows (GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION).
-// 0 if neither is set.
+// from the bound per row (op param 4). 0 if it is not set.
 static int64_t ggml_cuda_fattn_sparse_n_kv(const ggml_tensor * KQV, const int ncols1) {
-    const int32_t n_kv_row   = ggml_get_op_params_i32(KQV, 4);
-    const int32_t n_kv_union = ggml_get_op_params_i32(KQV, GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION);
-    if (n_kv_row <= 0 && n_kv_union <= 0) {
+    const int32_t n_kv_row = ggml_get_op_params_i32(KQV, 4);
+    if (n_kv_row <= 0) {
         return 0;
     }
-    int64_t n_kv = KQV->src[1]->ne[1];
-    if (n_kv_row > 0) {
-        n_kv = std::min<int64_t>(n_kv, int64_t(ncols1)*n_kv_row);
-    }
-    if (n_kv_union > 0) {
-        n_kv = std::min<int64_t>(n_kv, n_kv_union);
-    }
-    return n_kv;
+    return std::min<int64_t>(KQV->src[1]->ne[1], int64_t(ncols1)*n_kv_row);
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -1126,31 +1119,41 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
-    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
-    // A quantized K/V read in place gathers only its rows: the mask is compacted along the lists, which are padded to
-    // whole tiles, and the kernel reads it like a dense mask (see flash_attn_ext_f16_iter()).
-    const bool sparse_compact_mask = use_sparse && !need_f16_K && ggml_is_quantized(K->type);
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns. Only the
+    // K/V rows of the list are gathered: the mask is compacted along the lists, which are padded to whole tiles, and the
+    // kernel reads it like a dense mask (see flash_attn_ext_f16_iter()). A list of K/V rows from the graph
+    // (ggml_flash_attn_ext_set_kv_rows()) is that list already, for every tile, and its mask has its columns.
+    const ggml_tensor * rows = KQV->src[5];
+    const bool sparse_compact_mask = use_sparse && rows == nullptr;
+    GGML_ASSERT(rows == nullptr || use_sparse);
     int32_t n_kv_max = 0;
-    if (use_sparse) {
-        GGML_ASSERT(mask != nullptr);
-        n_kv_max = ggml_cuda_fattn_sparse_n_kv(KQV, ncols1);
-        GGML_ASSERT(n_kv_max > 0);
-        if (sparse_compact_mask) {
-            GGML_ASSERT(mask->ne[2] == 1);
-            n_kv_max = GGML_PAD(n_kv_max, FATTN_KQ_STRIDE);
-        }
+    if (use_sparse && rows != nullptr) {
+        GGML_ASSERT(mask != nullptr && mask->ne[0] == rows->ne[0]);
+        n_kv_max = rows->ne[0];
+        GGML_ASSERT(n_kv_max % FATTN_KQ_STRIDE == 0);
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
-        ggml_cuda_fattn_count_gather(KQV);
-
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        ggml_cuda_flash_attn_ext_rows_lists(rows, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, ntiles_x, mask->ne[3], main_stream);
+    } else if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        n_kv_max = ggml_cuda_fattn_sparse_n_kv(KQV, ncols1);
+        GGML_ASSERT(n_kv_max > 0);
+        GGML_ASSERT(mask->ne[2] == 1);
+        n_kv_max = GGML_PAD(n_kv_max, FATTN_KQ_STRIDE);
 
+        const size_t n_lists   = size_t(ntiles_x) * mask->ne[3];
+        const size_t n_scratch = ggml_cuda_flash_attn_ext_compact_mask_scratch(mask, Q->ne[1], ncols1);
+
+        // the lists, their lengths, the scratch of the list kernels
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists + n_scratch);
         if (sparse_compact_mask) {
             mask_compact.alloc(size_t(n_kv_max) * Q->ne[1] * mask->ne[3]);
-            ggml_cuda_flash_attn_ext_gather_mask(mask, KV_max.ptr, mask_compact.ptr, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists,
+            KV_max.ptr + size_t(n_kv_max)*n_lists + n_lists, sparse_compact_mask ? mask_compact.ptr : nullptr,
+            Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.

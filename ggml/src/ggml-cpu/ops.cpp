@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <cfloat>
 #include <cmath>
 
@@ -8687,6 +8688,53 @@ void ggml_compute_forward_roll(
     }
 }
 
+// ggml_compute_forward_attn_mask_ranges
+
+template <typename T>
+static void ggml_compute_forward_attn_mask_ranges_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * r = dst->src[0];
+
+    const int64_t n_cols = dst->ne[0];
+    const int64_t ne1    = dst->ne[1];
+    const int64_t nr     = ne1*dst->ne[3];
+
+    T keep;
+    T drop;
+    if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+        keep = GGML_CPU_FP32_TO_FP16(0.0f);
+        drop = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    } else {
+        keep = 0.0f;
+        drop = -INFINITY;
+    }
+
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i3 = ir / ne1;
+
+        const int32_t * range = (const int32_t *) ((const char *) r->data + i1*r->nb[1] + i3*r->nb[3]);
+        const int64_t lo = std::clamp<int64_t>(range[0], 0, n_cols);
+        const int64_t hi = std::clamp<int64_t>(range[1], lo, n_cols);
+
+        T * row = (T *) ((char *) dst->data + i1*dst->nb[1] + i3*dst->nb[3]);
+        std::fill(row,      row + lo,     drop);
+        std::fill(row + lo, row + hi,     keep);
+        std::fill(row + hi, row + n_cols, drop);
+    }
+}
+
+void ggml_compute_forward_attn_mask_ranges(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F16: ggml_compute_forward_attn_mask_ranges_impl<ggml_fp16_t>(params, dst); break;
+        case GGML_TYPE_F32: ggml_compute_forward_attn_mask_ranges_impl<float>      (params, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_arange
 
 static void ggml_compute_forward_arange_f32(
@@ -8930,6 +8978,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rows  = dst->src[5]; // column ic reads K/V row rows[ic], see ggml_flash_attn_ext_set_kv_rows()
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9025,6 +9074,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const int32_t     * rp = rows ? (const int32_t *)((const char *) rows->data + (iq3%rows->ne[3])*rows->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9049,7 +9099,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            const int64_t ik1 = rp ? rp[ic] : ic;
+            const char * k_data = (const char *) k->data + (ik1*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = s*scale; // scale KQ value
@@ -9065,7 +9116,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = ((const char *) v->data + (ik1*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -9457,7 +9508,7 @@ static void ggml_flash_attn_ext_reduce_partials(
 
     const int64_t DK        = k->ne[0];
     const int64_t DV        = v->ne[0];
-    const int64_t nek1      = k->ne[1];
+    const int64_t nek1      = dst->src[5] ? dst->src[5]->ne[0] : k->ne[1]; // the columns, see ggml_flash_attn_ext_set_kv_rows()
     const int64_t n_q_heads = q->ne[2];
 
     const int ith = params->ith;
@@ -9564,22 +9615,26 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // with a list of K/V rows the columns are its entries, see ggml_flash_attn_ext_set_kv_rows()
+    const bool    has_rows = dst->src[5] != nullptr;
+    const int64_t n_cols   = has_rows ? dst->src[5]->ne[0] : nek1;
+
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && n_cols >= 512;
 
     if (use_split_kv_path) {
-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
+        const int64_t chunk_size = (n_cols + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
 
         const int64_t ic_start = ith * chunk_size;
-        const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
+        const int64_t ic_end   = std::min(ic_start + chunk_size, n_cols);
 
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        if (ic_start < nek1) {
+        if (ic_start < n_cols) {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,
@@ -9621,7 +9676,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !has_rows &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9643,7 +9698,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_cols, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);

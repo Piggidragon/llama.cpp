@@ -2007,11 +2007,6 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                // the conversation can come back from the prompt cache
-                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
-                    prompt_cache->update();
-                }
-
                 slot.prompt_clear();
 
                 res = true;
@@ -3602,8 +3597,13 @@ private:
     // ubatches may reach the cells of other sequences (a seq_cp shares a recurrent cell, e.g. n_cmpl > 1): not while
     // ctx_bg computes
     void bg_wait_target() {
-        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt) ||
-                    batch_straddles(bg_slot->id))) {
+        if (bg_slot == nullptr) {
+            return;
+        }
+        if (batch_straddles(bg_slot->id)) {
+            SLT_DBG(*bg_slot, "%s", "concurrent prefill: the target's batch has sequences on both sides of this one, waiting\n");
+            bg_wait();
+        } else if (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt)) {
             bg_wait();
         }
     }

@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_ATTN_MASK_RANGES,
 
         GGML_OP_UNARY,
 
@@ -2510,7 +2511,6 @@ extern "C" {
     enum ggml_flash_attn_ext_op_param {
         // scale, max_bias, logit_softcap and prec occupy slots 0-3, n_kv_max slot 4
         GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS = 5,
-        GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION    = 6,
     };
 
     // Let backends consume supported quantized K/V layouts directly instead
@@ -2525,12 +2525,23 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
-    // A hint: the finite mask entries of all rows of one mask sequence (dim 3) lie in at most n_kv_union columns,
-    // e.g. the cells of a ubatch's own sequences in a KV cache that holds several. A backend may gather those columns
-    // instead of reading every row of K/V, the result does not depend on it. Set 0 for no hint.
-    GGML_API void ggml_flash_attn_ext_set_n_kv_union(
+    // Columns from a list of K/V rows: column j of the attention, and of the mask, is row rows[j] of K and V (of the
+    // K/V sequence i3 if rows has one list per sequence). The mask then has rows->ne[0] columns. For a KV cache that
+    // holds several sequences: only the cells of the ubatch's own sequences. Backends: CPU, CUDA.
+    // rows: I32 [n_cols, 1, 1, 1 or k->ne[3]]
+    GGML_API void ggml_flash_attn_ext_set_kv_rows(
             struct ggml_tensor * a,
-            int32_t              n_kv_union);
+            struct ggml_tensor * rows);
+
+    // An attention mask from one column range per row: res[i3][i1][j] = 0.0f if r[i3][i1][0] <= j < r[i3][i1][1],
+    // -INFINITY otherwise. The mask of a causal prefix (or a window) of the KV cells without uploading it.
+    // r:   I32 [2, n_rows, 1, ne3]
+    // res: F16 or F32 [n_cols, n_rows, 1, ne3]
+    GGML_API struct ggml_tensor * ggml_attn_mask_ranges(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            int64_t               n_cols,
+            enum ggml_type        type);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

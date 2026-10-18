@@ -255,6 +255,31 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // --compact-attn-mask: whether every token of the applied ubatch sees a prefix of the first n_kv cells of its
+    // stream under a causal mask: one sequence per stream, its cells first and in position order, no ALiBi or SWA.
+    // The graph then builds the mask from one bound per token, see set_input_kq_bounds().
+    bool get_causal_prefix(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
+
+    // whether a ubatch can see a prefix at all: the reserve graphs are built that way, the usual case
+    bool can_causal_prefix() const;
+
+    // --kv-unified-gather, one stream: the attention reads the cells of the ubatch's sequences through a list of
+    // n_rows rows (get_n_kv_union()). One sequence: its cells in the causal order; several: their cells by index.
+    // The rest of the list repeats cell 0, masked. Returns the length of the list before that.
+    size_t get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows) const;
+
+    // whether every token of a ubatch of one sequence sees a prefix of the list of get_kv_rows()
+    bool get_rows_prefix(const llama_ubatch & ubatch) const;
+
+    // I32 [n_rows]
+    void set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // the mask over the list: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // I32 [2, n_tokens/n_stream, 1, n_stream]: the column range [0, n) of the cells token i sees
+    void set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -428,6 +453,20 @@ public:
     // see llama_kv_cache::get_n_kv_union()
     uint32_t get_n_kv_union() const;
 
+    // see llama_kv_cache::get_causal_prefix()
+    bool get_causal_prefix() const;
+
+    // see llama_kv_cache::get_rows_prefix(), and whether the cache has one stream
+    bool get_rows_prefix() const;
+    bool get_unified() const;
+
+    // the rows of the list of get_kv_rows() (the cells of the ubatch's sequences, padded), 0 if the attention reads the
+    // first n_kv cells: no list for several streams, SWA or ALiBi, or if it would not be shorter
+    uint32_t get_n_kv_rows() const;
+
+    void set_input_kv_rows     (ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -501,6 +540,12 @@ private:
 
     // the cells of the current ubatch's sequences, see llama_kv_cache::get_n_kv_union()
     uint32_t n_kv_union = 0;
+
+    // see llama_kv_cache::get_causal_prefix()
+    bool causal_prefix = false;
+
+    // see llama_kv_cache::get_rows_prefix()
+    bool rows_prefix = false;
 
     // the largest n_kv of the ubatches of a batch context, see get_attn_reserve_n_kv()
     uint32_t reserve_n_kv = 0;

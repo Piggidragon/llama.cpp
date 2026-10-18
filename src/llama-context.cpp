@@ -212,6 +212,31 @@ llama_context::llama_context(
     cparams.phase_aware_workspace    = params.phase_aware_workspace;
     cparams.live_context_workspace   = params.live_context_workspace;
     cparams.kv_unified_gather        = params.kv_unified_gather;
+    // the list of K/V rows of --kv-unified-gather is gathered by the CPU and CUDA backends only: other backends would
+    // read the columns of its mask as the first cells
+    if (cparams.kv_unified_gather) {
+        const auto gathers = [](ggml_backend_dev_t dev) {
+            return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
+        };
+        bool ok = true;
+        for (const auto & dev : model.devices) {
+            if (dev.is_meta) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    const auto type = ggml_backend_dev_type(d);
+                    ok &= (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) || gathers(d);
+                }
+            } else {
+                ok &= gathers(dev.dev);
+            }
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: kv_unified_gather needs the CPU or CUDA backend, it is not used\n", __func__);
+            cparams.kv_unified_gather = false;
+        }
+    }
+    cparams.compact_attn_mask        = params.compact_attn_mask;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -417,6 +442,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     if (cparams.kv_unified_gather) {
         LLAMA_LOG_INFO("%s: kv_unified_gather     = true\n", __func__);
+    }
+    if (cparams.compact_attn_mask) {
+        LLAMA_LOG_INFO("%s: compact_attn_mask     = true\n", __func__);
     }
     LLAMA_LOG_INFO("%s: fa_native_quants      = %s\n",   __func__, cparams.flash_attn_native_quants ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
@@ -4616,6 +4644,7 @@ llama_context_params llama_context_default_params() {
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
         /*.kv_unified_gather           =*/ false,
+        /*.compact_attn_mask           =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
