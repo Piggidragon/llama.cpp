@@ -208,7 +208,7 @@ public:
     uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // a bound on the cells the tokens of an applied ubatch can see in a stream: the cells of its sequences, padded
-    // like n_kv; 0 if that is not fewer than n_kv: the length of the list of get_kv_rows()
+    // like n_kv, at most n_kv: the length of the list of get_kv_rows()
     uint32_t get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
 
     // get views of the current state of the cache
@@ -461,7 +461,8 @@ public:
     bool get_unified() const;
 
     // the rows of the list of get_kv_rows() (the cells of the ubatch's sequences, padded), 0 if the attention reads the
-    // first n_kv cells: no list for several streams, SWA or ALiBi, or if it would not be shorter
+    // first n_kv cells: no list for several streams, SWA or ALiBi, or if it would neither be shorter nor give one
+    // sequence the ranges of a causal prefix
     uint32_t get_n_kv_rows() const;
 
     void set_input_kv_rows     (ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -546,6 +547,9 @@ private:
 
     // see llama_kv_cache::get_rows_prefix()
     bool rows_prefix = false;
+
+    // a context for reserving the compute buffers, see get_n_kv_rows()
+    bool is_reserve = false;
 
     // the largest n_kv of the ubatches of a batch context, see get_attn_reserve_n_kv()
     uint32_t reserve_n_kv = 0;

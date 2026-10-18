@@ -1358,7 +1358,7 @@ uint32_t llama_kv_cache::get_n_kv_union(const slot_info & sinfo, const llama_uba
         result = std::max<uint32_t>(result, GGML_PAD((uint32_t) std::min<size_t>(n, cells.size()), n_pad_cur));
     }
 
-    return result < n_kv ? result : 0;
+    return std::min(result, n_kv);
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3238,6 +3238,7 @@ llama_kv_cache_context::llama_kv_cache_context(
     causal_prefix = kv->can_causal_prefix();
     rows_prefix   = kv->can_causal_prefix();
     n_kv_union    = kv->get_n_stream() == 1 ? this->n_kv : 0;
+    is_reserve    = true;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -3335,7 +3336,16 @@ bool llama_kv_cache_context::get_unified() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
-    return kv->get_n_stream() == 1 && kv->can_causal_prefix() ? n_kv_union : 0;
+    if (kv->get_n_stream() != 1 || !kv->can_causal_prefix()) {
+        return 0;
+    }
+    // a list shorter than the used cells, or, for one sequence whose cells are not a prefix of the cells (other
+    // sequences hold some of them), a list that gives it the column ranges of a causal prefix instead of a dense mask;
+    // the reserve graphs take the list over all cells
+    if (is_reserve || n_kv_union < (uint32_t) n_kv || (rows_prefix && !causal_prefix)) {
+        return n_kv_union;
+    }
+    return 0;
 }
 
 void llama_kv_cache_context::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const {
