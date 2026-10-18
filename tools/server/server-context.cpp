@@ -3498,9 +3498,11 @@ private:
         }
         if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.can_split() || slot.need_embd() ||
                 slot.task->is_parent() || slot.task->is_child() || slot.task->n_tokens_shared > 0 ||
-                !slot.task->decision.order.empty() || slot.task->tokens.has_mtmd) {
+                !slot.task->decision.order.empty()) {
             return false;
         }
+        // with an mmproj every prompt has has_mtmd set, also a text-only one: its text goes through ctx_bg, the token
+        // loop stops at a media chunk, which is decoded in ctx_tgt (see bg_wait_target())
         const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
         if (slot.task->n_tokens() - slot.prompt.n_tokens() <= n_ubatch + 4) {
             return false;
@@ -3576,6 +3578,15 @@ private:
     void bg_wait() {
         if (bg_slot != nullptr) {
             bg_finish();
+        }
+    }
+
+    // before a decode of ctx_tgt: it applies a KV shift or a stream copy over the cells of all sequences, or its
+    // ubatches may reach the cells of other sequences (a seq_cp shares a recurrent cell, e.g. n_cmpl > 1): not while
+    // ctx_bg computes
+    void bg_wait_target() {
+        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt))) {
+            bg_wait();
         }
     }
 
@@ -3682,11 +3693,7 @@ private:
             return;
         }
 
-        // the decode applies a KV shift or a stream copy over the cells of all sequences, or its ubatches may reach
-        // the cells of other sequences (a seq_cp shares a recurrent cell, e.g. n_cmpl > 1): not while ctx_bg computes
-        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt))) {
-            bg_wait();
-        }
+        bg_wait_target();
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
@@ -4454,6 +4461,9 @@ private:
                         //       so the timing is queued and flushed on the next sync
                         metrics_pre_decode();
 
+                        // the chunk is decoded in ctx_tgt right away, ctx_bg may compute another slot meanwhile
+                        bg_wait_target();
+
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
@@ -4507,8 +4517,10 @@ private:
                             }
                         }
                     };
-                    const bool bg_ok = !wait_shared && alora_scale <= 0.0f && !has_mtmd;
-                    const bool use_bg = bg_ok && bg_next == nullptr && (bg_pick == nullptr || &slot == bg_pick) &&
+                    // a media chunk decoded in ctx_tgt in this step is in its cells only after the decode of this
+                    // step synchronizes ctx_tgt: the text after it can go through ctx_bg from the next step on
+                    const bool bg_ok = !wait_shared && alora_scale <= 0.0f;
+                    const bool use_bg = bg_ok && !has_mtmd && bg_next == nullptr && (bg_pick == nullptr || &slot == bg_pick) &&
                         bg_eligible(slot, !generating.empty());
 
                     // while slots generate, a long prompt that ctx_bg cannot take now waits for it, instead of
