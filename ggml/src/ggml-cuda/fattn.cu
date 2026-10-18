@@ -104,7 +104,46 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
+
+// one block per (column chunk, query row, mask sequence)
+static __global__ void flash_attn_sparse_gather_mask(
+        const half * mask_ptr, const int32_t * indices_ptr, half * dst_ptr, const int n_groups, const int ncols1,
+        const int n_queries, const int n_kv_max, const int64_t s31, const int64_t s33) {
+    ggml_cuda_pdl_sync();
+
+    const int q        = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const half    * mask    = mask_ptr + sequence*s33 + q*s31;
+    const int32_t * indices = indices_ptr + (int64_t(sequence)*n_groups + q/ncols1)*n_kv_max;
+    half          * dst     = dst_ptr + (int64_t(sequence)*n_queries + q)*n_kv_max;
+
+    for (int c = blockIdx.x*blockDim.x + threadIdx.x; c < n_kv_max; c += gridDim.x*blockDim.x) {
+        const int32_t index = indices[c];
+        dst[c] = index >= 0 ? mask[index] : __float2half(-INFINITY);
+    }
+
+    ggml_cuda_pdl_lc();
+}
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_ext_gather_mask(
+        const ggml_tensor * mask, const int32_t * indices, half * dst, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(mask, indices, dst, n_queries, ncols1, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    const int64_t s31 = mask->nb[1] / sizeof(half);
+    const int64_t s33 = mask->nb[3] / sizeof(half);
+    const int n_groups = (n_queries + ncols1 - 1)/ncols1;
+    const dim3 blocks_num(std::min((n_kv_max + 255)/256, 32), n_queries, mask->ne[3]);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_sparse_gather_mask, launch_params,
+        (const half *) mask->data, indices, dst, n_groups, ncols1, int(n_queries), n_kv_max, s31, s33);
+    CUDA_CHECK(cudaGetLastError());
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
@@ -118,10 +157,18 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
-                        n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
-                                             flash_attn_mask_to_sparse_indices<8, false>;
+    const bool oob = n_queries % ncols1 != 0;
+    decltype(&flash_attn_mask_to_sparse_indices<1, false>) kernel = nullptr;
+    switch (ncols1) {
+        case  1: kernel = flash_attn_mask_to_sparse_indices< 1, false>; break;
+        case  2: kernel = oob ? flash_attn_mask_to_sparse_indices< 2, true> : flash_attn_mask_to_sparse_indices< 2, false>; break;
+        case  4: kernel = oob ? flash_attn_mask_to_sparse_indices< 4, true> : flash_attn_mask_to_sparse_indices< 4, false>; break;
+        case  8: kernel = oob ? flash_attn_mask_to_sparse_indices< 8, true> : flash_attn_mask_to_sparse_indices< 8, false>; break;
+        case 16: kernel = oob ? flash_attn_mask_to_sparse_indices<16, true> : flash_attn_mask_to_sparse_indices<16, false>; break;
+        case 32: kernel = oob ? flash_attn_mask_to_sparse_indices<32, true> : flash_attn_mask_to_sparse_indices<32, false>; break;
+        case 64: kernel = oob ? flash_attn_mask_to_sparse_indices<64, true> : flash_attn_mask_to_sparse_indices<64, false>; break;
+        default: GGML_ABORT("unsupported ncols1 %d for the sparse index lists", ncols1);
+    }
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
@@ -142,10 +189,10 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const int64_t n_kv_max = ggml_cuda_fattn_sparse_n_kv(dst, ncols1);
 
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
-    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : 1) * n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -162,6 +209,19 @@ static std::atomic<int64_t> fattn_native_count{0};
 
 int64_t ggml_backend_cuda_fattn_native_count(void) {
     return fattn_native_count.load(std::memory_order_relaxed);
+}
+
+// Counts the launches that gathered the K/V rows of their index lists with the n_kv_union hint, for test-backend-ops.
+static std::atomic<int64_t> fattn_gather_count{0};
+
+int64_t ggml_backend_cuda_fattn_gather_count(void) {
+    return fattn_gather_count.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_fattn_count_gather(const ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION) > 0) {
+        fattn_gather_count.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -648,6 +708,7 @@ static bool ggml_cuda_fattn_native_supported(
 
     // A sparse K/V set (n_kv_max > 0) is gathered by the F16 kernel only, and
     // reading every row instead would cost more than the cast saves.
+    // (The n_kv_union hint is not such a set: reading every row only costs what it costs without the hint.)
     const bool sparse_kv = ggml_get_op_params_i32(dst, 4) > 0;
 
     if (!turing_mma_available(cc) || logit_softcap != 0.0f || !gqa_opt_applies || sparse_kv ||

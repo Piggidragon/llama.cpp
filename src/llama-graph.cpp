@@ -65,6 +65,11 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// --kv-unified-gather: the bound a graph built now gives its attention, and that a reused graph must have been built with
+static uint32_t graph_n_kv_union(const llama_kv_cache_context * mctx, const llama_cparams & cparams) {
+    return cparams.kv_unified_gather ? mctx->get_n_kv_union() : 0;
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -557,6 +562,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= graph_n_kv_union(mctx, params.cparams) == n_kv_union;
 
     return res;
 }
@@ -727,6 +733,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask && self_kq_mask->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+        res &= graph_n_kv_union(mctx->get_base(), params.cparams) == n_kv_union;
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -737,6 +744,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+        res &= graph_n_kv_union(mctx->get_swa(), params.cparams) == n_kv_union_swa;
     }
 
     return res;
@@ -1184,6 +1192,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= graph_n_kv_union(mctx->get_attn(), params.cparams) == inp_attn->n_kv_union;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1305,6 +1314,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+    res &= graph_n_kv_union(attn_ctx->get_base(), params.cparams) == inp_attn->n_kv_union;
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1313,6 +1323,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    res &= graph_n_kv_union(attn_ctx->get_swa(), params.cparams) == inp_attn->n_kv_union_swa;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2889,7 +2900,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+             int64_t   n_kv_union) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2931,6 +2943,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_native_quants(cur, cparams.flash_attn_native_quants);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        GGML_ASSERT(n_kv_union >= 0 && n_kv_union <= INT32_MAX);
+        ggml_flash_attn_ext_set_n_kv_union(cur, static_cast<int32_t>(n_kv_union));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -3133,6 +3147,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    inp->n_kv_union = graph_n_kv_union(mctx_cur, cparams);
+
     return inp;
 }
 
@@ -3201,7 +3217,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, inp->n_kv_union);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3464,7 +3480,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il,
+                                       is_swa ? inp->n_kv_union_swa : inp->n_kv_union);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -3730,6 +3747,9 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
+    inp->n_kv_union     = graph_n_kv_union(mctx_cur->get_base(), cparams);
+    inp->n_kv_union_swa = graph_n_kv_union(mctx_cur->get_swa(),  cparams);
+
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
 
@@ -3967,6 +3987,9 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
     }
+
+    inp_attn->n_kv_union     = graph_n_kv_union(attn_ctx->get_base(), cparams);
+    inp_attn->n_kv_union_swa = graph_n_kv_union(attn_ctx->get_swa(),  cparams);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

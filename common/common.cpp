@@ -1751,6 +1751,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.split_overlap            = params.split_overlap;
     cparams.phase_aware_workspace    = params.phase_aware_workspace;
     cparams.live_context_workspace   = params.live_context_workspace;
+    cparams.kv_unified_gather        = params.kv_unified_gather;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

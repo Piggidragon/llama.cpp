@@ -364,6 +364,9 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // --kv-unified-gather: the cells the ubatch's tokens can see, see ggml_flash_attn_ext_set_n_kv_union()
+    uint32_t n_kv_union = 0;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -537,6 +540,10 @@ public:
     ggml_tensor * self_v_rot_swa = nullptr;
 
     const llama_hparams hparams;
+    // --kv-unified-gather, see llm_graph_input_attn_kv::n_kv_union
+    uint32_t n_kv_union     = 0;
+    uint32_t n_kv_union_swa = 0;
+
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
@@ -1251,7 +1258,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   n_kv_union = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

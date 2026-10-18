@@ -2007,6 +2007,11 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                // the conversation can come back from the prompt cache
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
+
                 slot.prompt_clear();
 
                 res = true;
@@ -3122,7 +3127,9 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                // with --kv-unified-gather the cells of an idle slot cost the attention of the
+                                // others nothing: they stay until the cache needs the room, see try_clear_idle_slots()
+                                if (params_base.kv_unified && !params_base.kv_unified_gather) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -3448,9 +3455,9 @@ private:
 
     // --concurrent-prefill: the second context, on the memory of ctx_tgt
     void bg_init() {
-        if (params_base.n_parallel < 2 || params_base.kv_unified || !params_base.lora_adapters.empty() ||
+        if (params_base.n_parallel < 2 || !params_base.lora_adapters.empty() ||
                 !params_base.control_vectors.empty() || params_base.embedding || llama_get_memory(ctx_tgt) == nullptr) {
-            SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no unified KV cache, no LoRA adapters or control vectors and a generation model, it is not used\n");
+            SRV_WRN("%s", "--concurrent-prefill needs --parallel >= 2, no LoRA adapters or control vectors and a generation model, it is not used\n");
             return;
         }
         if (!llama_memory_seqs_independent(ctx_tgt)) {
@@ -3515,14 +3522,24 @@ private:
     void bg_submit(server_slot & slot) {
         GGML_ASSERT(bg_slot == nullptr && batch_bg.size() > 0);
 
+        // a unified KV cache gives the cells another sequence freed to any sequence: the target must be done with them
+        // (a decode without outputs is not synchronized)
+        if (params_base.kv_unified) {
+            llama_synchronize(ctx_tgt);
+        }
+
         batch_bg.render(0, batch_bg.size());
         t_bg_submit = ggml_time_us();
-        const int32_t ret = llama_process(ctx_bg.get(), LLAMA_PROCESS_TYPE_DECODE, batch_bg.view.get());
+        int32_t ret = llama_process(ctx_bg.get(), LLAMA_PROCESS_TYPE_DECODE, batch_bg.view.get());
+        // no room in a unified KV cache: an idle slot gives its cells
+        while (ret == 1 && try_clear_idle_slots()) {
+            ret = llama_process(ctx_bg.get(), LLAMA_PROCESS_TYPE_DECODE, batch_bg.view.get());
+        }
         if (ret != 0) {
             SLT_ERR(slot, "concurrent prefill: decode failed, ret = %d\n", ret);
             llama_synchronize(ctx_bg.get());
             batch_bg.clear();
-            send_error(slot, "Compute error.");
+            send_error(slot, ret == 1 ? "Context size has been exceeded." : "Compute error.");
             slot.release();
             slot.prompt_clear();
             return;
@@ -3585,9 +3602,26 @@ private:
     // ubatches may reach the cells of other sequences (a seq_cp shares a recurrent cell, e.g. n_cmpl > 1): not while
     // ctx_bg computes
     void bg_wait_target() {
-        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt))) {
+        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt) ||
+                    batch_straddles(bg_slot->id))) {
             bg_wait();
         }
+    }
+
+    // with a unified KV cache a ubatch can hold any of the batch's sequences: one with sequences below and above
+    // seq_id makes the recurrent memory gather their cells into one range, which moves the cell of seq_id
+    // (see llama_memory_recurrent::find_slot()); with a stream per sequence the ubatches hold consecutive sequences
+    bool batch_straddles(const int32_t seq_id) const {
+        if (!params_base.kv_unified) {
+            return false;
+        }
+        bool below = false;
+        bool above = false;
+        for (const auto & tok : batch.tokens) {
+            below |= tok.id_slot < seq_id;
+            above |= tok.id_slot > seq_id;
+        }
+        return below && above;
     }
 
     void abort_all_slots(const std::string & reason) {

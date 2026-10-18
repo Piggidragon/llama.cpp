@@ -1759,6 +1759,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--kv-unified-gather"},
+        {"--no-kv-unified-gather"},
+        "with a unified KV cache that holds several sequences, the attention of a ubatch reads only the cells of its "
+        "own sequences instead of every used cell: a slot does not pay for the context of the other slots (CUDA "
+        "FlashAttention, where a gather kernel exists for the K/V type and head size; elsewhere it has no effect) "
+        "(default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_unified_gather = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_GATHER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
         {"--flash-attn-native-quants"},
         {"--no-flash-attn-native-quants"},
         "read quantized K/V caches directly in the CUDA MMA FlashAttention kernel instead of casting them to F16 "

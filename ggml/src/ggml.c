@@ -5589,6 +5589,15 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_n_kv_union(
+        struct ggml_tensor * a,
+        int32_t              n_kv_union) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_union >= 0);
+
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION, n_kv_union);
+}
+
 void ggml_flash_attn_ext_set_native_quants(
         struct ggml_tensor * a,
         bool                 enabled) {

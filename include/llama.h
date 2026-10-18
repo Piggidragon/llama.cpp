@@ -444,6 +444,9 @@ extern "C" {
                                        // computes in the buffers of its target
         bool live_context_workspace;   // size the attention part of the compute buffers by the used part of the KV
                                        // cache (power-of-two steps from 1/8 of it) instead of its full size
+        bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a
+                                       // ubatch reads only the cells of the ubatch's sequences (CUDA, where a gather
+                                       // kernel exists), not every used cell
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

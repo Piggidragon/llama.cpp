@@ -9,3 +9,4 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 // number of FlashAttention nodes that read a quantized K/V cache in place
 // instead of casting it to F16 first; reached through get_proc_address
 int64_t ggml_backend_cuda_fattn_native_count(void);
+int64_t ggml_backend_cuda_fattn_gather_count(void);

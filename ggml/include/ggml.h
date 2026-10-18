@@ -2510,6 +2510,7 @@ extern "C" {
     enum ggml_flash_attn_ext_op_param {
         // scale, max_bias, logit_softcap and prec occupy slots 0-3, n_kv_max slot 4
         GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS = 5,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION    = 6,
     };
 
     // Let backends consume supported quantized K/V layouts directly instead
@@ -2523,6 +2524,13 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);
+
+    // A hint: the finite mask entries of all rows of one mask sequence (dim 3) lie in at most n_kv_union columns,
+    // e.g. the cells of a ubatch's own sequences in a KV cache that holds several. A backend may gather those columns
+    // instead of reading every row of K/V, the result does not depend on it. Set 0 for no hint.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_union(
+            struct ggml_tensor * a,
+            int32_t              n_kv_union);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

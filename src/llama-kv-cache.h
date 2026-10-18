@@ -207,6 +207,10 @@ public:
     // the largest get_n_kv() of the ubatches of a batch, before any of them is applied
     uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
+    // a bound on the cells the tokens of an applied ubatch can see in a stream: the cells of its sequences, padded
+    // like n_kv; 0 if that is not fewer than n_kv (see ggml_flash_attn_ext_set_n_kv_union())
+    uint32_t get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -421,6 +425,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // see llama_kv_cache::get_n_kv_union()
+    uint32_t get_n_kv_union() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -491,6 +498,9 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv = 0;
+
+    // the cells of the current ubatch's sequences, see llama_kv_cache::get_n_kv_union()
+    uint32_t n_kv_union = 0;
 
     // the largest n_kv of the ubatches of a batch context, see get_attn_reserve_n_kv()
     uint32_t reserve_n_kv = 0;

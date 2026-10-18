@@ -769,7 +769,11 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
 }
 
 bool llama_kv_cache::get_seqs_independent() const {
-    return n_stream > 1 && !other; // one stream per sequence, no cells shared with another cache
+    // A ubatch writes only the cells it was given, which were free; no cells are shared with another cache. With one
+    // stream for all sequences (unified) a ubatch also reads the cells of the other sequences, masked (-inf, or not at
+    // all with --kv-unified-gather): a concurrent write there leaves finite values (the buffers start zeroed). The
+    // server synchronizes the target before another context takes cells that the target's sequences freed.
+    return !other;
 }
 
 bool llama_kv_cache::has_pending_update() const {
@@ -1331,6 +1335,30 @@ uint32_t llama_kv_cache::get_reserve_n_kv(const slot_info_vec_t & sinfos) const 
     }
 
     return result;
+}
+
+uint32_t llama_kv_cache::get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
+    // a token sees only cells of its own sequences (see set_input_kq_mask()); a shared cell counts once per sequence
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    uint32_t result = 0;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t strm = sinfo.strm[s];
+        const auto & cells = v_cells[strm];
+
+        size_t n = 0;
+        for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[i];
+            if (seq_to_stream[seq_id] == strm) {
+                n += cells.seq_pos_get(seq_id).size();
+            }
+        }
+
+        result = std::max<uint32_t>(result, GGML_PAD((uint32_t) std::min<size_t>(n, cells.size()), n_pad_cur));
+    }
+
+    return result < n_kv ? result : 0;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3026,7 +3054,8 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv       = kv->get_n_kv(sinfos[i_cur]);
+    n_kv_union = kv->get_n_kv_union(sinfos[i_cur], ubatches[i_cur], n_kv);
 
     return true;
 }
@@ -3047,6 +3076,10 @@ uint32_t llama_kv_cache_context::get_attn_reserve_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_union() const {
+    return n_kv_union;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

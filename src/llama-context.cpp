@@ -211,6 +211,7 @@ llama_context::llama_context(
     cparams.split_overlap            = params.split_overlap;
     cparams.phase_aware_workspace    = params.phase_aware_workspace;
     cparams.live_context_workspace   = params.live_context_workspace;
+    cparams.kv_unified_gather        = params.kv_unified_gather;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -414,6 +415,9 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: allreduce             = %s\n",   __func__, llama_allreduce_type_name(params.allreduce_type));
     }
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.kv_unified_gather) {
+        LLAMA_LOG_INFO("%s: kv_unified_gather     = true\n", __func__);
+    }
     LLAMA_LOG_INFO("%s: fa_native_quants      = %s\n",   __func__, cparams.flash_attn_native_quants ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
@@ -4611,6 +4615,7 @@ llama_context_params llama_context_default_params() {
         /*.split_overlap               =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
+        /*.kv_unified_gather           =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

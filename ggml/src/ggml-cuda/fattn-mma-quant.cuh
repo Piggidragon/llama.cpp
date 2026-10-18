@@ -86,12 +86,24 @@ static constexpr __device__ int ggml_cuda_fattn_quant_smem_per_sm_device() {
 #endif // __CUDA_ARCH__
 }
 
+// The K/V row of entry i of a tile: with gather the cell listed at position i of the sparse index list (padded entries
+// read row 0, their mask is -inf), otherwise row i.
+template<bool gather>
+static __device__ __forceinline__ int64_t fattn_quant_row(const int32_t * const __restrict__ indices, const int i) {
+    if constexpr (gather) {
+        return max(indices[i], 0);
+    } else {
+        GGML_UNUSED(indices);
+        return i;
+    }
+}
+
 // Load quantized rows directly into the half2 shared-memory tile consumed by
 // the existing MMA kernel.
-template<ggml_type type, int D2, int stride_tile, int nthreads, int nbatch_fa, int ncols1, int ncols2, bool oob_check>
+template<ggml_type type, int D2, int stride_tile, int nthreads, int nbatch_fa, int ncols1, int ncols2, bool oob_check, bool gather = false>
 static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV,
-        const int k0_h2, const int row0, const int stride_row, const int i_sup) {
+        const int k0_h2, const int row0, const int stride_row, const int i_sup, const int32_t * const __restrict__ indices = nullptr) {
 #ifdef FP16_AVAILABLE
     using traits = fattn_quant_type_traits<type>;
 
@@ -113,7 +125,7 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
     const int k_tid = tid % threads_per_row;
     const int e0    = 2*k0_h2 + k_tid*nelem_per_thread;
     const int64_t stride_iter = int64_t(rows_per_iter)*stride_row;
-    const char * row = KV + int64_t(row0 + i_tid)*stride_row;
+    const char * row = KV + fattn_quant_row<gather>(indices, row0 + i_tid)*stride_row;
 
 #pragma unroll
     for (int i0 = 0; i0 < nbatch_fa; i0 += rows_per_iter) {
@@ -121,10 +133,10 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
         __align__(16) half2 vals[nh2_per_thread];
 
         if (!oob_check || i < i_sup) {
-            if constexpr (fattn_quant_incremental_rows<type>::value) {
+            if constexpr (fattn_quant_incremental_rows<type>::value && !gather) {
                 traits::template dequant<nelem_per_thread>(row, vals, e0);
             } else {
-                const char * const row_i = KV + int64_t(row0 + i)*stride_row;
+                const char * const row_i = KV + fattn_quant_row<gather>(indices, row0 + i)*stride_row;
                 traits::template dequant<nelem_per_thread>(row_i, vals, e0);
             }
         } else {
@@ -141,12 +153,13 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
             half2 * const dst = ggml_cuda_mma::swizzle<stride_tile>(tile_KV, i*stride_tile + col, i);
             ggml_cuda_memcpy_1<16>(dst, vals + l0);
         }
-        if constexpr (fattn_quant_incremental_rows<type>::value) {
+        if constexpr (fattn_quant_incremental_rows<type>::value && !gather) {
             row += stride_iter;
         }
     }
+    GGML_UNUSED_VARS(row, stride_iter);
 #else
-    GGML_UNUSED_VARS(KV, tile_KV, k0_h2, row0, stride_row, i_sup);
+    GGML_UNUSED_VARS(KV, tile_KV, k0_h2, row0, stride_row, i_sup, indices);
     NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
 }
@@ -252,9 +265,11 @@ static __device__ __forceinline__ void fattn_quant_cp_async(const unsigned int d
 
 // Start copying nbatch_fa raw rows of D elements, row0 onward, into raw.
 // Consecutive threads take consecutive chunks so each row is read as whole sectors.
-template<ggml_type type, int D, int nthreads, int nbatch_fa>
+// With gather, row i of the tile is the cell at position row0 + i of the sparse index list, see fattn_quant_row().
+template<ggml_type type, int D, int nthreads, int nbatch_fa, bool gather = false>
 static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
-        const char * const __restrict__ KV, char * const __restrict__ raw, const int row0, const int stride_row) {
+        const char * const __restrict__ KV, char * const __restrict__ raw, const int row0, const int stride_row,
+        const int32_t * const __restrict__ indices = nullptr) {
 #ifdef CP_ASYNC_AVAILABLE
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
     constexpr int row_bytes      = D/32 * ggml_cuda_fattn_quant_block_bytes(type);
@@ -266,6 +281,13 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
 
     const unsigned int raw_s = ggml_cuda_cvta_generic_to_shared(raw);
     const char * const src0 = KV + int64_t(row0)*stride_row;
+    const auto src_row = [&](const int i) -> const char * {
+        if constexpr (gather) {
+            return KV + fattn_quant_row<gather>(indices, row0 + i)*stride_row;
+        } else {
+            return src0 + int64_t(i)*stride_row;
+        }
+    };
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 
 #pragma unroll
@@ -273,7 +295,7 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
         const int c = c0 + tid;
         const int i = c / chunks_per_row;
         const int k = c - i*chunks_per_row;
-        fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src0 + (i*stride_row + cs*k));
+        fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src_row(i) + cs*k);
     }
 
     // Copy the remaining chunks in 4-byte pieces so every thread takes part.
@@ -286,7 +308,7 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
             const int c = c_rem + tid;
             const int i = c / chunks_per_row;
             const int k = c - i*chunks_per_row;
-            fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src0 + (i*stride_row + cs*k));
+            fattn_quant_cp_async<cs>(raw_s + i*pitch + cs*k, src_row(i) + cs*k);
         }
     } else {
 #pragma unroll
@@ -296,11 +318,11 @@ static __device__ __forceinline__ void flash_attn_ext_quant_stage_tile(
             const int i = c / chunks_per_row;
             const int k = c - i*chunks_per_row;
             const int b = cs*k + o % cs;
-            fattn_quant_cp_async<4>(raw_s + i*pitch + b, src0 + (i*stride_row + b));
+            fattn_quant_cp_async<4>(raw_s + i*pitch + b, src_row(i) + b);
         }
     }
 #else
-    GGML_UNUSED_VARS(KV, raw, row0, stride_row);
+    GGML_UNUSED_VARS(KV, raw, row0, stride_row, indices);
     NO_DEVICE_CODE;
 #endif // CP_ASYNC_AVAILABLE
 }

@@ -726,6 +726,33 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// The mask of each query row at the cells of the index list of its group of ncols1 queries, -inf for the padding:
+// a kernel that gathers only the K/V rows reads it like a dense mask of n_kv_max columns.
+void ggml_cuda_flash_attn_ext_gather_mask(
+        const ggml_tensor * mask, const int32_t * indices, half * dst, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+
+// see ggml_backend_cuda_fattn_gather_count()
+void ggml_cuda_fattn_count_gather(const ggml_tensor * dst);
+
+// The length of the column list a group of ncols1 queries gathers: a bound on the union of their finite mask entries,
+// from the bound per row (op param 4) and/or the bound for all rows (GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION).
+// 0 if neither is set.
+static int64_t ggml_cuda_fattn_sparse_n_kv(const ggml_tensor * KQV, const int ncols1) {
+    const int32_t n_kv_row   = ggml_get_op_params_i32(KQV, 4);
+    const int32_t n_kv_union = ggml_get_op_params_i32(KQV, GGML_FLASH_ATTN_EXT_OP_PARAM_N_KV_UNION);
+    if (n_kv_row <= 0 && n_kv_union <= 0) {
+        return 0;
+    }
+    int64_t n_kv = KQV->src[1]->ne[1];
+    if (n_kv_row > 0) {
+        n_kv = std::min<int64_t>(n_kv, int64_t(ncols1)*n_kv_row);
+    }
+    if (n_kv_union > 0) {
+        n_kv = std::min<int64_t>(n_kv, n_kv_union);
+    }
+    return n_kv;
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1014,7 +1041,9 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // the pool frees in the reverse order of the allocations: the sparse buffers first, then the fixup buffers
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<half>   mask_compact(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1098,17 +1127,30 @@ void launch_fattn(
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    // A quantized K/V read in place gathers only its rows: the mask is compacted along the lists, which are padded to
+    // whole tiles, and the kernel reads it like a dense mask (see flash_attn_ext_f16_iter()).
+    const bool sparse_compact_mask = use_sparse && !need_f16_K && ggml_is_quantized(K->type);
     int32_t n_kv_max = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
-        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
-        GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+        n_kv_max = ggml_cuda_fattn_sparse_n_kv(KQV, ncols1);
+        GGML_ASSERT(n_kv_max > 0);
+        if (sparse_compact_mask) {
+            GGML_ASSERT(mask->ne[2] == 1);
+            n_kv_max = GGML_PAD(n_kv_max, FATTN_KQ_STRIDE);
+        }
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
+        ggml_cuda_fattn_count_gather(KQV);
+
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+
+        if (sparse_compact_mask) {
+            mask_compact.alloc(size_t(n_kv_max) * Q->ne[1] * mask->ne[3]);
+            ggml_cuda_flash_attn_ext_gather_mask(mask, KV_max.ptr, mask_compact.ptr, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1254,12 +1296,30 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    // the compacted mask: Q->ne[1] rows of n_kv_max columns per mask sequence
+    const char * mask_data = mask ? (const char *) mask->data : nullptr;
+    int64_t mask_ne[4] = { 0, 0, 0, 0 };
+    size_t  mask_nb[4] = { 0, 0, 0, 0 };
+    if (mask) {
+        for (int i = 0; i < 4; ++i) {
+            mask_ne[i] = mask->ne[i];
+            mask_nb[i] = mask->nb[i];
+        }
+    }
+    if (sparse_compact_mask) {
+        mask_data  = (const char *) mask_compact.ptr;
+        mask_ne[1] = Q->ne[1];
+        mask_nb[1] = size_t(n_kv_max)*sizeof(half);
+        mask_nb[2] = mask_nb[1]*Q->ne[1];
+        mask_nb[3] = mask_nb[2];
+    }
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_data,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
@@ -1267,8 +1327,8 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask_ne[1], mask_ne[2], mask_ne[3],
+        mask_nb[1], mask_nb[2], mask_nb[3]
     );
     CUDA_CHECK(cudaGetLastError());
 

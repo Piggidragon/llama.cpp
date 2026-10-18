@@ -308,3 +308,61 @@ def test_concurrent_prefill_mmproj():
     assert n_image >= 2 # before and after the image
     assert text == text_ref
     assert image_text == image_ref
+
+
+@pytest.mark.parametrize("gather", [False, True])
+def test_concurrent_prefill_unified(gather: bool):
+    # one KV cache for all slots: the prompt's cells are taken from the shared cells while slot 0 generates; the texts
+    # are the ones of a unified cache without the flag
+    server.kv_unified = True
+    server.kv_unified_gather = gather
+    server.n_ctx = 4096
+    gen_ref, long_ref, _ = run(False)
+    gen, long, log = run(True)
+    assert "prompt tokens in the second context" in log
+    assert long == long_ref
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_concurrent_prefill_unified_hybrid():
+    hybrid = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(450))
+    server.kv_unified = True
+    server.kv_unified_gather = True
+    gen_ref, long_ref, _ = run(False, hybrid, prompt)
+    gen, long, log = run(True, hybrid, prompt)
+    assert "prompt tokens in the second context" in log
+    assert long == long_ref
+
+
+@pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+def test_concurrent_prefill_unified_hybrid_straddle():
+    # unified: slots 0 and 2 generate in one ubatch of the target while the prompt of slot 1 goes through the second
+    # context; the recurrent memory gathers the cells of a ubatch {0, 2} into one range, over the cell of slot 1, so the
+    # target waits for the second context then (see batch_straddles()); the prompt's text is the one without the flag
+    hybrid = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(450))
+    gen = lambda id_slot: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT + f" {id_slot}", "n_predict": 400, "ignore_eos": True, "id_slot": id_slot, "cache_prompt": False})
+    long = lambda: server.make_request("POST", "/completion", data={"prompt": prompt, "n_predict": 8, "id_slot": 1, "cache_prompt": False})
+
+    def run3(concurrent: bool):
+        global server
+        server.n_slots = 3
+        server.n_ctx = 3 * 2048
+        server.kv_unified = True
+        server.kv_unified_gather = True
+        start(concurrent, hybrid)
+        def slot1():
+            time.sleep(0.3) # slots 0 and 2 generate
+            return long()
+        res = parallel_function_calls([(gen, (0,)), (gen, (2,)), (slot1, ())])
+        server.stop()
+        log = read_log()
+        os.remove(server.log_path)
+        assert all(r.status_code == 200 for r in res)
+        return res[2].body["content"], log
+
+    ref, _ = run3(False)
+    out, log = run3(True)
+    assert "prompt tokens in the second context" in log
+    assert out == ref
