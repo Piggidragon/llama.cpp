@@ -130,6 +130,13 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// --kv-unified-gather: the FlashAttention with a list of K/V rows, which CUDA computes for some shapes only
+static const llm_fused_op_probe llm_fused_op_kv_rows_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
+    /*.name             =*/ "kv_unified_gather (Flash Attention with a list of K/V rows)",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_AR,
     /*.name             =*/ "fused Gated Delta Net (autoregressive)",
@@ -347,6 +354,8 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    cparams.auto_kv_rows = cparams.kv_unified_gather;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -758,8 +767,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     };
 
     if (cparams.auto_fa) {
+        // without the list of --kv-unified-gather, which is checked on its own below: a device that cannot gather keeps
+        // FlashAttention, the list is not used then
+        const bool kv_unified_gather = cparams.kv_unified_gather;
+        cparams.kv_unified_gather = false;
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
+        cparams.kv_unified_gather = kv_unified_gather;
         cparams.auto_fa = false;
+    }
+
+    // the reserve graphs of a unified cache read it through the list: the attention must stay on the device of its
+    // layer (the CUDA kernels gather at head sizes 128 and 256 from Turing on, without logit softcapping)
+    if (cparams.auto_kv_rows) {
+        if (cparams.flash_attn && cparams.kv_unified) {
+            resolve(llm_fused_op_kv_rows_probe, cparams.kv_unified_gather);
+        }
+        cparams.auto_kv_rows = false;
     }
 
     if (cparams.auto_fgdn) {
@@ -4861,6 +4884,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+bool llama_get_kv_unified_gather(const llama_context * ctx) {
+    return ctx->get_cparams().kv_unified_gather && ctx->get_cparams().flash_attn;
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

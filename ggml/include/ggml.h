@@ -2526,9 +2526,10 @@ extern "C" {
             int32_t              n_kv_max);
 
     // Columns from a list of K/V rows: column j of the attention, and of the mask, is row rows[j] of K and V (of the
-    // K/V sequence i3 if rows has one list per sequence). The mask then has rows->ne[0] columns. For a KV cache that
-    // holds several sequences: only the cells of the ubatch's own sequences. Backends: CPU, CUDA.
-    // rows: I32 [n_cols, 1, 1, 1 or k->ne[3]]
+    // K/V sequence i3 if rows has one list per sequence, which needs a mask per sequence too). The mask then has
+    // rows->ne[0] columns. For a KV cache that holds several sequences: only the cells of the ubatch's own sequences.
+    // Backends: CPU, CUDA.
+    // rows: I32 [n_cols, 1, 1, 1 or k->ne[3] (= mask->ne[3])]
     GGML_API void ggml_flash_attn_ext_set_kv_rows(
             struct ggml_tensor * a,
             struct ggml_tensor * rows);

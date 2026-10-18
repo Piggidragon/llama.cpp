@@ -1762,9 +1762,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kv-unified-gather"},
         {"--no-kv-unified-gather"},
         "with a unified KV cache that holds several sequences, the attention of a ubatch reads only the cells of its "
-        "own sequences instead of every used cell: a slot does not pay for the context of the other slots (CUDA "
-        "FlashAttention, where a gather kernel exists for the K/V type and head size; elsewhere it has no effect) "
-        "(default: disabled)",
+        "own sequences instead of every used cell: a slot does not pay for the context of the other slots "
+        "(FlashAttention on the CPU, and on CUDA at head sizes 128 and 256 from Turing on, without logit softcapping; "
+        "it is not used where a device or the model cannot) (default: disabled)",
         [](common_params & params, bool value) {
             params.kv_unified_gather = value;
         }
@@ -1866,7 +1866,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--no-concurrent-prefill"},
         "while slots generate, compute the prompt of another slot at the same time in a second context on the same\n"
         "memory, the generating slots first (default: disabled, needs --parallel >= 2; with a unified KV cache, use\n"
-        "--kv-unified-gather)",
+        "--kv-unified-gather; not with a unified KV cache with sliding-window attention)",
         [](common_params & params, bool value) {
             params.concurrent_prefill = value;
         }

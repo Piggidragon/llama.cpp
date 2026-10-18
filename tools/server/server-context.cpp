@@ -3124,7 +3124,7 @@ private:
 
                                 // with --kv-unified-gather the cells of an idle slot cost the attention of the
                                 // others nothing: they stay until the cache needs the room, see try_clear_idle_slots()
-                                if (params_base.kv_unified && !params_base.kv_unified_gather) {
+                                if (params_base.kv_unified && !llama_get_kv_unified_gather(ctx_tgt)) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -3456,7 +3456,7 @@ private:
             return;
         }
         if (!llama_memory_seqs_independent(ctx_tgt)) {
-            SRV_WRN("%s", "--concurrent-prefill: the memory of this model shares cells between the sequences, it is not used\n");
+            SRV_WRN("%s", "--concurrent-prefill: the memory of this model shares cells between the sequences (with sliding-window attention: a unified KV cache, use --no-kv-unified), it is not used\n");
             return;
         }
 

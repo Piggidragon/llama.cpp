@@ -773,7 +773,10 @@ bool llama_kv_cache::get_seqs_independent() const {
     // stream for all sequences (unified) a ubatch also reads the cells of the other sequences, masked (-inf, or not at
     // all with --kv-unified-gather): a concurrent write there leaves finite values (the buffers start zeroed). The
     // server synchronizes the target before another context takes cells that the target's sequences freed.
-    return !other;
+    // Not with sliding-window attention in one stream: find_slot() also gives out the cells of another sequence that
+    // its window has left, measured from that sequence's position after a ubatch that may still be computing (its first
+    // tokens still read them).
+    return !other && (n_stream > 1 || swa_type == LLAMA_SWA_TYPE_NONE);
 }
 
 bool llama_kv_cache::has_pending_update() const {
@@ -2049,6 +2052,11 @@ void llama_kv_cache::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatc
     const bool is_2d = ubatch->is_pos_2d();
     const uint32_t n_tokens = ubatch->n_tokens;
 
+    // as in set_input_kq_mask(): only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
     if (dst->type == GGML_TYPE_I32) {
         // one sequence, its cells in the causal order: token i sees the list up to the last cell not after it
         GGML_ASSERT(causal_attn && dst->ne[0] == 2 && dst->ne[1] == n_tokens);
@@ -3240,6 +3248,10 @@ llama_kv_cache_context::llama_kv_cache_context(
     n_kv_union    = kv->get_n_stream() == 1 ? this->n_kv : 0;
     is_reserve    = true;
 
+    has_n_kv_union    = true;
+    has_causal_prefix = true;
+    has_rows_prefix   = true;
+
     const uint32_t n_stream = kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
@@ -3293,10 +3305,11 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv          = kv->get_n_kv(sinfos[i_cur]);
-    n_kv_union    = kv->get_n_kv_union(sinfos[i_cur], ubatches[i_cur], n_kv);
-    causal_prefix = kv->get_causal_prefix(sinfos[i_cur], ubatches[i_cur], n_kv);
-    rows_prefix   = kv->get_rows_prefix(ubatches[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    has_n_kv_union    = false;
+    has_causal_prefix = false;
+    has_rows_prefix   = false;
 
     return true;
 }
@@ -3320,14 +3333,26 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_union() const {
+    if (!has_n_kv_union) {
+        n_kv_union     = kv->get_n_kv_union(sinfos[i_cur], ubatches[i_cur], n_kv);
+        has_n_kv_union = true;
+    }
     return n_kv_union;
 }
 
 bool llama_kv_cache_context::get_causal_prefix() const {
+    if (!has_causal_prefix) {
+        causal_prefix     = kv->get_causal_prefix(sinfos[i_cur], ubatches[i_cur], n_kv);
+        has_causal_prefix = true;
+    }
     return causal_prefix;
 }
 
 bool llama_kv_cache_context::get_rows_prefix() const {
+    if (!has_rows_prefix) {
+        rows_prefix     = kv->get_rows_prefix(ubatches[i_cur]);
+        has_rows_prefix = true;
+    }
     return rows_prefix;
 }
 
@@ -3342,8 +3367,9 @@ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     // a list shorter than the used cells, or, for one sequence whose cells are not a prefix of the cells (other
     // sequences hold some of them), a list that gives it the column ranges of a causal prefix instead of a dense mask;
     // the reserve graphs take the list over all cells
-    if (is_reserve || n_kv_union < (uint32_t) n_kv || (rows_prefix && !causal_prefix)) {
-        return n_kv_union;
+    const uint32_t n_union = get_n_kv_union();
+    if (is_reserve || n_union < (uint32_t) n_kv || (get_rows_prefix() && !get_causal_prefix())) {
+        return n_union;
     }
     return 0;
 }
@@ -3411,7 +3437,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     // --compact-attn-mask: the column range of each token, the graph builds the mask (ggml_attn_mask_ranges())
     if (dst->type == GGML_TYPE_I32) {
-        GGML_ASSERT(causal_attn && causal_prefix);
+        GGML_ASSERT(causal_attn && get_causal_prefix());
         kv->set_input_kq_bounds(dst, ubatch, n_kv);
         return;
     }

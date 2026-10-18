@@ -539,14 +539,19 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv = 0;
 
+    // computed on first use after apply(), only --compact-attn-mask and --kv-unified-gather read them:
     // the cells of the current ubatch's sequences, see llama_kv_cache::get_n_kv_union()
-    uint32_t n_kv_union = 0;
+    mutable uint32_t n_kv_union = 0;
 
     // see llama_kv_cache::get_causal_prefix()
-    bool causal_prefix = false;
+    mutable bool causal_prefix = false;
 
     // see llama_kv_cache::get_rows_prefix()
-    bool rows_prefix = false;
+    mutable bool rows_prefix = false;
+
+    mutable bool has_n_kv_union    = false;
+    mutable bool has_causal_prefix = false;
+    mutable bool has_rows_prefix   = false;
 
     // a context for reserving the compute buffers, see get_n_kv_rows()
     bool is_reserve = false;

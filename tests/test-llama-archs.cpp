@@ -748,11 +748,13 @@ static bool check_seq_cells(llama_model * model, const std::vector<llama_token> 
     return ok;
 }
 
-// recurrent and hybrid memory: scripts of multi-sequence batches, seq_rm and seq_cp, with unified and per-sequence KV;
-// each sequence's last logits and one more token must match a fresh single-sequence context with the same history.
-// The cell of a sequence that is new in a ubatch was taken twice once (by a later sequence of the same ubatch).
-static bool check_seq_scripts(llama_model * model, std::string & status) {
-    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+// scripts of multi-sequence batches, seq_rm and seq_cp, with unified and per-sequence KV; each sequence's last logits and
+// one more token must match a fresh single-sequence context with the same history. Recurrent and hybrid memory: the cell
+// of a sequence that is new in a ubatch was taken twice once (by a later sequence of the same ubatch). All models: the
+// lists of cells of a unified KV cache (--kv-unified-gather), also of cells that seq_cp shares (all_models: the device
+// configuration of a single device, the lists do not depend on the split, and the scripts take many contexts).
+static bool check_seq_scripts(llama_model * model, std::string & status, bool all_models) {
+    if (!all_models && !llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         return true;
     }
 
@@ -896,6 +898,85 @@ static bool check_seq_scripts(llama_model * model, std::string & status) {
 
     if (!ok) {
         status = "\033[1;31mFAIL\033[0m";
+    }
+    return ok;
+}
+
+// --kv-unified-gather and graph reuse: sequence 1 holds 200 cells, sequence 0 decodes one token per ubatch after them,
+// past the n_kv of 256, while its list stays at 256 rows (the positions stay within the training context of 256). A reused graph keeps the K/V views of the n_kv it was built
+// for, and CUDA converts a K/V cache it does not read in place (BF16 here) to F16 over those views only: the last
+// logits of sequence 0 must match a fresh context with its history.
+static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
+    if (llama_model_is_recurrent(model)) {
+        return true;
+    }
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto make_ctx = [&](uint32_t n_seq, bool unified) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx             = 1024;
+        ctx_params.n_seq_max         = n_seq;
+        ctx_params.n_batch           = 512;
+        ctx_params.n_ubatch          = 512;
+        ctx_params.kv_unified        = unified;
+        ctx_params.kv_unified_gather = true;
+        ctx_params.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.type_k            = GGML_TYPE_BF16;
+        ctx_params.type_v            = GGML_TYPE_BF16;
+        ctx_params.n_threads         = 4;
+        ctx_params.n_threads_batch   = 4;
+        return llama_context_ptr(llama_init_from_model(model, ctx_params));
+    };
+
+    llama_context_ptr ctx = make_ctx(2, true);
+    if (!ctx) {
+        throw std::runtime_error("failed to create the context of the list reuse check");
+    }
+    if (!llama_get_kv_unified_gather(ctx.get())) {
+        return true; // the model or the devices do not read through a list
+    }
+
+    uint32_t rng = 4321;
+    auto tok = [&]() {
+        rng = rng*1103515245u + 12345u;
+        return (llama_token) (1 + (rng >> 8) % (n_vocab - 2));
+    };
+
+    std::vector<llama_token> hist;
+    {
+        common_batch batch(ctx.get());
+        for (int i = 0; i < 200; i++) {
+            batch.add(tok(), i, 1, i + 1 == 200);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode sequence 1");
+        }
+    }
+    for (int i = 0; i < 100; i++) {
+        common_batch batch(ctx.get());
+        hist.push_back(tok());
+        batch.add(hist.back(), i, 0, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode sequence 0");
+        }
+    }
+    const float * logits = llama_get_logits_ith(ctx.get(), -1);
+    const std::vector<float> last(logits, logits + n_vocab);
+
+    llama_context_ptr ref = make_ctx(1, false);
+    common_batch batch(ref.get());
+    for (size_t i = 0; i < hist.size(); i++) {
+        batch.add(hist[i], i, 0, i + 1 == hist.size());
+    }
+    if (llama_process(ref.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode the reference of the list reuse check");
+    }
+    logits = llama_get_logits_ith(ref.get(), -1);
+
+    const bool ok = nmse(std::vector<float>(logits, logits + n_vocab), last) < 1e-4;
+    if (!ok) {
+        status = "\033[1;31mFAIL\033[0m (list reuse)";
     }
     return ok;
 }
@@ -1456,7 +1537,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         // allocation of main (Piggidragon/llama.cpp#30)
                         const bool seq_scripts_known_bad = arch == LLM_ARCH_MINIMAX_01 &&
                             ggml_backend_dev_type(dc.devs[0]) != GGML_BACKEND_DEVICE_TYPE_CPU;
-                        if (!encode && !seq_scripts_known_bad && !check_seq_scripts(model_and_ctx_dev.first.get(), status_range)) {
+                        const bool dc_plain = dc.devs.size() == 1 && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR && !dc.host_experts &&
+                            dc.moe_cache_size == 0 && dc.attn_split.empty() && !dc.split_overlap && !dc.workspace && !dc.compact_mask;
+                        if (!encode && !seq_scripts_known_bad && !check_seq_scripts(model_and_ctx_dev.first.get(), status_range, dc_plain)) {
+                            test_ok = false;
+                        }
+                        if (!encode && !check_kv_rows_reuse(model_and_ctx_dev.first.get(), status_range)) {
                             test_ok = false;
                         }
 

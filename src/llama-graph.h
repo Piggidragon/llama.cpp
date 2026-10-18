@@ -367,6 +367,8 @@ public:
     // --kv-unified-gather: I32 [n_rows], the cells of the ubatch's sequences the attention reads (the mask has their
     // columns), see ggml_flash_attn_ext_set_kv_rows(); null if it reads the first n_kv cells
     ggml_tensor * self_kv_rows = nullptr;
+    // the n_kv of the K/V views the list indexes into: a graph is reused only with the same views
+    uint32_t self_kv_rows_n_kv = 0;
 
     // whether the model reads the attention mask only through the attention (a list of rows changes its columns)
     bool allow_rows = true;
@@ -546,6 +548,7 @@ public:
     const llama_hparams hparams;
     // --kv-unified-gather, the cells of the non-SWA layers, see llm_graph_input_attn_kv::self_kv_rows
     ggml_tensor * self_kv_rows = nullptr;
+    uint32_t      self_kv_rows_n_kv = 0;
 
     const llama_cparams cparams;
 

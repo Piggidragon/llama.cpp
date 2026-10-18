@@ -5603,7 +5603,8 @@ void ggml_flash_attn_ext_set_kv_rows(
         GGML_ASSERT(rows->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(rows));
         GGML_ASSERT(rows->ne[0] == mask->ne[0] && rows->ne[1] == 1 && rows->ne[2] == 1);
-        GGML_ASSERT(rows->ne[3] == 1 || rows->ne[3] == k->ne[3]);
+        // one list per K/V sequence goes with one mask per sequence (the backends take the list of the mask's sequence)
+        GGML_ASSERT(rows->ne[3] == 1 || (rows->ne[3] == k->ne[3] && mask->ne[3] == k->ne[3]));
     }
 
     a->src[5] = rows;

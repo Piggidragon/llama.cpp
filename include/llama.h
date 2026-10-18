@@ -1197,6 +1197,10 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
+    // (llama_context_params::kv_unified_gather, if the devices and the model support it)
+    LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

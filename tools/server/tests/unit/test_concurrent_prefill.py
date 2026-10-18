@@ -379,3 +379,24 @@ def test_concurrent_prefill_unified_hybrid_straddle():
     assert "prompt tokens in the second context" in log
     assert "sequences on both sides of this one, waiting" in log
     assert out == ref
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_concurrent_prefill_swa(unified: bool):
+    # sliding-window attention: per-slot caches take the second context; one KV cache for all slots does not, its
+    # cells that a window has left go to other sequences while a ubatch that reads them may still compute
+    global server
+    server = ServerPreset.tinygemma3()
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.kv_unified = unified
+    server.kv_unified_gather = unified
+    server.no_mmproj = True
+    start(True)
+    server.stop()
+    log = read_log()
+    os.remove(server.log_path)
+    if unified:
+        assert "shares cells between the sequences" in log
+    else:
+        assert "shares cells between the sequences" not in log
