@@ -290,9 +290,9 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
     // in_proj: {n_embd, 2*d_inner} @ {n_embd, n_seq_tokens, n_seqs} => {2*d_inner, n_seq_tokens, n_seqs}
     ggml_tensor * zx = build_lora_mm(model.layers[il].ssm_in, cur);
     cb(zx, "mamba_in_proj", il);
-    // {8192, 5, 1, 1} -> {8192, 1, 5, 1}
-    zx = ggml_permute(ctx0, zx, 0, 2, 1, 3);
-    zx = ggml_cont_4d(ctx0, zx, head_dim * 2, n_heads, n_seq_tokens, n_seqs);
+    // {2*d_inner, n_seq_tokens, n_seqs} => {head_dim * 2, n_heads, n_seq_tokens, n_seqs}: a permute of the token and
+    // sequence dimensions here mixed the tokens of different sequences once a ubatch had several of each
+    zx = ggml_reshape_4d(ctx0, zx, head_dim * 2, n_heads, n_seq_tokens, n_seqs);
     cb(zx, "mamba_in_proj_out", il);
 
     // split into z and x

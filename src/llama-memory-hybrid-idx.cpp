@@ -204,9 +204,14 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     if (mem_idx) {
+        // a removal past the end of the sequence removes nothing and regroups no pool (the server asks for one
+        // before each prompt step)
+        const bool removes = seq_id < 0 || p0 < 0 || p0 <= mem_idx->seq_pos_max(seq_id);
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
         mem_idx->seq_rm(seq_id, p0, p1);
-        mem_idx_stale_set(seq_id, stale);
+        if (removes) {
+            mem_idx_stale_set(seq_id, stale);
+        }
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);

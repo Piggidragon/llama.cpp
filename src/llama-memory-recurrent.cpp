@@ -628,6 +628,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
+            } else {
+                // claimed: a later sequence of this ubatch must not take it as empty (its own index or the next one)
+                empty_cell.seq_id.insert(seq_id); // will be overwritten
             }
             seq_meta.tail = cell_id;
             // find next empty cell

@@ -117,9 +117,10 @@ def test_concurrent_prefill_single_slot():
 
 @pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
 def test_concurrent_prefill_hybrid_three_slots():
-    # the recurrent cell of the prompt's sequence (slot 0) lies between the cells of slots 1 and 2, which generate in
-    # one ubatch of the target while the prompt goes through the second context: the target's ubatch must not reach
-    # that cell (see llama_memory_recurrent::find_slot()). The prompt's text is the one without the flag.
+    # slots 1 and 2 generate in one ubatch of the target while the prompt of slot 0 goes through the second context,
+    # after the slots were used in the order 1, 0, 2: each sequence keeps the recurrent cell of its index, so the
+    # target's ubatch does not reach the cell of slot 0 (see llama_memory_recurrent::find_slot()); without that the
+    # memory is not independent and the second context is not used. The prompt's text is the one without the flag.
     hybrid = os.environ["LLAMA_TEST_HYBRID_MODEL"]
     prompt = " ".join(f"item{(k * 31) % 1000}" for k in range(450))
     gen = lambda id_slot: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT + f" {id_slot}", "n_predict": 400, "ignore_eos": True, "id_slot": id_slot, "cache_prompt": False})

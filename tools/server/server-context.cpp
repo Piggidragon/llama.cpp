@@ -297,6 +297,9 @@ struct server_slot {
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
+
+    // --concurrent-prefill: how often the second context went to another prompt while this one waited for it
+    int32_t bg_passed = 0;
     bool has_new_line   = false;
     bool truncated      = false;
 
@@ -361,6 +364,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+
+        bg_passed = 0;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -3677,8 +3682,9 @@ private:
             return;
         }
 
-        // the decode applies a KV shift or a stream copy over the cells of all sequences: not while ctx_bg computes
-        if (bg_slot != nullptr && llama_memory_update_pending(ctx_tgt)) {
+        // the decode applies a KV shift or a stream copy over the cells of all sequences, or its ubatches may reach
+        // the cells of other sequences (a seq_cp shares a recurrent cell, e.g. n_cmpl > 1): not while ctx_bg computes
+        if (bg_slot != nullptr && (llama_memory_update_pending(ctx_tgt) || !llama_memory_seqs_independent(ctx_tgt))) {
             bg_wait();
         }
 
@@ -3962,17 +3968,34 @@ private:
         server_slot * bg_next = nullptr;
 
         // with several prompts the one with the fewest tokens left goes through ctx_bg first (the shortest time to the
-        // first token on average); a prompt that starts in this step can take it when none was waiting
+        // first token on average), unless one was passed over bg_passed_max times: then the one passed over most
+        // (no prompt waits forever behind shorter ones); a prompt that starts in this step can take it when none was
+        // waiting
         server_slot * bg_pick = nullptr;
         if (ctx_bg && bg_slot == nullptr && !generating.empty()) {
+            constexpr int32_t bg_passed_max = 8;
+            auto n_left = [](const server_slot & slot) { return slot.task->n_tokens() - slot.prompt.n_tokens(); };
             for (auto & other : slots) {
                 if (other.state != SLOT_STATE_PROCESSING_PROMPT || !bg_candidate(other)) {
                     continue;
                 }
-                const int32_t n_left = other.task->n_tokens() - other.prompt.n_tokens();
-                if (bg_pick == nullptr || n_left < bg_pick->task->n_tokens() - bg_pick->prompt.n_tokens()) {
+                if (bg_pick == nullptr) {
+                    bg_pick = &other;
+                    continue;
+                }
+                const bool aged      = other.bg_passed >= bg_passed_max || bg_pick->bg_passed >= bg_passed_max;
+                const bool preferred = aged ? other.bg_passed > bg_pick->bg_passed : n_left(other) < n_left(*bg_pick);
+                if (preferred) {
                     bg_pick = &other;
                 }
+            }
+            if (bg_pick != nullptr) {
+                for (auto & other : slots) {
+                    if (&other != bg_pick && other.state == SLOT_STATE_PROCESSING_PROMPT && bg_candidate(other)) {
+                        other.bg_passed++;
+                    }
+                }
+                bg_pick->bg_passed = 0;
             }
         }
 

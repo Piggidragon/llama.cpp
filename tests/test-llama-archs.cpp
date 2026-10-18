@@ -20,7 +20,9 @@
 #include <cstring>
 #include <cstdint>
 #include <random>
+#include <map>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -743,6 +745,153 @@ static bool check_seq_cells(llama_model * model, const std::vector<llama_token> 
     return ok;
 }
 
+// recurrent and hybrid memory: scripts of multi-sequence batches, seq_rm and seq_cp, with unified and per-sequence KV;
+// each sequence's last logits and one more token must match a fresh single-sequence context with the same history.
+// The cell of a sequence that is new in a ubatch was taken twice once (by a later sequence of the same ubatch).
+static bool check_seq_scripts(llama_model * model, std::string & status) {
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        return true;
+    }
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto make_ctx = [&](uint32_t n_seq, bool unified) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx      = n_seq*256;
+        ctx_params.n_seq_max  = n_seq;
+        ctx_params.n_batch    = 64;
+        ctx_params.n_ubatch   = 64;
+        ctx_params.kv_unified = unified;
+        ctx_params.n_threads  = 4;
+        ctx_params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the context of the sequence scripts");
+        }
+        return ctx;
+    };
+
+    auto ref_logits = [&](const std::vector<llama_token> & hist) {
+        llama_context_ptr ctx = make_ctx(1, false);
+        common_batch batch(ctx.get());
+        for (size_t i = 0; i < hist.size(); i++) {
+            batch.add(hist[i], i, 0, i + 1 == hist.size());
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode the reference");
+        }
+        const float * logits = llama_get_logits_ith(ctx.get(), -1);
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+
+    struct script {
+        bool        unified;
+        const char * ops; // "d s:n s:n" decodes one batch (n tokens of sequence s, in this order), "rm s", "cp a b"
+    };
+    const script scripts[] = {
+        { true,  "d 0:3; d 0:1 3:2; d 0:1 3:1; rm 1; rm 2; d 0:1 1:4 2:4" },
+        { true,  "d 1:3; d 1:1; d 0:6; d 0:1 3:4; rm 1; rm 2; d 0:1 3:1 1:6 2:2" },
+        { true,  "d 0:5 3:2; d 0:1 3:1 1:6 2:5" },
+        { true,  "d 1:2 0:2; rm 1; d 0:1; d 1:2 2:2" },
+        { false, "d 0:5; cp 0 3; d 0:1; d 1:3 2:3 3:1" },
+        { false, "d 0:3; cp 0 3; d 0:1 3:1; rm 0; d 3:1 0:3 1:3" },
+        { false, "d 1:1; d 0:1; d 2:1; rm 0; d 0:1; d 1:1 2:1" },
+    };
+
+    bool ok = true;
+    uint32_t rng = 1234;
+    auto tok = [&]() {
+        rng = rng*1103515245u + 12345u;
+        return (llama_token) (1 + (rng >> 8) % (n_vocab - 2));
+    };
+
+    for (const auto & sc : scripts) {
+        llama_context_ptr ctx = make_ctx(4, sc.unified);
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        std::map<llama_seq_id, std::vector<llama_token>> hist;
+        std::map<llama_seq_id, std::vector<float>>       last;
+
+        std::stringstream ss(sc.ops);
+        std::string op;
+        while (ok && std::getline(ss, op, ';')) {
+            std::stringstream os(op);
+            std::string cmd;
+            os >> cmd;
+            if (cmd == "d") {
+                std::vector<std::pair<llama_seq_id, int>> parts;
+                std::string part;
+                while (os >> part) {
+                    int seq = 0, n = 0;
+                    GGML_ASSERT(sscanf(part.c_str(), "%d:%d", &seq, &n) == 2);
+                    parts.push_back({ seq, n });
+                }
+                common_batch batch(ctx.get());
+                for (const auto & [seq, n] : parts) {
+                    for (int i = 0; i < n; i++) {
+                        const llama_token t = tok();
+                        batch.add(t, hist[seq].size(), seq, i + 1 == n);
+                        hist[seq].push_back(t);
+                    }
+                }
+                if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    ok = false; // a false "no memory slot"
+                    break;
+                }
+                int k = 0;
+                for (const auto & [seq, n] : parts) {
+                    k += n;
+                    const float * logits = llama_get_logits_ith(ctx.get(), k - 1);
+                    last[seq] = std::vector<float>(logits, logits + n_vocab);
+                }
+            } else if (cmd == "rm") {
+                int seq = 0;
+                os >> seq;
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                hist.erase(seq);
+                last.erase(seq);
+            } else if (cmd == "cp") {
+                int src = 0, dst = 0;
+                os >> src >> dst;
+                llama_memory_seq_rm(mem, dst, -1, -1);
+                llama_memory_seq_cp(mem, src, dst, -1, -1);
+                hist[dst] = hist[src];
+                last[dst] = last[src];
+            }
+        }
+
+        for (auto & [seq, h] : hist) {
+            if (!ok) {
+                break;
+            }
+            if (h.empty() || last.find(seq) == last.end()) {
+                continue;
+            }
+            ok = nmse(ref_logits(h), last[seq]) < 1e-4;
+
+            // the memory continues the sequence like the reference
+            const llama_token t = tok();
+            common_batch batch(ctx.get());
+            batch.add(t, h.size(), seq, true);
+            if (!ok || llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                ok = false;
+                break;
+            }
+            const float * logits = llama_get_logits_ith(ctx.get(), -1);
+            std::vector<llama_token> h_next = h;
+            h_next.push_back(t);
+            ok = nmse(ref_logits(h_next), std::vector<float>(logits, logits + n_vocab)) < 1e-4;
+        }
+        if (!ok) {
+            break;
+        }
+    }
+
+    if (!ok) {
+        status = "\033[1;31mFAIL\033[0m";
+    }
+    return ok;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1282,6 +1431,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                         }
                         if (!encode && !check_seq_cells(model_and_ctx_dev.first.get(), tokens, status_range)) {
+                            test_ok = false;
+                        }
+                        if (!encode && !check_seq_scripts(model_and_ctx_dev.first.get(), status_range)) {
                             test_ok = false;
                         }
 
