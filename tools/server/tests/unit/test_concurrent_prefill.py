@@ -1,3 +1,4 @@
+import base64
 import os
 import tempfile
 import time
@@ -262,3 +263,53 @@ def test_concurrent_prefill_qwen4exp():
     assert "it is not used" not in log
     assert "prompt tokens in the second context" in log
     assert out == ref
+
+
+def test_concurrent_prefill_mmproj():
+    # with an mmproj loaded every chat prompt counts as multimodal, also a text-only one: its text goes through the
+    # second context; an image in the middle of a prompt is decoded in the first one, the text after it goes through
+    # the second context again; the texts are the ones without the flag
+    with open(os.path.join(os.path.dirname(__file__), "../../../mtmd/test-1.jpeg"), "rb") as f:
+        image = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode("utf-8")
+    text_a = " ".join(f"word{(k * 37) % 997}" for k in range(300))
+    text_b = " ".join(f"item{(k * 31) % 1000}" for k in range(300))
+    text_only  = [{"role": "user", "content": text_a}]
+    with_image = [{"role": "user", "content": [
+        {"type": "text", "text": text_a},
+        {"type": "image_url", "image_url": {"url": image}},
+        {"type": "text", "text": text_b},
+    ]}]
+
+    def chat_and_gen(messages):
+        gen = lambda: server.make_request("POST", "/completion", data={"prompt": SHORT_PROMPT, "n_predict": 1024, "ignore_eos": True, "id_slot": 0, "cache_prompt": False})
+        def chat():
+            time.sleep(0.05) # arrives while slot 0 generates
+            return server.make_request("POST", "/v1/chat/completions", data={"messages": messages, "max_tokens": 8, "id_slot": 1, "cache_prompt": False})
+        res_gen, res_chat = parallel_function_calls([(gen, ()), (chat, ())])
+        assert res_gen.status_code == 200 and res_chat.status_code == 200
+        return res_chat.body["choices"][0]["message"]["content"], read_log()
+
+    def run_mm(concurrent: bool):
+        global server
+        server = ServerPreset.tinygemma3()
+        server.n_slots = 2
+        server.n_ctx = 8192
+        server.temperature = 0.0
+        start(concurrent)
+        text, log_text = chat_and_gen(text_only)
+        image_text, log_all = chat_and_gen(with_image)
+        server.stop()
+        os.remove(server.log_path)
+        return text, image_text, log_text, log_all[len(log_text):]
+
+    bg_line = "prompt tokens in the second context"
+    text_ref, image_ref, _, _ = run_mm(False)
+    text, image_text, log_text, log_image = run_mm(True)
+    assert bg_line in log_text
+    # the text after the image goes through the second context too
+    i_image = log_image.find("image decoded")
+    assert i_image >= 0
+    assert bg_line in log_image[:i_image]
+    assert bg_line in log_image[i_image:]
+    assert text == text_ref
+    assert image_text == image_ref
