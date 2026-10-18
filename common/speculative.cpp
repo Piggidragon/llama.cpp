@@ -1516,9 +1516,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // offload draft sampling to the backend
+        // offload draft sampling to the backend (not with a draft vocabulary: the context hands its logits to the CPU
+        // sampler as the candidates of the vocabulary's tokens)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        if (this->params.backend_sampling && this->params.vocab.empty()) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -2676,7 +2677,8 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_type    = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.draft_vocab = !params.speculative.draft.vocab.empty();
     }
 
     // the draft context holds as many tokens per sequence as the target context

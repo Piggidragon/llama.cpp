@@ -1260,7 +1260,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
-            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.ctx_type    = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.draft_vocab = !params.speculative.draft.vocab.empty();
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -1710,6 +1711,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // the draft head of MTP: rows of the output head, made at load
+    if (mparams.load_mtp && !params.speculative.draft.vocab.empty()) {
+        mparams.draft_vocab   = params.speculative.draft.vocab.data();
+        mparams.n_draft_vocab = (uint32_t) params.speculative.draft.vocab.size();
+    }
 
     return mparams;
 }

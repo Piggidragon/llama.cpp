@@ -1559,6 +1559,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    head_src         (params.head_src),
+    head_draft       (params.head_draft),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1616,6 +1618,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // llama_context_params::draft_vocab: the output head of a draft graph has the rows of the draft vocabulary only
+    if (w == head_src && head_draft != nullptr && w_s == nullptr) {
+        w = head_draft;
+    }
     cur = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 

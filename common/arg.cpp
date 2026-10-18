@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <list>
 #include <numeric>
 #include <regex>
@@ -4390,6 +4391,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab"}, "FNAME",
+        "MTP: draft over these tokens only, a file of token ids (whitespace separated, # starts a comment), e.g. from "
+        "llama-draft-vocab: a copy of their rows of the output head is made at load, a draft step reads and samples "
+        "only those; a token outside the list is never drafted (default: the whole vocabulary)",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value);
+            if (!file) {
+                throw std::invalid_argument(string_format("cannot open the draft vocabulary '%s'", value.c_str()));
+            }
+            std::vector<llama_token> ids;
+            std::string line;
+            while (std::getline(file, line)) {
+                line = line.substr(0, line.find('#'));
+                std::istringstream ls(line);
+                long long id;
+                while (ls >> id) {
+                    if (id < 0 || id > INT32_MAX) {
+                        throw std::invalid_argument(string_format("invalid token id %lld in '%s'", id, value.c_str()));
+                    }
+                    ids.push_back((llama_token) id);
+                }
+                if (!ls.eof()) {
+                    throw std::invalid_argument(string_format("invalid line in the draft vocabulary '%s': %s", value.c_str(), line.c_str()));
+                }
+            }
+            if (ids.empty()) {
+                throw std::invalid_argument(string_format("the draft vocabulary '%s' has no token ids", value.c_str()));
+            }
+            params.speculative.draft.vocab = std::move(ids);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-sampling"}, "{greedy,probabilistic}",
         string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "

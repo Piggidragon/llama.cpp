@@ -436,7 +436,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
-    static const std::regex pattern_output_weight("output\\.weight");
+    static const std::regex pattern_output_weight("output(_draft)?\\.weight"); // output_draft: rows of output, see load_draft_head
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
@@ -1392,6 +1392,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
             this->params.attn_split = pimpl->attn_split_owned.data();
         }
     }
+    // the draft vocabulary is a borrowed array as well: sorted (the rows are read in file order) and without duplicates
+    if (params.draft_vocab != nullptr && params.n_draft_vocab > 0) {
+        draft_vocab.assign(params.draft_vocab, params.draft_vocab + params.n_draft_vocab);
+        std::sort(draft_vocab.begin(), draft_vocab.end());
+        draft_vocab.erase(std::unique(draft_vocab.begin(), draft_vocab.end()), draft_vocab.end());
+    }
+    this->params.draft_vocab   = nullptr;
+    this->params.n_draft_vocab = 0;
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
@@ -2135,7 +2143,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    load_draft_head(ml);
+
     return true;
+}
+
+// llama_model_params::draft_vocab: a copy of the rows of the output head for these tokens, read from the model file in
+// the head's type, on the buffer type of the head (split by rows like it under split mode tensor); MTP draft heads
+// project onto it in contexts with llama_context_params::draft_vocab
+void llama_model_base::load_draft_head(llama_model_loader & ml) {
+    if (draft_vocab.empty()) {
+        return;
+    }
+
+    const int32_t n_vocab = vocab.n_tokens();
+
+    auto skip = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: the draft vocabulary is not used: %s\n", __func__, why);
+        draft_vocab.clear();
+    };
+
+    if (draft_vocab.front() < 0 || draft_vocab.back() >= n_vocab) {
+        skip("token ids out of the vocabulary");
+        return;
+    }
+    if (output == nullptr || output->buffer == nullptr || output_s != nullptr || output->ne[1] != n_vocab) {
+        skip("the model has no plain output head");
+        return;
+    }
+    const auto * weight = ml.get_weight(ggml_get_name(output));
+    if (weight == nullptr) {
+        skip("the output head is not read from the model file");
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create the draft head context");
+    }
+
+    const int64_t n_rows = (int64_t) draft_vocab.size();
+    ggml_tensor * head = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_rows);
+    ggml_set_name(head, "output_draft.weight");
+
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buffer) {
+        throw std::runtime_error(format("unable to allocate the %s buffer of the draft head", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // the rows, in runs of consecutive ids
+    const size_t row_size = ggml_row_size(output->type, output->ne[0]);
+    std::vector<uint8_t> data(row_size*n_rows);
+    const auto & file = ml.files.at(weight->idx);
+    for (int64_t i = 0; i < n_rows; ) {
+        int64_t j = i + 1;
+        while (j < n_rows && draft_vocab[j] == draft_vocab[j - 1] + 1) {
+            ++j;
+        }
+        file->seek(weight->offs + row_size*draft_vocab[i], SEEK_SET);
+        file->read_raw(data.data() + row_size*i, row_size*(j - i));
+        i = j;
+    }
+    ggml_backend_tensor_set(head, data.data(), 0, data.size());
+
+    LLAMA_LOG_INFO("%s: draft head of %zu tokens (%.1f%% of the vocabulary), %.2f MiB on %s\n", __func__,
+            draft_vocab.size(), 100.0*draft_vocab.size()/n_vocab, data.size()/1024.0/1024.0, ggml_backend_buft_name(buft));
+
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    output_draft = head;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -3459,6 +3550,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.draft_vocab                 =*/ nullptr,
+        /*.n_draft_vocab               =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3504,6 +3597,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+uint32_t llama_model_n_draft_vocab(const llama_model * model) {
+    return model->output_draft ? (uint32_t) model->draft_vocab.size() : 0;
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

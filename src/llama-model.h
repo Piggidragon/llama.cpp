@@ -734,6 +734,10 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
+
+    // llama_model_params::draft_vocab: the rows of the output head for these tokens (sorted ids), see load_draft_head()
+    struct ggml_tensor *     output_draft = nullptr;
+    std::vector<llama_token> draft_vocab;
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
@@ -935,6 +939,9 @@ struct llama_model_base : public llama_model {
     const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
+
+    // see llama_model::output_draft
+    void load_draft_head(llama_model_loader & ml);
     virtual ~llama_model_base() = default;
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);

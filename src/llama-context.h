@@ -453,6 +453,10 @@ private:
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
 
+    // the logits of the last decode are over model.draft_vocab (llama_context_params::draft_vocab), a row of that
+    // many values per output at the stride of the vocabulary; the sampled-candidates API reports them
+    bool logits_subset = false;
+
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
