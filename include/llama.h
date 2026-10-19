@@ -453,6 +453,12 @@ extern "C" {
                                        // vocabulary only (llama_model_params::draft_vocab): its logits have
                                        // llama_get_sampled_logits_count_ith() entries, for the tokens of
                                        // llama_get_sampled_candidates_ith()
+        bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a
+                                       // ubatch reads only the cells of the ubatch's sequences (CUDA, where a gather
+                                       // kernel exists), not every used cell
+        bool compact_attn_mask;        // a causal attention mask whose visible cells are a prefix of the cells for
+                                       // every token is built on the device from one bound per token instead of
+                                       // being uploaded
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1209,6 +1215,9 @@ extern "C" {
     // An MTP context created with llama_context_params::draft_vocab drafts over the draft vocabulary (true, the
     // default) or over the whole vocabulary (false), e.g. while the text leaves the list
     LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, bool enabled);
+    // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
+    // (llama_context_params::kv_unified_gather, if the devices and the model support it)
+    LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

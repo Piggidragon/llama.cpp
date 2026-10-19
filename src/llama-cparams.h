@@ -43,6 +43,9 @@ struct llama_cparams {
     bool phase_aware_workspace;    // see llama_context_params::phase_aware_workspace
     bool live_context_workspace;   // see llama_context_params::live_context_workspace
     bool draft_vocab;              // see llama_context_params::draft_vocab (an MTP context of a model with a draft head)
+    bool kv_unified_gather;        // see llama_context_params::kv_unified_gather
+    bool auto_kv_rows;             // kv_unified_gather is still to be checked against the devices of the attention
+    bool compact_attn_mask;        // see llama_context_params::compact_attn_mask
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)

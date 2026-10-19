@@ -1717,6 +1717,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-root"}, "N",
+        string_format("keep a context checkpoint at the end of a system prompt of at least N tokens for good: in the slot, "
+            "and in the prompt cache as an entry of its own that every conversation with the same system prompt "
+            "restores, so that a new chat reads only what follows it (default: %d, 0 = off)", params.checkpoint_root),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-root must be non-negative");
+            }
+            params.checkpoint_root = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_ROOT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-spread"},
+        {"--no-checkpoint-spread"},
+        "when the context checkpoints of a slot are full, evict the one whose removal leaves the smallest gap for its "
+        "distance from the newest, instead of the oldest: the kept checkpoints thin out geometrically back from the "
+        "end, and an edit of the history d tokens back reads about d tokens again (default: disabled)",
+        [](common_params & params, bool value) {
+            params.checkpoint_spread = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_SPREAD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-save-min"}, "N",
+        string_format("before another prompt takes a slot, save the slot's prompt to the prompt cache if it would lose at "
+            "least N tokens, so that its conversation resumes where it was (default: %d, 0 = only if it would lose more "
+            "than half of them)", params.cache_save_min),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-save-min must be non-negative");
+            }
+            params.cache_save_min = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SAVE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -1759,6 +1793,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_unified = value;
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--kv-unified-gather"},
+        {"--no-kv-unified-gather"},
+        "with a unified KV cache that holds several sequences, the attention of a ubatch reads only the cells of its "
+        "own sequences instead of every used cell: a slot does not pay for the context of the other slots "
+        "(FlashAttention on the CPU, and on CUDA at head sizes 128 and 256 from Turing on, without logit softcapping; "
+        "it is not used where a device or the model cannot) (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_unified_gather = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_GATHER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--compact-attn-mask"},
+        {"--no-compact-attn-mask"},
+        "where every token of a ubatch sees a prefix of the KV cells (a causal mask over the cells of one sequence in "
+        "position order, no SWA or ALiBi), build the attention mask on the device from one bound per token instead of "
+        "uploading a mask of n_kv x n_tokens; for long prompts that is up to tens of MB per ubatch less to copy to "
+        "each GPU; for a KV cache per sequence or of one sequence (a unified cache of several sequences gets the same "
+        "with --kv-unified-gather) (default: disabled)",
+        [](common_params & params, bool value) {
+            params.compact_attn_mask = value;
+        }
+    ).set_env("LLAMA_ARG_COMPACT_ATTN_MASK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
         {"--flash-attn-native-quants"},
         {"--no-flash-attn-native-quants"},
@@ -1844,7 +1901,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--concurrent-prefill"},
         {"--no-concurrent-prefill"},
         "while slots generate, compute the prompt of another slot at the same time in a second context on the same\n"
-        "memory, the generating slots first (default: disabled, needs --parallel >= 2 and no unified KV cache)",
+        "memory, the generating slots first (default: disabled, needs --parallel >= 2; with a unified KV cache, use\n"
+        "--kv-unified-gather; not with a unified KV cache with sliding-window attention)",
         [](common_params & params, bool value) {
             params.concurrent_prefill = value;
         }

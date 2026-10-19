@@ -1095,6 +1095,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "ATTN_MASK_RANGES",
 
     "UNARY",
 
@@ -1112,7 +1113,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "attn_mask_ranges(r)",
 
     "unary(x)",
 
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5587,6 +5589,44 @@ void ggml_flash_attn_ext_set_n_kv_max(
     GGML_ASSERT(n_kv_max >= 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
+void ggml_flash_attn_ext_set_kv_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * rows) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (rows) {
+        const struct ggml_tensor * k    = a->src[1];
+        const struct ggml_tensor * mask = a->src[3];
+        GGML_ASSERT(mask != NULL);
+        GGML_ASSERT(rows->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(rows));
+        GGML_ASSERT(rows->ne[0] == mask->ne[0] && rows->ne[1] == 1 && rows->ne[2] == 1);
+        // one list per K/V sequence goes with one mask per sequence (the backends take the list of the mask's sequence)
+        GGML_ASSERT(rows->ne[3] == 1 || (rows->ne[3] == k->ne[3] && mask->ne[3] == k->ne[3]));
+    }
+
+    a->src[5] = rows;
+}
+
+struct ggml_tensor * ggml_attn_mask_ranges(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        int64_t               n_cols,
+        enum ggml_type        type) {
+    GGML_ASSERT(r->type == GGML_TYPE_I32);
+    GGML_ASSERT(r->ne[0] == 2 && r->ne[2] == 1);
+    GGML_ASSERT(ggml_is_contiguous(r));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(n_cols > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_cols, r->ne[1], 1, r->ne[3]);
+
+    result->op     = GGML_OP_ATTN_MASK_RANGES;
+    result->src[0] = r;
+
+    return result;
 }
 
 void ggml_flash_attn_ext_set_native_quants(

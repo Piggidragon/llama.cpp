@@ -118,6 +118,9 @@ private:
 
         bool ranged = false;
 
+        // a root prompt (server_prompt_cache_state::root), file kind 'r': the prompts that continue it do not remove it
+        bool root = false;
+
         // keys of the KV blocks of a ranged state, in position order
         std::vector<server_kv_key> blocks;
 

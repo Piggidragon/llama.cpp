@@ -34,6 +34,7 @@
 #include <future>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -8357,6 +8358,274 @@ struct test_arange : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with one list of K/V rows per K/V sequence (and a mask per sequence): each sequence attends
+// the rows of its own list
+struct test_flash_attn_ext_kv_rows_seq : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t gqa;
+    const int64_t kv;
+    const int64_t n_cols;
+    const int64_t nb;
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, gqa, kv, n_cols, nb, type_KV);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_KV_ROWS_SEQ";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_rows_seq(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 4, int64_t kv = 4096, int64_t n_cols = 512,
+            int64_t nb = 3, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_cols(n_cols), nb(nb), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 2);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 2);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 2);
+        ggml_set_name(v, "v");
+        ggml_tensor * rows = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_cols, 1, 1, 2);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_cols, nb, 1, 2);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_kv_rows(out, rows);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x53455153);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rows") == 0) {
+                // the two lists take different cells
+                std::vector<int32_t> data(2*n_cols);
+                for (int64_t s = 0; s < 2; ++s) {
+                    for (int64_t c = 0; c < n_cols; ++c) {
+                        data[s*n_cols + c] = (int32_t) ((c*7 + s*(kv/2)) % kv);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // a causal-like prefix per query, another one per sequence
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t s = 0; s < 2; ++s) {
+                    for (int64_t i = 0; i < nb; ++i) {
+                        const int64_t n_vis = n_cols - 37*s - (nb - 1 - i);
+                        for (int64_t c = 0; c < n_cols; ++c) {
+                            data[(s*nb + i)*n_cols + c] = c < n_vis ? 0.0f : -INFINITY;
+                        }
+                    }
+                }
+                std::vector<ggml_fp16_t> h(data.size());
+                ggml_fp32_to_fp16_row(data.data(), h.data(), data.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT with a list of K/V rows (ggml_flash_attn_ext_set_kv_rows()): the attention over the rows of
+// the list, next to the attention over the same rows gathered first; the halves must agree, also on the CPU
+struct test_flash_attn_ext_kv_rows : public test_case {
+    const int64_t hs;
+    const int64_t nh;     // K/V heads
+    const int64_t gqa;
+    const int64_t kv;     // cells
+    const int64_t n_cols; // the list, padded
+    const int64_t n_live; // its live part
+    const int64_t nb;     // queries
+    const ggml_type type_KV;
+    const bool native;
+    const bool ranges;    // a prefix of the list per query from ggml_attn_mask_ranges(), else a dense mask
+
+    std::string vars() override {
+        return VARS_TO_STR10(hs, nh, gqa, kv, n_cols, n_live, nb, type_KV, native, ranges);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_KV_ROWS";
+    }
+
+    test_flash_attn_ext_kv_rows(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 4, int64_t kv = 8192, int64_t n_cols = 1024,
+            int64_t n_live = 1000, int64_t nb = 3, ggml_type type_KV = GGML_TYPE_F16, bool native = false, bool ranges = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_cols(n_cols), n_live(n_live), nb(nb), type_KV(type_KV), native(native), ranges(ranges) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cols);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * rows_h = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_cols, nh);
+        ggml_set_name(rows_h, "rows_h");
+
+        ggml_tensor * m;
+        if (ranges) {
+            ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, 1);
+            ggml_set_name(r, "ranges");
+            m = ggml_attn_mask_ranges(ctx, r, n_cols, GGML_TYPE_F16);
+        } else {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_cols, nb, 1, 1);
+            ggml_set_name(m, "m");
+        }
+
+        const float scale = 1.0f/sqrtf(hs);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_kv_rows(out, rows);
+        ggml_flash_attn_ext_set_native_quants(out, native);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+
+        ggml_tensor * kg = ggml_cast(ctx, ggml_get_rows(ctx, k, rows_h), GGML_TYPE_F16);
+        ggml_tensor * vg = ggml_cast(ctx, ggml_get_rows(ctx, v, rows_h), GGML_TYPE_F16);
+        ggml_tensor * ref = ggml_flash_attn_ext(ctx, q, kg, vg, m, scale, 0.0f, 0.0f);
+        ggml_prec_set_acc(ref, GGML_PREC_F32);
+
+        out = ggml_concat(ctx, out, ref, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % 2 == 0);
+        const size_t half = n/2;
+        // the attention over the list against the one over the gathered rows, on both backends: rounding only (the CPU
+        // takes another kernel for the gathered rows of a large batch, the quantized-native route reads the rows the
+        // F16 copy was made from)
+        return std::max({nmse(a, b, n), nmse(a, a + half, half), nmse(b, b + half, half)});
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x524F5753);
+        std::vector<int32_t> cells(kv);
+        std::iota(cells.begin(), cells.end(), 0);
+        std::shuffle(cells.begin(), cells.end(), gen);
+        std::vector<int32_t> list(n_cols, 0);
+        for (int64_t c = 0; c < n_live; ++c) {
+            list[c] = cells[c];
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rows") == 0) {
+                ggml_backend_tensor_set(t, list.data(), 0, list.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rows_h") == 0) {
+                std::vector<int32_t> data;
+                for (int64_t h = 0; h < nh; ++h) {
+                    data.insert(data.end(), list.begin(), list.end());
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "ranges") == 0) {
+                // causal prefixes of the live part, the last query sees all of it; odd queries see a later segment
+                // only (the list of several sequences, one segment each)
+                std::vector<int32_t> data(2*nb);
+                for (int64_t i = 0; i < nb; ++i) {
+                    data[2*i + 1] = (int32_t) std::max<int64_t>(1, n_live - (nb - 1 - i)*7);
+                    data[2*i + 0] = i % 2 == 1 ? std::min<int32_t>(data[2*i + 1] - 1, (int32_t) (n_live/3)) : 0;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // each query sees a random part of the live list, at least one row
+                std::vector<float> data(n_cols*nb, -INFINITY);
+                std::uniform_int_distribution<int> coin(0, 2);
+                for (int64_t i = 0; i < nb; ++i) {
+                    data[i*n_cols + (i % n_live)] = 0.0f;
+                    for (int64_t c = 0; c < n_live; ++c) {
+                        if (coin(gen) == 0) {
+                            data[i*n_cols + c] = -0.03125f * (1 + (c + i) % 7);
+                        }
+                    }
+                }
+                std::vector<ggml_fp16_t> data_f16(data.size());
+                ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data.size());
+                ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_ATTN_MASK_RANGES
+struct test_attn_mask_ranges : public test_case {
+    const ggml_type type;
+    const int64_t n_cols;
+    const int64_t n_rows;
+    const int64_t ne3;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_cols, n_rows, ne3);
+    }
+
+    test_attn_mask_ranges(ggml_type type = GGML_TYPE_F16, int64_t n_cols = 512, int64_t n_rows = 8, int64_t ne3 = 1)
+        : type(type), n_cols(n_cols), n_rows(n_rows), ne3(ne3) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_MASK_RANGES";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, n_rows, 1, ne3);
+        ggml_set_name(r, "r");
+
+        ggml_tensor * mask = ggml_attn_mask_ranges(ctx, r, n_cols, type);
+        ggml_set_name(mask, "mask");
+
+        // 1 inside the range, 0 outside: finite values to compare
+        ggml_tensor * out = ggml_exp(ctx, ggml_cast(ctx, mask, GGML_TYPE_F32));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4D41534B);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+            std::vector<int32_t> data(ggml_nelements(t));
+            std::uniform_int_distribution<int32_t> dist(-3, (int32_t) n_cols + 3);
+            for (size_t i = 0; i < data.size(); i += 2) {
+                // causal prefixes, windows, empty and out of range ranges
+                int32_t lo = (i/2) % 3 == 0 ? 0 : dist(gen);
+                int32_t hi = dist(gen);
+                if (lo > hi && (i/2) % 5 != 0) {
+                    std::swap(lo, hi);
+                }
+                data[i + 0] = lo;
+                data[i + 1] = hi;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // GGML_OP_TIMESTEP_EMBEDDING
 struct test_timestep_embedding : public test_case {
     const ggml_type type;
@@ -11705,6 +11974,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
+    // lists of K/V rows: decode, speculative decoding, a prompt; dense masks and causal prefixes; F16 and quantized,
+    // the quantized ones also on the native route
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0}) {
+        for (bool native : {false, true}) {
+            if (native && type == GGML_TYPE_F16) {
+                continue;
+            }
+            for (int64_t hs : {128, 256}) {
+                for (int64_t gqa : {1, 4, 6, 8}) {
+                    for (int64_t nb : {1, 3, 7, 64, 256}) {
+                        for (bool ranges : {false, true}) {
+                            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(hs, 2, gqa, 8192, 1536, 1300, nb, type, native, ranges));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // one list per K/V sequence
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {128, 256}) {
+            for (int64_t nb : {1, 3, 64}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows_seq(hs, 2, 4, 4096, 512, nb, type));
+            }
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_attn_mask_ranges(type, 512, 8, 1));
+        test_cases.emplace_back(new test_attn_mask_ranges(type, 16384, 256, 1));
+        test_cases.emplace_back(new test_attn_mask_ranges(type, 4096, 3, 2));
+        test_cases.emplace_back(new test_attn_mask_ranges(type, 1000, 7, 3));
+    }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());

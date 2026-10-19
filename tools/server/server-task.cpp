@@ -1804,12 +1804,13 @@ static server_kv_key block_key(const server_kv_key & prev, const server_tokens &
 
 // a prompt is stored in KV blocks if the memory supports state ranges, and only for text: positions follow
 // the token index there, while media tokens can share a position
-static bool prompt_cache_ranged(llama_context * ctx_tgt, llama_context * ctx_dft, const server_tokens & tokens, size_t n_block) {
+// n_tokens: only the first tokens (e.g. those of a root), all if larger
+static bool prompt_cache_ranged(llama_context * ctx_tgt, llama_context * ctx_dft, const server_tokens & tokens, size_t n_block, size_t n_tokens = SIZE_MAX) {
     if (n_block == 0 || !llama_state_seq_range_supported(ctx_tgt) || (ctx_dft && !llama_state_seq_range_supported(ctx_dft))) {
         return false;
     }
 
-    for (size_t i = 0; i < tokens.size(); ++i) {
+    for (size_t i = 0; i < std::min(tokens.size(), n_tokens); ++i) {
         if (tokens[i] == LLAMA_TOKEN_NULL) {
             return false;
         }
@@ -2001,10 +2002,116 @@ size_t server_prompt_cache::copy_size(const server_prompt & prompt, llama_contex
     return res;
 }
 
+size_t server_prompt_cache::n_usable(const server_prompt & prompt, size_t lcp) const {
+    if (!rolls_back_to_checkpoints || lcp >= prompt.tokens.size()) {
+        return lcp;
+    }
+    size_t res = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (ckpt.n_tokens >= 0 && (size_t) ckpt.n_tokens <= lcp) {
+            res = std::max(res, (size_t) ckpt.n_tokens);
+        }
+    }
+    return res;
+}
+
+void server_prompt_cache::save_root(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    const common_prompt_checkpoint * root = nullptr;
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (ckpt.root) {
+            root = &ckpt;
+            break;
+        }
+    }
+    if (root == nullptr || root->n_tokens <= 0 || (size_t) root->n_tokens > prompt.tokens.size() || root->data_tgt.empty() ||
+            (ctx_dft && root->data_dft.empty())) {
+        return;
+    }
+
+    const size_t n_root = root->n_tokens;
+
+    // a whole state cannot be cut at the root
+    if (!prompt_cache_ranged(ctx_tgt, ctx_dft, prompt.tokens, n_block, n_root)) {
+        return;
+    }
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->root && it->prompt.tokens.size() == n_root && it->prompt.tokens.get_common_prefix(prompt.tokens) == n_root) {
+            // the most recently used one
+            states.splice(states.end(), states, it);
+            return;
+        }
+    }
+
+    server_prompt_cache_state state;
+    state.root          = true;
+    state.prompt.tokens = prompt.tokens.clone();
+    state.prompt.tokens.keep_first(n_root);
+    state.data.ranged   = true;
+
+    try {
+        const size_t n_full = n_root / n_block * n_block;
+
+        // the blocks of the conversation up to the root, shared with it
+        server_kv_key key;
+        for (size_t i0 = 0; i0 < n_full; i0 += n_block) {
+            key = block_key(key, prompt.tokens, i0, i0 + n_block);
+
+            server_kv_block_ptr block = find_block(key);
+            if (!block) {
+                auto block_new = std::make_shared<server_kv_block>();
+
+                block_new->key     = key;
+                block_new->n_begin = i0;
+                block_new->n_end   = i0 + n_block;
+                block_new->tgt     = state_range(ctx_tgt, id_slot, i0, i0 + n_block);
+                if (ctx_dft) {
+                    block_new->dft = state_range(ctx_dft, id_slot, i0, i0 + n_block);
+                }
+
+                blocks_ram[key] = block_new;
+                block = std::move(block_new);
+            }
+
+            state.data.blocks.push_back(std::move(block));
+        }
+
+        if (n_root > n_full) {
+            state.data.tail_tgt = state_range(ctx_tgt, id_slot, n_full, n_root);
+            if (ctx_dft) {
+                state.data.tail_dft = state_range(ctx_dft, id_slot, n_full, n_root);
+            }
+        }
+
+        // the recurrent state at the root, shared with the checkpoint
+        state.data.part_tgt = root->data_tgt;
+        state.data.part_dft = root->data_dft;
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to copy the root prompt: %s\n", e.what());
+        return;
+    }
+
+    if (limit_size > 0) {
+        if (state.size() > limit_size) {
+            return;
+        }
+        while (!states.empty() && size_with(&state) > limit_size) {
+            evict_oldest();
+        }
+    }
+
+    SRV_INF(" - saving the system prompt of %zu tokens as a root prompt, shared by its conversations\n", n_root);
+
+    states.push_back(std::move(state));
+}
+
 bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     if (prompt.tokens.size() == 0) {
         return false;
     }
+
+    // --checkpoint-root: its system prompt as a state of its own
+    save_root(prompt, ctx_tgt, ctx_dft, id_slot);
 
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -2038,11 +2145,12 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
         return false;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
+    // remove any cached prompts that are fully contained in the current prompt, except the root prompts, which are
+    // shared by other conversations
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (!it->root && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -2068,7 +2176,26 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
 
     states.push_back(std::move(state));
 
+    // the root behind the conversation in the LRU order: the conversation goes first, the root serves the others
+    touch_root(prompt);
+
     return true;
+}
+
+void server_prompt_cache::touch_root(const server_prompt & prompt) {
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (!ckpt.root || ckpt.n_tokens <= 0) {
+            continue;
+        }
+        const size_t n_root = ckpt.n_tokens;
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->root && it->prompt.tokens.size() == n_root && it->prompt.tokens.get_common_prefix(prompt.tokens) == n_root) {
+                states.splice(states.end(), states, it);
+                return;
+            }
+        }
+        return;
+    }
 }
 
 // restore the KV ranges and the partial state of a ranged prompt state, in position order
@@ -2218,9 +2345,9 @@ size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t 
     size_t lcp_best = lcp_base;
 
     for (const auto & state : states) {
-        const size_t lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
+        const size_t lcp_cur = n_usable(state.prompt, state.prompt.tokens.get_common_prefix(tokens_new));
 
-        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, state.prompt.tokens.size(), lcp_base, true)) {
+        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, state.prompt.tokens.size(), lcp_base, !state.root)) {
             lcp_best = lcp_cur;
         }
     }
@@ -2233,7 +2360,8 @@ size_t server_prompt_cache::n_lcp_best(const server_tokens & tokens_new, size_t 
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const size_t lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+    // the prefixes compared are the ones a state restores (n_usable()): a hybrid model rolls back to a checkpoint
+    const size_t lcp_base = n_usable(prompt, prompt.tokens.get_common_prefix(tokens_new));
 
     size_t lcp_best = lcp_base;
 
@@ -2243,12 +2371,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the cached prompt that shares the longest prefix with the new prompt
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const size_t lcp_cur = n_usable(it->prompt, it->prompt.tokens.get_common_prefix(tokens_new));
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur,
                 float(lcp_cur) / it->prompt.tokens.size(), float(lcp_cur) / tokens_new.size());
 
-        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, it->prompt.tokens.size(), lcp_base, true)) {
+        // a root prompt is restored by copy, nothing of it is lost
+        if (lcp_cur > lcp_best && prompt_cache_better(lcp_cur, it->prompt.tokens.size(), lcp_base, !it->root)) {
             lcp_best = lcp_cur;
             it_best  = it;
         }
@@ -2286,6 +2415,33 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n",
                 float(lcp_best) / it_best->prompt.tokens.size(), float(lcp_best) / tokens_new.size());
 
+        if (it_best->root) {
+            // a copy: the root stays for the other conversations, and the slot keeps it as its first checkpoint
+            server_prompt_cache_state copy;
+            copy.prompt = it_best->prompt.clone();
+            copy.data   = it_best->data;
+
+            if (!prompt_cache_restore(copy, prompt, ctx_tgt, ctx_dft, id_slot)) {
+                return false;
+            }
+
+            common_prompt_checkpoint ckpt;
+            ckpt.n_tokens = prompt.n_tokens();
+            ckpt.id_task  = COMMON_CHECKPOINT_FROM_CACHE; // kept by create_checkpoint() instead of copied again
+            ckpt.root     = true;
+            ckpt.pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
+            ckpt.pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot);
+            ckpt.data_tgt = it_best->data.part_tgt;
+            ckpt.data_dft = it_best->data.part_dft;
+            prompt.checkpoints.push_front(std::move(ckpt));
+
+            SRV_INF(" - restored the root prompt of %d tokens\n", prompt.n_tokens());
+
+            states.splice(states.end(), states, it_best);
+
+            return true;
+        }
+
         if (!prompt_cache_restore(*it_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
@@ -2299,6 +2455,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::evict_oldest() {
     GGML_ASSERT(!states.empty());
 
+    // least recently used first, also a root prompt: one that its conversations use is moved to the back when they are
+    // saved or when it is loaded (save_root(), load())
     if (disk) {
         disk->put(std::move(states.front()).at_checkpoint());
     }

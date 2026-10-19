@@ -72,6 +72,7 @@ class ServerProcess:
     n_ubatch: int | None = None
     prefill_budget: int | None = None
     concurrent_prefill: bool = False
+    kv_unified_gather: bool = False
     cache_reuse: int | None = None
     n_ctx: int | None = None
     n_ga: int | None = None
@@ -123,6 +124,11 @@ class ServerProcess:
     cache_disk: str | None = None
     cache_disk_size: int | None = None
     cache_block_size: int | None = None
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    checkpoint_root: int | None = None
+    checkpoint_spread: bool = False
+    cache_save_min: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -203,6 +209,8 @@ class ServerProcess:
             server_args.extend(["--prefill-budget", self.prefill_budget])
         if self.concurrent_prefill:
             server_args.append("--concurrent-prefill")
+        if self.kv_unified_gather:
+            server_args.append("--kv-unified-gather")
         if self.cache_reuse is not None:
             server_args.extend(["--cache-reuse", self.cache_reuse])
         if self.n_threads:
@@ -307,6 +315,16 @@ class ServerProcess:
             server_args.extend(["--cache-disk-size", self.cache_disk_size])
         if self.cache_block_size is not None:
             server_args.extend(["--cache-block-size", self.cache_block_size])
+        if self.ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
+        if self.checkpoint_root is not None:
+            server_args.extend(["--checkpoint-root", self.checkpoint_root])
+        if self.checkpoint_spread:
+            server_args.append("--checkpoint-spread")
+        if self.cache_save_min is not None:
+            server_args.extend(["--cache-save-min", self.cache_save_min])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

@@ -519,6 +519,8 @@ struct common_params {
     bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next
     bool phase_aware_workspace    = false; // size the compute buffers for prompt or generation, share them with the MTP draft
     bool live_context_workspace   = false; // size the attention compute buffers by the used part of the KV cache
+    bool kv_unified_gather        = false; // attention reads only the cells of the ubatch's sequences (unified KV)
+    bool compact_attn_mask        = false; // causal masks built on the device from one bound per token
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
@@ -656,6 +658,9 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_root     = 0;     // keep a checkpoint at the end of a system prompt of at least this many tokens (0 = off)
+    bool    checkpoint_spread   = false; // evict the checkpoint that leaves the smallest gap for its distance from the end
+    int32_t cache_save_min      = 0;     // save a slot's prompt before another one takes the slot if it loses this many tokens (0 = only more than half)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
     int32_t cache_disk_mib      = 32768; // size limit of the disk level of the prompt cache, -1 = no limit, 0 = disable
@@ -1331,11 +1336,18 @@ private:
     std::shared_ptr<storage> buf;
 };
 
+// common_prompt_checkpoint::id_task of a checkpoint that the prompt cache restored together with the slot's state
+#define COMMON_CHECKPOINT_FROM_CACHE -2
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
-    // (optional) id of the task that created the checkpoint
+    // (optional) id of the task that created the checkpoint; -1: none (e.g. restored from a slot file, not guaranteed
+    // to load), COMMON_CHECKPOINT_FROM_CACHE: restored from the prompt cache with the state of the slot
     int id_task = -1;
+
+    // at the end of the system prompt, kept for good (--checkpoint-root)
+    bool root = false;
 
     llama_pos pos_min;
     llama_pos pos_max;

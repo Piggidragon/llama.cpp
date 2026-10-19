@@ -537,7 +537,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         const std::vector<float> & attn_split = {}, const bool split_overlap = false,
-        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false) {
+        const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false,
+        const bool compact_mask = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -562,6 +563,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     // the compute buffers follow the batches: prompt and generation sizes, the KV extent
     ctx_params.phase_aware_workspace  = workspace;
     ctx_params.live_context_workspace = workspace;
+    // causal masks built on the device from one column range per token
+    ctx_params.compact_attn_mask = compact_mask;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -745,11 +748,13 @@ static bool check_seq_cells(llama_model * model, const std::vector<llama_token> 
     return ok;
 }
 
-// recurrent and hybrid memory: scripts of multi-sequence batches, seq_rm and seq_cp, with unified and per-sequence KV;
-// each sequence's last logits and one more token must match a fresh single-sequence context with the same history.
-// The cell of a sequence that is new in a ubatch was taken twice once (by a later sequence of the same ubatch).
-static bool check_seq_scripts(llama_model * model, std::string & status) {
-    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+// scripts of multi-sequence batches, seq_rm and seq_cp, with unified and per-sequence KV; each sequence's last logits and
+// one more token must match a fresh single-sequence context with the same history. Recurrent and hybrid memory: the cell
+// of a sequence that is new in a ubatch was taken twice once (by a later sequence of the same ubatch). All models: the
+// lists of cells of a unified KV cache (--kv-unified-gather), also of cells that seq_cp shares (all_models: the device
+// configuration of a single device, the lists do not depend on the split, and the scripts take many contexts).
+static bool check_seq_scripts(llama_model * model, std::string & status, bool all_models) {
+    if (!all_models && !llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         return true;
     }
 
@@ -762,6 +767,10 @@ static bool check_seq_scripts(llama_model * model, std::string & status) {
         ctx_params.n_batch    = 64;
         ctx_params.n_ubatch   = 64;
         ctx_params.kv_unified = unified;
+        // the single-sequence references take the compact masks, the scripts of several sequences in a unified cache the
+        // lists of their cells (--kv-unified-gather) or the dense masks: each checks the other
+        ctx_params.compact_attn_mask = true;
+        ctx_params.kv_unified_gather = true;
         ctx_params.n_threads  = 4;
         ctx_params.n_threads_batch = 4;
         llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
@@ -889,6 +898,85 @@ static bool check_seq_scripts(llama_model * model, std::string & status) {
 
     if (!ok) {
         status = "\033[1;31mFAIL\033[0m";
+    }
+    return ok;
+}
+
+// --kv-unified-gather and graph reuse: sequence 1 holds 200 cells, sequence 0 decodes one token per ubatch after them,
+// past the n_kv of 256, while its list stays at 256 rows (the positions stay within the training context of 256). A reused graph keeps the K/V views of the n_kv it was built
+// for, and CUDA converts a K/V cache it does not read in place (BF16 here) to F16 over those views only: the last
+// logits of sequence 0 must match a fresh context with its history.
+static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
+    if (llama_model_is_recurrent(model)) {
+        return true;
+    }
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto make_ctx = [&](uint32_t n_seq, bool unified) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx             = 1024;
+        ctx_params.n_seq_max         = n_seq;
+        ctx_params.n_batch           = 512;
+        ctx_params.n_ubatch          = 512;
+        ctx_params.kv_unified        = unified;
+        ctx_params.kv_unified_gather = true;
+        ctx_params.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.type_k            = GGML_TYPE_BF16;
+        ctx_params.type_v            = GGML_TYPE_BF16;
+        ctx_params.n_threads         = 4;
+        ctx_params.n_threads_batch   = 4;
+        return llama_context_ptr(llama_init_from_model(model, ctx_params));
+    };
+
+    llama_context_ptr ctx = make_ctx(2, true);
+    if (!ctx) {
+        throw std::runtime_error("failed to create the context of the list reuse check");
+    }
+    if (!llama_get_kv_unified_gather(ctx.get())) {
+        return true; // the model or the devices do not read through a list
+    }
+
+    uint32_t rng = 4321;
+    auto tok = [&]() {
+        rng = rng*1103515245u + 12345u;
+        return (llama_token) (1 + (rng >> 8) % (n_vocab - 2));
+    };
+
+    std::vector<llama_token> hist;
+    {
+        common_batch batch(ctx.get());
+        for (int i = 0; i < 200; i++) {
+            batch.add(tok(), i, 1, i + 1 == 200);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode sequence 1");
+        }
+    }
+    for (int i = 0; i < 100; i++) {
+        common_batch batch(ctx.get());
+        hist.push_back(tok());
+        batch.add(hist.back(), i, 0, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode sequence 0");
+        }
+    }
+    const float * logits = llama_get_logits_ith(ctx.get(), -1);
+    const std::vector<float> last(logits, logits + n_vocab);
+
+    llama_context_ptr ref = make_ctx(1, false);
+    common_batch batch(ref.get());
+    for (size_t i = 0; i < hist.size(); i++) {
+        batch.add(hist[i], i, 0, i + 1 == hist.size());
+    }
+    if (llama_process(ref.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode the reference of the list reuse check");
+    }
+    logits = llama_get_logits_ith(ref.get(), -1);
+
+    const bool ok = nmse(std::vector<float>(logits, logits + n_vocab), last) < 1e-4;
+    if (!ok) {
+        status = "\033[1;31mFAIL\033[0m (list reuse)";
     }
     return ok;
 }
@@ -1208,12 +1296,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         bool                            split_overlap;
         llama_allreduce_type            allreduce_type;
         bool                            workspace;    // phase-aware and live-context workspace
+        bool                            compact_mask; // --compact-attn-mask
 
         device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0,
                 std::vector<float> attn_split = {}, bool split_overlap = false, llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT,
-                bool workspace = false)
+                bool workspace = false, bool compact_mask = false)
             : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size),
-              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type), workspace(workspace) {}
+              attn_split(std::move(attn_split)), split_overlap(split_overlap), allreduce_type(allreduce_type), workspace(workspace),
+              compact_mask(compact_mask) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -1233,6 +1323,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     continue;
                 }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+                // the causal masks from one column range per token
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, std::string(ggml_backend_dev_description(dev)) + " -cam",
+                        LLAMA_SPLIT_MODE_LAYER, false, 0, std::vector<float>{}, false, LLAMA_ALLREDUCE_TYPE_DEFAULT, false, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
@@ -1277,6 +1372,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 dev_configs.emplace_back(devices_meta, "Meta -so -paw -lcw", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, true,
                         LLAMA_ALLREDUCE_TYPE_DEFAULT, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+                // the causal masks from one column range per token, built on each device
+                dev_configs.emplace_back(devices_meta, "Meta -cam", LLAMA_SPLIT_MODE_TENSOR, false, 0, std::vector<float>{}, false,
+                        LLAMA_ALLREDUCE_TYPE_DEFAULT, false, true);
             }
         }
 
@@ -1383,7 +1482,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type, dc.workspace);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type, dc.workspace, dc.compact_mask);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1438,7 +1537,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         // allocation of main (Piggidragon/llama.cpp#30)
                         const bool seq_scripts_known_bad = arch == LLM_ARCH_MINIMAX_01 &&
                             ggml_backend_dev_type(dc.devs[0]) != GGML_BACKEND_DEVICE_TYPE_CPU;
-                        if (!encode && !seq_scripts_known_bad && !check_seq_scripts(model_and_ctx_dev.first.get(), status_range)) {
+                        const bool dc_plain = dc.devs.size() == 1 && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR && !dc.host_experts &&
+                            dc.moe_cache_size == 0 && dc.attn_split.empty() && !dc.split_overlap && !dc.workspace && !dc.compact_mask;
+                        if (!encode && !seq_scripts_known_bad && !check_seq_scripts(model_and_ctx_dev.first.get(), status_range, dc_plain)) {
+                            test_ok = false;
+                        }
+                        if (!encode && !check_kv_rows_reuse(model_and_ctx_dev.first.get(), status_range)) {
                             test_ok = false;
                         }
 
