@@ -840,6 +840,11 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    // llama_context_params::draft_vocab: the draft head (MTP) projects onto head_draft instead of head_src (the output
+    // head), see build_lora_mm()
+    const ggml_tensor * head_src   = nullptr;
+    ggml_tensor *       head_draft = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -927,6 +932,7 @@ struct llm_graph_params {
         }
 
         return
+            head_draft                      == other.head_draft                      &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -1092,6 +1098,10 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+
+    // see llm_graph_params::head_src
+    const ggml_tensor * head_src;
+    ggml_tensor *       head_draft;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

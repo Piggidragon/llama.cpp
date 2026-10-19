@@ -337,6 +337,13 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    // --spec-draft-vocab: the tokens the MTP draft head projects onto (llama_model_params::draft_vocab), empty for all
+    std::vector<llama_token> vocab;
+
+    // --spec-draft-vocab-max-miss: draft over the whole vocabulary while more than this share of the last tokens of a
+    // sequence is outside the list (back below half of it)
+    float vocab_max_miss = 0.10f;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

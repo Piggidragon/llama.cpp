@@ -253,6 +253,11 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
+
+    cparams.draft_vocab = params.draft_vocab && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.output_draft != nullptr;
+    if (params.draft_vocab && !cparams.draft_vocab) {
+        LLAMA_LOG_WARN("%s: draft_vocab needs an MTP context of a model loaded with a draft vocabulary, it is not used\n", __func__);
+    }
     cparams.pooling_type      = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -1614,6 +1619,10 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
 float * llama_context::get_sampled_logits_ith(int32_t idx) {
     output_reorder();
 
+    if (logits_subset) {
+        return get_logits_ith(idx);
+    }
+
     if (!sampling.logits.has_data()) {
         return nullptr;
     }
@@ -1633,6 +1642,10 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
 const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
     output_reorder();
 
+    if (logits_subset) {
+        return model.draft_vocab.data();
+    }
+
     try {
         const int64_t row = output_resolve_row(idx);
         if (sampling.candidates.has_data() &&
@@ -1650,6 +1663,10 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
 
 size_t llama_context::get_sampled_candidates_count(int32_t idx) {
     output_reorder();
+
+    if (logits_subset) {
+        return model.draft_vocab.size();
+    }
 
     if (!sampling.candidates.has_data()) {
         return 0;
@@ -1669,6 +1686,10 @@ size_t llama_context::get_sampled_candidates_count(int32_t idx) {
 
 size_t llama_context::get_sampled_logits_count(int32_t idx) {
     output_reorder();
+
+    if (logits_subset) {
+        return model.draft_vocab.size();
+    }
 
     if (!sampling.logits.has_data()) {
         return model.vocab.n_tokens();
@@ -1784,6 +1805,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_draft_vocab(bool value) {
+    // the graphs compare their head (llm_graph_params::head_draft), a switch builds a new one
+    draft_vocab_on = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1820,6 +1846,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+
+    // the draft vocabulary reports its logits as candidates already, see logits_subset
+    if (sampler && cparams.draft_vocab) {
+        LLAMA_LOG_DEBUG("%s: backend sampling is not used with draft_vocab; using CPU\n", __func__);
+        return false;
+    }
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
@@ -2530,7 +2562,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const int64_t n_cols = t_logits->ne[0];
+                if (n_cols == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // the draft head (llama_context_params::draft_vocab): its rows at the stride of the vocabulary
+                    GGML_ASSERT(cparams.draft_vocab && n_cols == (int64_t) model.draft_vocab.size());
+                    for (int64_t r = 0; r < n_outputs; ++r) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + r*n_vocab, r*t_logits->nb[1], n_cols*sizeof(float));
+                    }
+                }
+                logits_subset = n_cols != n_vocab;
             }
         }
 
@@ -3127,7 +3169,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // with a draft vocabulary, reserve for the whole head: llama_set_draft_vocab() can switch to it, the larger logits
+    const bool draft_vocab_on_saved = draft_vocab_on;
+    draft_vocab_on = false;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    draft_vocab_on = draft_vocab_on_saved;
 
     res->reset();
 
@@ -3178,6 +3224,8 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.head_src    =*/ cparams.draft_vocab && draft_vocab_on ? model.output       : nullptr,
+        /*.head_draft  =*/ cparams.draft_vocab && draft_vocab_on ? model.output_draft : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4696,6 +4744,7 @@ llama_context_params llama_context_default_params() {
         /*.split_overlap               =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
+        /*.draft_vocab                 =*/ false,
         /*.kv_unified_gather           =*/ false,
         /*.compact_attn_mask           =*/ false,
         /*.sampler                     =*/ nullptr,
@@ -4914,6 +4963,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_draft_vocab(llama_context * ctx, bool enabled) {
+    ctx->set_draft_vocab(enabled);
 }
 
 bool llama_get_kv_unified_gather(const llama_context * ctx) {

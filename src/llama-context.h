@@ -137,6 +137,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_draft_vocab(bool value);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -452,6 +453,13 @@ private:
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
+
+    // the logits of the last decode are over model.draft_vocab (llama_context_params::draft_vocab), a row of that
+    // many values per output at the stride of the vocabulary; the sampled-candidates API reports them
+    bool logits_subset = false;
+
+    // llama_set_draft_vocab(): the draft head is in use (with cparams.draft_vocab)
+    bool draft_vocab_on = true;
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

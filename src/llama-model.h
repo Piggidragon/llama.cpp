@@ -660,7 +660,8 @@ struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
 
-    bool apply(ggml_tensor * res) const;
+    // key: the weight the policy is registered for, if res reads another one (e.g. a draft head made of its rows)
+    bool apply(ggml_tensor * res, const ggml_tensor * key = nullptr) const;
 
     void load(llama_model_loader & ml, const llama_model & model);
 };
@@ -734,6 +735,10 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
+
+    // llama_model_params::draft_vocab: the rows of the output head for these tokens (sorted ids), see load_draft_head()
+    struct ggml_tensor *     output_draft = nullptr;
+    std::vector<llama_token> draft_vocab;
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
@@ -935,6 +940,9 @@ struct llama_model_base : public llama_model {
     const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
+
+    // see llama_model::output_draft
+    void load_draft_head(llama_model_loader & ml);
     virtual ~llama_model_base() = default;
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);

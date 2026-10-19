@@ -515,17 +515,32 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
-struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+// the candidates of the last sample: cur holds n_vocab entries, of which only those that cur_p still lists (e.g. the
+// top-k) are copied; the next sample fills cur again
+static void common_sampler_copy_candidates(const common_sampler * src, common_sampler * dst) {
+    dst->cur_p = src->cur_p;
+    if (src->cur_p.data != nullptr && src->cur_p.data == src->cur.data()) {
+        dst->cur.assign(src->cur.begin(), src->cur.begin() + std::min(src->cur.size(), src->cur_p.size));
+        dst->cur_p.data = dst->cur.data();
+    } else {
+        dst->cur        = src->cur;
+        dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr;
+    }
+}
+
+struct common_sampler * common_sampler_clone(const common_sampler * gsmpl) {
+    auto * res = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ {},
+        /* .cur_p   = */ {},
         /* .rng     = */ gsmpl->rng,
     };
+    common_sampler_copy_candidates(gsmpl, res);
+    return res;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -542,9 +557,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    common_sampler_copy_candidates(src, dst);
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }

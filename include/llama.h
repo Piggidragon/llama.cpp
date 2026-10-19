@@ -363,6 +363,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // token ids of a subset of the vocabulary: a copy of their rows of the output head is made at load, and a
+        // context with llama_context_params::draft_vocab drafts (MTP) over these tokens only; NULL for none
+        const llama_token * draft_vocab;
+        uint32_t            n_draft_vocab;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -444,6 +449,10 @@ extern "C" {
                                        // computes in the buffers of its target
         bool live_context_workspace;   // size the attention part of the compute buffers by the used part of the KV
                                        // cache (power-of-two steps from 1/8 of it) instead of its full size
+        bool draft_vocab;              // the draft head (MTP) of this context projects onto the model's draft
+                                       // vocabulary only (llama_model_params::draft_vocab): its logits have
+                                       // llama_get_sampled_logits_count_ith() entries, for the tokens of
+                                       // llama_get_sampled_candidates_ith()
         bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a
                                        // ubatch reads only the cells of the ubatch's sequences (CUDA, where a gather
                                        // kernel exists), not every used cell
@@ -651,6 +660,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+
+    // the number of tokens of the draft head (llama_model_params::draft_vocab), 0 if the model has none
+    LLAMA_API uint32_t llama_model_n_draft_vocab(const struct llama_model * model);
+
+    // the token ids of the draft head, sorted, llama_model_n_draft_vocab() of them; NULL if the model has none
+    LLAMA_API const llama_token * llama_model_draft_vocab(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -1197,6 +1212,9 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // An MTP context created with llama_context_params::draft_vocab drafts over the draft vocabulary (true, the
+    // default) or over the whole vocabulary (false), e.g. while the text leaves the list
+    LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, bool enabled);
     // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
     // (llama_context_params::kv_unified_gather, if the devices and the model support it)
     LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);
