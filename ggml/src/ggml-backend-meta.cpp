@@ -442,6 +442,9 @@ struct ggml_backend_meta_buffer_context {
     // an alias shares the simple buffers of another meta buffer and does not free them
     bool owns_bufs = true;
 
+    // the simple tensors of ggml_backend_meta_tensor_init_row_views, views into the slices of other static tensors
+    ggml_context_ptr ctx_row_views;
+
     int debug;
 
     ggml_backend_meta_buffer_context(
@@ -1249,7 +1252,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
+                // the dimensions outside the split one; with one element along the split dimension the next one has the
+                // same stride, and a slice without elements would keep it (and read past its end)
+                if (tensor->nb[i] > tensor->nb[split_dim] || (i > split_dim && tensor->nb[i] == tensor->nb[split_dim])) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
@@ -2086,7 +2091,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         // TODO other simple backend may be better
         ggml_backend_tensor_get_async(
@@ -2756,6 +2760,69 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
 };
+
+size_t ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev) {
+    return ggml_backend_dev_is_meta(dev) ? ggml_backend_meta_dev_n_devs(dev) : 0;
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_simple(ggml_backend_dev_t dev, size_t i) {
+    return ggml_backend_meta_dev_simple_dev(dev, i);
+}
+
+size_t ggml_backend_meta_tensor_n_slices(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    return ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+}
+
+struct ggml_tensor * ggml_backend_meta_tensor_slice(const struct ggml_tensor * tensor, size_t j) {
+    if (j >= ggml_backend_meta_tensor_n_slices(tensor)) {
+        return nullptr;
+    }
+    return ggml_backend_meta_buffer_simple_tensor(tensor, j);
+}
+
+void ggml_backend_meta_tensor_init_row_views(struct ggml_tensor * src, struct ggml_tensor * dst, const int64_t * rows) {
+    GGML_ASSERT(ggml_backend_meta_tensor_n_slices(src) > 0);
+    GGML_ASSERT(dst->type == src->type && dst->ne[0] == src->ne[0] && dst->ne[2] == 1 && dst->ne[3] == 1);
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) src->buffer->context;
+    auto it = buf_ctx->stc_static.simple_tensors.find(src);
+    GGML_ASSERT(it != buf_ctx->stc_static.simple_tensors.end() && "src must be a static tensor of its meta buffer");
+
+    const size_t n_bufs = buf_ctx->bufs.size();
+    if (!buf_ctx->ctx_row_views) {
+        const ggml_init_params params = {
+            /*.mem_size   =*/ 64*GGML_BACKEND_META_MAX_DEVICES*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        buf_ctx->ctx_row_views.reset(ggml_init(params));
+    }
+
+    int64_t n_rows = 0;
+    std::vector<ggml_tensor *> simple_tensors(n_bufs);
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_tensor * s_j = it->second[j];
+        GGML_ASSERT(rows[j] >= 0 && rows[j] <= s_j->ne[1]);
+        ggml_tensor * v = ggml_view_2d(buf_ctx->ctx_row_views.get(), s_j, s_j->ne[0], rows[j], s_j->nb[1], 0);
+        ggml_set_name(v, dst->name);
+        v->flags = s_j->flags;
+        if (rows[j] > 0) {
+            GGML_ASSERT(ggml_backend_view_init(v) == GGML_STATUS_SUCCESS);
+        } else {
+            v->buffer = s_j->buffer;
+            v->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        }
+        simple_tensors[j] = v;
+        n_rows += rows[j];
+    }
+    GGML_ASSERT(n_rows == dst->ne[1]);
+
+    dst->buffer = src->buffer;
+    dst->data   = src->data;
+    buf_ctx->stc_static.simple_tensors[dst] = simple_tensors;
+}
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;

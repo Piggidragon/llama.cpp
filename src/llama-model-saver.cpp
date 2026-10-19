@@ -471,6 +471,8 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
+    // the rows of the output head are reordered for the draft head of --spec-draft-vocab (see load_draft_head)
+    GGML_ASSERT(model->output_row_of_token.empty() && "a model loaded with a draft vocabulary cannot be saved");
     if (model->output != nullptr &&
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output

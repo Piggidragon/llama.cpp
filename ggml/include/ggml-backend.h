@@ -460,6 +460,20 @@ extern "C" {
     // ggml_backend_set_stream_priority() of the simple backends and the AllReduce of a meta backend
     GGML_API bool ggml_backend_meta_set_stream_priority(ggml_backend_t meta_backend, bool high);
 
+    // the simple devices of a meta device: their number (0 if dev is not a meta device) and device i
+    GGML_API size_t             ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple  (ggml_backend_dev_t dev, size_t i);
+
+    // the slices of a tensor allocated in a meta buffer (e.g. a weight split by rows): their number (0 if the tensor is
+    // not in a meta buffer) and the tensor of slice j on its device
+    GGML_API size_t               ggml_backend_meta_tensor_n_slices(const struct ggml_tensor * tensor);
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_slice   (const struct ggml_tensor * tensor, size_t j);
+
+    // make dst a weight of src's meta buffer whose slice j is a view of the first rows[j] rows (ne[1]) of src's slice j,
+    // without memory of its own: dst has src's type and ne[0], ne[1] = the sum of rows, and the split state callback of
+    // the meta device must report it split along axis 1 by rows; it stays valid while src's buffer exists
+    GGML_API void ggml_backend_meta_tensor_init_row_views(struct ggml_tensor * src, struct ggml_tensor * dst, const int64_t * rows);
+
     // ggml_backend_set_stream_priority_t of the backend (of all simple backends of a meta backend), false if it has none
     GGML_API bool ggml_backend_set_stream_priority(ggml_backend_t backend, bool high);
 

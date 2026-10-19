@@ -254,9 +254,9 @@ llama_context::llama_context(
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
 
-    cparams.draft_vocab = params.draft_vocab && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.output_draft != nullptr;
+    cparams.draft_vocab = params.draft_vocab && model.output_draft != nullptr;
     if (params.draft_vocab && !cparams.draft_vocab) {
-        LLAMA_LOG_WARN("%s: draft_vocab needs an MTP context of a model loaded with a draft vocabulary, it is not used\n", __func__);
+        LLAMA_LOG_WARN("%s: draft_vocab needs a model loaded with a draft vocabulary, it is not used\n", __func__);
     }
     cparams.pooling_type      = params.pooling_type;
 
@@ -1444,7 +1444,32 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (logits_permuted) {
+        return logits_ordered_all();
+    }
+
     return logits.data;
+}
+
+// the logits of the last decode in token order (see logits_permuted), all rows at once: a row of the logits API is
+// followed by the next ones, as in the logits buffer
+float * llama_context::logits_ordered_all() {
+    if (!logits_ordered_done) {
+        const auto & row_of = model.output_row_of_token;
+        const int64_t n_vocab = (int64_t) row_of.size();
+        if (logits_ordered.size() < (size_t) n_outputs*n_vocab) {
+            logits_ordered.resize((size_t) n_outputs*n_vocab); // grows only, no zero fill for every decode
+        }
+        for (int64_t row = 0; row < n_outputs; ++row) {
+            const float * src = logits.data + row*n_vocab;
+            float * dst = logits_ordered.data() + row*n_vocab;
+            for (int64_t t = 0; t < n_vocab; ++t) {
+                dst[t] = src[row_of[t]];
+            }
+        }
+        logits_ordered_done = true;
+    }
+    return logits_ordered.data();
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1485,6 +1510,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if (logits_permuted) {
+            return logits_ordered_all() + j*model.vocab.n_tokens();
+        }
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1847,6 +1875,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    // the device's logits of an output head with reordered rows are not in token order (see logits_permuted)
+    if (sampler && !model.output_row_of_token.empty()) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: backend sampling is not used with the draft head of --spec-draft-vocab; using CPU\n", __func__);
+            warned = true;
+        }
+        return false;
+    }
+
     // the draft vocabulary reports its logits as candidates already, see logits_subset
     if (sampler && cparams.draft_vocab) {
         LLAMA_LOG_DEBUG("%s: backend sampling is not used with draft_vocab; using CPU\n", __func__);
@@ -2139,6 +2177,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        logits_permuted = !model.output_row_of_token.empty();
     }
 
     // extract embeddings
@@ -2568,6 +2607,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const int64_t n_cols = t_logits->ne[0];
                 if (n_cols == n_vocab) {
                     ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                    logits_permuted = !model.output_row_of_token.empty();
                 } else {
                     // the draft head (llama_context_params::draft_vocab): its rows at the stride of the vocabulary
                     GGML_ASSERT(cparams.draft_vocab && n_cols == (int64_t) model.draft_vocab.size());
@@ -2746,6 +2786,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    // the logits of the new outputs
+    logits_permuted     = false;
+    logits_ordered_done = false;
+
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
