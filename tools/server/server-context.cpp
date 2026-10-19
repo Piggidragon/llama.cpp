@@ -988,6 +988,7 @@ private:
     llama_context_ptr  ctx_bg;
     server_batch       batch_bg;
     server_slot *      bg_slot = nullptr;
+    bool               spec_step_bg = false; // a background ubatch computed alongside the current batch
     std::thread        bg_waiter;          // synchronizes ctx_bg, nothing else
     std::atomic<bool>  bg_done{false};
     int64_t            t_bg_submit = 0;
@@ -3838,6 +3839,9 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // --spec-select: a prompt ubatch of the background context computes alongside this batch
+        spec_step_bg = bg_slot != nullptr;
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -5209,6 +5213,11 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // --spec-select learns the draft's outcome here, before a restore (the replay reports one more)
+                if (!slot.spec_is_replay) {
+                    common_speculative_verified(spec.get(), slot.id, accepted.size() - 1, batch.size(), !spec_step_bg);
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

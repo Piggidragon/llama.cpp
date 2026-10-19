@@ -2401,6 +2401,12 @@ struct common_speculative_selector {
         int          cand_impl = -1;
         llama_tokens cand;
 
+        // the draft of this step was cut by the choice and accepted up to the cut: its drafter is not told the outcome as
+        // its own (it would read a draft cut to k and fully accepted as one of its length with k accepted, e.g. ngram-mod
+        // as a low acceptance, ngram-map as the key's new draft length), see common_speculative_accept
+        bool cut      = false;
+        bool cut_full = false;
+
         // a draft that was not used, or the part of a used draft after its truncation: compared with the text that
         // follows, to learn its acceptance anyway
         llama_tokens shadow;
@@ -3421,6 +3427,7 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
             impl->n_gen_tokens += result.size();
             st.impl = st.cand_impl;
             st.k    = (int) result.size();
+            st.cut  = result.size() < st.cand.size();
             if (st.shadow_impl == st.cand_impl && st.shadow_from == 0) {
                 st.shadow.clear(); // an unused draft of this drafter: its draft is used now
             }
@@ -3484,6 +3491,8 @@ void common_speculative_draft(common_speculative * spec) {
             }
             st.impl      = -1;
             st.k         = 0;
+            st.cut       = false;
+            st.cut_full  = false;
             st.stepped   = true;
             st.cand_impl = -1;
             st.cand.clear();
@@ -3502,6 +3511,10 @@ void common_speculative_draft(common_speculative * spec) {
         if (sel && is_model && !chosen) {
             common_speculative_select_choose(spec, (int) ii);
             chosen = true;
+            // every sequence took its n-gram draft: no model draft (its time would teach t_model a call without work)
+            if (std::none_of(dparams.begin(), dparams.end(), [](const auto & dp) { return dp.drafting; })) {
+                break;
+            }
         }
 
         {
@@ -3614,7 +3627,7 @@ void common_speculative_draft(common_speculative * spec) {
 
 // --spec-select: account the step of a sequence (its draft, n_accepted of it accepted); the first sequence of a step
 // accounts the step's time
-static void common_speculative_select_step(common_speculative * spec, llama_seq_id seq_id, int n_accepted) {
+static void common_speculative_select_step(common_speculative * spec, llama_seq_id seq_id, int n_accepted, int n_batch, bool clean) {
     auto * sel = spec->select.get();
     auto & st  = sel->seqs[seq_id];
     if (!st.stepped) {
@@ -3625,14 +3638,17 @@ static void common_speculative_select_step(common_speculative * spec, llama_seq_
     if (st.impl >= 0) {
         common_speculative_selector::learn(st, st.impl, std::min(st.k, n_accepted + 1), n_accepted);
     }
+    st.cut_full = st.cut && n_accepted >= st.k;
 
     if (sel->step_open) {
         sel->step_open = false;
         const float t = (float) std::max<int64_t>(0, ggml_time_us() - sel->step_t0 - sel->step_t_draft);
-        SPC_DBG("step: n %d, equal %d, %.0f us (draft %lld us), seq %d accepted %d of %d\n", sel->step_n, (int) sel->step_equal, t,
-                (long long) sel->step_t_draft, seq_id, n_accepted, st.k);
-        // the time per token count is learned from the steps of one pass (see step_time)
-        if (sel->step_equal) {
+        // the time per token count is learned from the steps of one pass (see step_time) whose batch holds the step's
+        // drafts and nothing else: no prompt tokens or replays of other sequences, no prompt computed alongside
+        const bool learn = sel->step_equal && clean && n_batch == sel->step_n;
+        SPC_DBG("step: n %d, equal %d, batch %d, clean %d, %.0f us (draft %lld us), seq %d accepted %d of %d\n", sel->step_n,
+                (int) sel->step_equal, n_batch, (int) clean, t, (long long) sel->step_t_draft, seq_id, n_accepted, st.k);
+        if (learn) {
             const float x = t / common_speculative_selector::f_verify(sel->step_n);
             float & v = sel->t_norm[common_speculative_selector::tbucket(sel->step_n)];
             v = v > 0.0f ? v + common_speculative_selector::ema*(x - v) : x;
@@ -3640,11 +3656,13 @@ static void common_speculative_select_step(common_speculative * spec, llama_seq_
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (spec->select) {
-        common_speculative_select_step(spec, seq_id, n_accepted);
+void common_speculative_verified(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_batch, bool clean) {
+    if (spec != nullptr && spec->select) {
+        common_speculative_select_step(spec, seq_id, n_accepted, n_batch, clean);
     }
+}
 
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3668,7 +3686,15 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(seq_id, n_accepted, false);
+        // --spec-select: a draft cut by the choice and accepted up to the cut does not tell its drafter how its own draft
+        // would have done (see seq_state::cut_full)
+        bool own = true;
+        if (spec->select) {
+            auto & st = spec->select->seqs[seq_id];
+            own = !st.cut_full;
+            st.cut_full = false;
+        }
+        impl->accept(seq_id, n_accepted, !own);
         impl->n_call_accept++;
     }
 
