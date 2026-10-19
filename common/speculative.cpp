@@ -2401,12 +2401,15 @@ struct common_speculative_selector {
         int          cand_impl = -1;
         llama_tokens cand;
 
-        // a draft that was not used: compared with the text that follows, to learn its acceptance anyway
+        // a draft that was not used, or the part of a used draft after its truncation: compared with the text that
+        // follows, to learn its acceptance anyway
         llama_tokens shadow;
         int          shadow_impl = -1;
         size_t       shadow_pos  = 0;               // prompt size when it was drafted (its first token follows id_last)
         llama_token  shadow_last = LLAMA_TOKEN_NULL;
         size_t       shadow_done = 0;               // positions already compared
+        size_t       shadow_from = 0;               // positions before it were verified (the used part of the draft)
+        size_t       shadow_seen = 0;               // positions learned (as the text came)
     };
 
     std::vector<seq_state> seqs;
@@ -2449,13 +2452,16 @@ struct common_speculative_selector {
                type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
     }
 
-    // a draft of impl ii was seen up to n_seen positions, the first n_hit of them accepted
-    static void learn(seq_state & st, int ii, int n_seen, int n_hit) {
-        for (int b = 0; b < NB; ++b) {
-            st.hit[ii][b]   *= decay;
-            st.n_try[ii][b] *= decay;
+    // a draft of impl ii was seen up to n_seen positions, the first n_hit of them accepted; positions before from were
+    // learned already (decay: the first part learned of this draft)
+    static void learn(seq_state & st, int ii, int n_seen, int n_hit, int from = 0, bool decay_now = true) {
+        if (decay_now) {
+            for (int b = 0; b < NB; ++b) {
+                st.hit[ii][b]   *= decay;
+                st.n_try[ii][b] *= decay;
+            }
         }
-        for (int i = 0; i < n_seen; ++i) {
+        for (int i = from; i < n_seen; ++i) {
             st.hit[ii][bucket(i)]   += i < n_hit ? 1.0f : 0.0f;
             st.n_try[ii][bucket(i)] += 1.0f;
         }
@@ -2527,10 +2533,12 @@ struct common_speculative_selector {
             return i < prompt.size() ? prompt[i] : i == prompt.size() ? id_last : LLAMA_TOKEN_NULL;
         };
         bool miss = false;
+        bool more = false; // the text has not passed the draft yet: compared on at the next step
         while (st.shadow_done < st.shadow.size()) {
             const llama_token t = text_at(st.shadow_done);
             if (t == LLAMA_TOKEN_NULL) {
-                return; // not generated yet, compared on
+                more = true;
+                break;
             }
             if (t != st.shadow[st.shadow_done]) {
                 miss = true;
@@ -2538,14 +2546,25 @@ struct common_speculative_selector {
             }
             st.shadow_done++;
         }
-        // the draft as if it had been used: shadow_done positions accepted, the next one (if any) rejected
-        const int n_hit = (int) st.shadow_done;
-        learn(st, st.shadow_impl, miss ? n_hit + 1 : n_hit, n_hit);
-        st.shadow.clear();
+        // the draft as if it had been used: shadow_done positions accepted, the next one (if any) rejected. Learned as
+        // the text comes: a long draft of copied text would teach nothing for many steps otherwise. A miss in the
+        // verified part of a used draft was learned by its step
+        const int n_hit  = (int) st.shadow_done;
+        const int n_seen = miss ? n_hit + 1 : n_hit;
+        const int from   = (int) std::max(st.shadow_from, st.shadow_seen);
+        if (n_seen > from) {
+            learn(st, st.shadow_impl, n_seen, n_hit, from, st.shadow_from == 0 && st.shadow_seen == 0);
+            st.shadow_seen = n_seen;
+        }
+        if (!more) {
+            st.shadow.clear();
+        }
     }
 
-    void keep_shadow(seq_state & st, int ii, const llama_tokens & draft, const common_speculative_draft_params & dp) {
-        if (!st.shadow.empty() || draft.empty()) {
+    // from > 0: the draft was used up to position from, the rest is learned from the text
+    void keep_shadow(seq_state & st, int ii, const llama_tokens & draft, const common_speculative_draft_params & dp,
+            size_t from = 0) {
+        if (!st.shadow.empty() || draft.size() <= from) {
             return;
         }
         st.shadow      = draft;
@@ -2553,6 +2572,8 @@ struct common_speculative_selector {
         st.shadow_pos  = dp.prompt ? dp.prompt->size() : 0;
         st.shadow_last = dp.id_last;
         st.shadow_done = 0;
+        st.shadow_from = from;
+        st.shadow_seen = 0;
     }
 };
 
@@ -3400,8 +3421,17 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
             impl->n_gen_tokens += result.size();
             st.impl = st.cand_impl;
             st.k    = (int) result.size();
-            if (st.shadow_impl == st.cand_impl) {
-                st.shadow.clear(); // this drafter's draft is used now
+            if (st.shadow_impl == st.cand_impl && st.shadow_from == 0) {
+                st.shadow.clear(); // an unused draft of this drafter: its draft is used now
+            }
+            // a draft cut to the length its learned acceptance pays for: the positions after the cut are learned from
+            // the text that follows, else the chooser would never see whether a longer draft pays
+            if (result.size() < st.cand.size()) {
+                llama_tokens full = st.cand;
+                if (dp.n_max > 0 && (int) full.size() > dp.n_max) {
+                    full.resize(dp.n_max);
+                }
+                sel->keep_shadow(st, st.cand_impl, full, dp, result.size());
             }
             dp.drafting = false;
         } else {
