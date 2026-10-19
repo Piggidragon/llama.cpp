@@ -1804,12 +1804,13 @@ static server_kv_key block_key(const server_kv_key & prev, const server_tokens &
 
 // a prompt is stored in KV blocks if the memory supports state ranges, and only for text: positions follow
 // the token index there, while media tokens can share a position
-static bool prompt_cache_ranged(llama_context * ctx_tgt, llama_context * ctx_dft, const server_tokens & tokens, size_t n_block) {
+// n_tokens: only the first tokens (e.g. those of a root), all if larger
+static bool prompt_cache_ranged(llama_context * ctx_tgt, llama_context * ctx_dft, const server_tokens & tokens, size_t n_block, size_t n_tokens = SIZE_MAX) {
     if (n_block == 0 || !llama_state_seq_range_supported(ctx_tgt) || (ctx_dft && !llama_state_seq_range_supported(ctx_dft))) {
         return false;
     }
 
-    for (size_t i = 0; i < tokens.size(); ++i) {
+    for (size_t i = 0; i < std::min(tokens.size(), n_tokens); ++i) {
         if (tokens[i] == LLAMA_TOKEN_NULL) {
             return false;
         }
@@ -2030,7 +2031,7 @@ void server_prompt_cache::save_root(const server_prompt & prompt, llama_context 
     const size_t n_root = root->n_tokens;
 
     // a whole state cannot be cut at the root
-    if (!prompt_cache_ranged(ctx_tgt, ctx_dft, prompt.tokens, n_block)) {
+    if (!prompt_cache_ranged(ctx_tgt, ctx_dft, prompt.tokens, n_block, n_root)) {
         return;
     }
 
@@ -2175,7 +2176,26 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
 
     states.push_back(std::move(state));
 
+    // the root behind the conversation in the LRU order: the conversation goes first, the root serves the others
+    touch_root(prompt);
+
     return true;
+}
+
+void server_prompt_cache::touch_root(const server_prompt & prompt) {
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (!ckpt.root || ckpt.n_tokens <= 0) {
+            continue;
+        }
+        const size_t n_root = ckpt.n_tokens;
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->root && it->prompt.tokens.size() == n_root && it->prompt.tokens.get_common_prefix(prompt.tokens) == n_root) {
+                states.splice(states.end(), states, it);
+                return;
+            }
+        }
+        return;
+    }
 }
 
 // restore the KV ranges and the partial state of a ranged prompt state, in position order

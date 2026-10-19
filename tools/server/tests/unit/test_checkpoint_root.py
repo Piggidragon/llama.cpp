@@ -212,3 +212,28 @@ def test_root_after_slot_restore():
     finally:
         server.stop()
         shutil.rmtree(slot_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("idle", [True, False])
+def test_root_survives_a_small_cache(idle):
+    # slot 0 holds a conversation with the system prompt, slot 1 serves chats with other system prompts, each saved
+    # when the next takes the slot; the cache holds only a few states: the root stays behind its conversation in the
+    # LRU order, so a new chat with the system prompt in slot 1 starts after it
+    global server
+    server = make_server(n_slots=2, cache_ram=200, checkpoint_root=256)
+    if not idle:
+        server.no_cache_idle_slots = True
+    server.start()
+    n_sys = n_system_tokens()
+    msgs = [{"role": "system", "content": SYSTEM}]
+    def turn(t):
+        msgs.append({"role": "user", "content": f"Turn {t}: " + " ".join(f"what does m{(t * 7 + k) % 60} need?" for k in range(30))})
+        _, reply = chat(msgs, id_slot=0)
+        msgs.append(reply)
+    turn(0)
+    for k in range(6):
+        other = f"You are bot {k}. Policy:\n" + "\n".join(f"{j}. Item i{j} of bot {k} costs {j * (k + 3) % 97} coins." for j in range(70))
+        chat([{"role": "system", "content": other}, {"role": "user", "content": "What does i7 cost?"}], id_slot=1)
+        turn(k + 1)
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}], id_slot=1)
+    assert cache_n >= n_sys - 4

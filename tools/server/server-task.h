@@ -803,6 +803,9 @@ struct server_prompt_cache {
     // holds yet; the slot still holds the KV of the prompt
     void save_root(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // the root state of the root checkpoint of prompt to the most recently used end
+    void touch_root(const server_prompt & prompt);
+
     // copy the prompt of a slot into the cache, false if it is cached already or does not fit
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

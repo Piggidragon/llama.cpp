@@ -764,10 +764,18 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     std::lock_guard<std::mutex> lk(mtx);
 
     // a root prompt is stored next to the conversations that continue it, once
-    for (const auto & e : entries) {
+    for (auto & e : entries) {
         if (e.tokens.size() >= n_tokens && e.tokens.get_common_prefix(state.prompt.tokens) == n_tokens &&
                 (!root || (e.root && e.tokens.size() == n_tokens))) {
             SRV_TRC("disk prompt cache: prompt with %zu tokens is already stored, skipping\n", n_tokens);
+            // it is still in use: newer in the LRU order of the directory
+            if (t_used > e.t_used) {
+                e.t_used = t_used;
+                if (e.on_disk && !e.busy()) {
+                    std::error_code ec;
+                    fs::last_write_time(fs::u8path(e.path), t_used, ec);
+                }
+            }
             return;
         }
     }

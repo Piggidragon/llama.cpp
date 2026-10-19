@@ -4465,9 +4465,10 @@ private:
                                 // a checkpoint at the root that is not marked (e.g. from a slot file)
                                 if (!it->root) {
                                     set_checkpoint_root(slot, *it);
-                                    if (prompt_cache) {
-                                        prompt_cache->save_root(slot.prompt, ctx_tgt, ctx_dft, slot.id);
-                                    }
+                                }
+                                // the root in the cache is in use again: to the recent end, or back if it was evicted
+                                if (prompt_cache) {
+                                    prompt_cache->save_root(slot.prompt, ctx_tgt, ctx_dft, slot.id);
                                 }
                             } else if (n_past == root_pos) {
                                 // the slot starts at the end of the system prompt (a root prompt from the disk level,
