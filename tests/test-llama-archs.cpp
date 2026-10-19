@@ -538,10 +538,12 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         const std::vector<float> & attn_split = {}, const bool split_overlap = false,
         const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false,
-        const bool compact_mask = false) {
+        const bool compact_mask = false, const std::vector<llama_token> & draft_vocab = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.draft_vocab   = draft_vocab.empty() ? nullptr : draft_vocab.data();
+    model_params.n_draft_vocab = (uint32_t) draft_vocab.size();
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -978,6 +980,113 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
     if (!ok) {
         status = "\033[1;31mFAIL\033[0m (list reuse)";
     }
+    return ok;
+}
+
+// A model loaded with a draft vocabulary (llama_model_params::draft_vocab, --spec-draft-vocab): on devices the draft
+// head is a view of the output head's rows, which are reordered at load (the list's tokens first in each device's slice)
+// and whose logits are put back in token order. Its logits must be those of the model without the list (bitwise on one
+// device; under split mode tensor tokens move between the devices, whose kernels may round differently), and a context
+// with llama_context_params::draft_vocab, whose output projects onto the draft head, the logits of the list's tokens.
+// The model is saved from the CPU model and loaded from the file on the devices of the config, with a list of a third of
+// the tokens and one of a single token (under split mode tensor no rows of the draft head on the first device).
+static bool check_draft_head(
+        llama_model * model_cpu, const size_t seed, const float stdev, const std::vector<llama_token> & tokens,
+        const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode,
+        const llama_model_tensor_buft_override * overrides, const size_t moe_cache_size, const std::vector<float> & attn_split,
+        const bool split_overlap, const llama_allreduce_type allreduce_type, const bool workspace, const bool compact_mask,
+        std::string & status) {
+    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
+    if (file == nullptr) {
+        return true;
+    }
+    llama_model_saver ms = llama_model_saver(model_cpu);
+    ms.add_kv_from_model();
+    ms.add_tensors_from_model();
+    ms.save(file);
+
+    auto load = [&](const std::vector<llama_token> & draft_vocab) {
+        rewind(file);
+        return get_model_and_ctx(nullptr, file, seed, stdev, devs, split_mode, false, overrides, moe_cache_size,
+            attn_split, split_overlap, allreduce_type, workspace, compact_mask, draft_vocab);
+    };
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_cpu));
+    std::vector<float> logits_ref;
+    {
+        auto model_and_ctx = load({});
+        logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    }
+
+    std::vector<std::vector<llama_token>> lists(2);
+    for (uint32_t t = 0; t < n_vocab; t++) {
+        if (t % 3 == 1 || t + 1 == n_vocab) {
+            lists[0].push_back((llama_token) t);
+        }
+    }
+    lists[1].push_back((llama_token) (n_vocab - 1));
+
+    auto fail = [&](const char * what) {
+        status = std::string("\033[1;31mFAIL\033[0m (draft head: ") + what + ")";
+        return false;
+    };
+    bool ok = true;
+    for (const auto & list : lists) {
+        auto model_and_ctx = load(list);
+        llama_model * model = model_and_ctx.first.get();
+        if (llama_model_n_draft_vocab(model) == 0) {
+            break; // the model has no plain output head of its own (e.g. tied to the token embeddings)
+        }
+
+        const std::vector<float> logits_list = get_logits(model, model_and_ctx.second.get(), tokens);
+        GGML_ASSERT(logits_list.size() == logits_ref.size());
+        if (split_mode == LLAMA_SPLIT_MODE_TENSOR ? nmse(logits_ref, logits_list) > 1e-8 : logits_list != logits_ref) {
+            ok = fail("logits");
+            break;
+        }
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 0;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.draft_vocab     = true;
+        llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the draft head context");
+        }
+        common_batch batch(ctx.get());
+        for (uint32_t pos = 0; pos < tokens.size(); pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode the batch of the draft head");
+        }
+        std::vector<float> draft;
+        std::vector<float> full;
+        for (uint32_t i = 0; i < tokens.size() && ok; i++) {
+            const float *       logits = llama_get_sampled_logits_ith(ctx.get(), i);
+            const llama_token * ids    = llama_get_sampled_candidates_ith(ctx.get(), i);
+            if (logits == nullptr || ids == nullptr || llama_get_sampled_logits_count_ith(ctx.get(), i) != list.size()) {
+                ok = fail("rows");
+                break;
+            }
+            for (size_t k = 0; k < list.size(); k++) {
+                if (ids[k] != list[k]) {
+                    ok = fail("tokens");
+                    break;
+                }
+                draft.push_back(logits[k]);
+                full.push_back(logits_ref[(size_t) i*n_vocab + list[k]]);
+            }
+        }
+        if (ok && nmse(full, draft) > 1e-6) {
+            ok = fail("logits of the draft head");
+        }
+        if (!ok) {
+            break;
+        }
+    }
+    fclose(file);
     return ok;
 }
 
@@ -1685,6 +1794,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (!encode && !shared_known_bad && (dc_plain || dc.split_mode == LLAMA_SPLIT_MODE_TENSOR) &&
                                 !check_shared_memory_reuse(model_and_ctx_dev.first.get(), dc.split_mode == LLAMA_SPLIT_MODE_TENSOR,
                                     dc.split_overlap, dc.allreduce_type, dc.workspace, dc.compact_mask, status_range)) {
+                            test_ok = false;
+                        }
+
+                        if (!encode && llama_model_saver_supports_arch(arch) &&
+                                !check_draft_head(model_and_ctx_cpu.first.get(), seed, stdev, tokens, dc.devs, dc.split_mode,
+                                    overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type,
+                                    dc.workspace, dc.compact_mask, status_range)) {
                             test_ok = false;
                         }
 

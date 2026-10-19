@@ -363,8 +363,12 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // token ids of a subset of the vocabulary: a copy of their rows of the output head is made at load, and a
-        // context with llama_context_params::draft_vocab drafts (MTP) over these tokens only; NULL for none
+        // token ids of a subset of the vocabulary: a context with llama_context_params::draft_vocab drafts (MTP) over
+        // these tokens only; NULL for none. When the output head is a tensor of its own in device memory, its rows are
+        // reordered at load so the draft head is a view of them (the logits still come in token order, put back on the
+        // CPU when they are read; backend samplers are not used with such a model; under split mode tensor on devices of
+        // different types the logits of tokens that move to another device can differ in the last bits); otherwise a copy
+        // of their rows is made
         const llama_token * draft_vocab;
         uint32_t            n_draft_vocab;
 
@@ -449,8 +453,9 @@ extern "C" {
                                        // computes in the buffers of its target
         bool live_context_workspace;   // size the attention part of the compute buffers by the used part of the KV
                                        // cache (power-of-two steps from 1/8 of it) instead of its full size
-        bool draft_vocab;              // the draft head (MTP) of this context projects onto the model's draft
-                                       // vocabulary only (llama_model_params::draft_vocab): its logits have
+        bool draft_vocab;              // the output head of this context (e.g. the draft head of an MTP context)
+                                       // projects onto the model's draft vocabulary only
+                                       // (llama_model_params::draft_vocab): its logits have
                                        // llama_get_sampled_logits_count_ith() entries, for the tokens of
                                        // llama_get_sampled_candidates_ith()
         bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a

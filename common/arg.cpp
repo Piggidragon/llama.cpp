@@ -4452,8 +4452,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-vocab"}, "FNAME",
         "MTP: draft over these tokens only, a file of token ids (whitespace separated, # starts a comment), e.g. from "
-        "llama-draft-vocab: a copy of their rows of the output head is made at load, a draft step reads and samples "
-        "only those; a token outside the list is never drafted, and a sequence whose recent text is often outside it "
+        "llama-draft-vocab: a draft step reads and samples only their rows of the output head (reordered at load so "
+        "they are a view of it, without memory of their own; a copy where the head is not a tensor of its own in "
+        "device memory); a token outside the list is never drafted, and a sequence whose recent text is often outside it "
         "(a language the list lacks) drafts over the whole vocabulary, see --spec-draft-vocab-max-miss (default: the "
         "whole vocabulary)",
         [](common_params & params, const std::string & value) {

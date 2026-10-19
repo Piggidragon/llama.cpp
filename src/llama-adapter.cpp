@@ -331,6 +331,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         // device buft and device ctx
         const auto * model_tensor = model.get_tensor(name.c_str());
+        // the rows of the output head are reordered for the draft head of --spec-draft-vocab (see load_draft_head)
+        if (model_tensor != nullptr && model_tensor == model.output && !model.output_row_of_token.empty()) {
+            throw std::runtime_error("LoRA adapters of the output head cannot be used with --spec-draft-vocab");
+        }
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
