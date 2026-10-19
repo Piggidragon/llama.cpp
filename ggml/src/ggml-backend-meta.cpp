@@ -1252,7 +1252,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
+                // the dimensions outside the split one; with one element along the split dimension the next one has the
+                // same stride, and a slice without elements would keep it (and read past its end)
+                if (tensor->nb[i] > tensor->nb[split_dim] || (i > split_dim && tensor->nb[i] == tensor->nb[split_dim])) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
@@ -2089,7 +2091,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
         // TODO other simple backend may be better
         ggml_backend_tensor_get_async(
@@ -2759,6 +2760,14 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
 };
+
+size_t ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev) {
+    return ggml_backend_dev_is_meta(dev) ? ggml_backend_meta_dev_n_devs(dev) : 0;
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_simple(ggml_backend_dev_t dev, size_t i) {
+    return ggml_backend_meta_dev_simple_dev(dev, i);
+}
 
 size_t ggml_backend_meta_tensor_n_slices(const struct ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {

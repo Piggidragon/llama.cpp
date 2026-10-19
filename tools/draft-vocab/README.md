@@ -8,10 +8,13 @@ come up in what a model writes. With `--spec-draft-vocab FILE` a draft step read
 for the tokens in the file. At load the rows of the output head are written again in an order where the list's tokens
 come first in each device's slice (under `-sm tensor` spread over the devices like the head's rows), so the draft head
 is a view of the first rows of each slice and takes no memory of its own; the logits of the target come in that row
-order and are put back in token order on the CPU when a row is read (~60 us per row of a 248k vocabulary). Where the head is not a tensor of its own in device memory (tied to the token embeddings, or in host
-memory), the model gets a copy of the rows instead (same type, split like the head).
-The target still checks every drafted token against the whole vocabulary, so the output does not change; a token
-outside the list is just never drafted.
+order and are put back in token order on the CPU when they are read (~60 us per row of a 248k vocabulary). Under
+`-sm tensor` tokens move between the GPUs for this; on GPUs of different types (e.g. a 4070 and a 3060) the logits of
+the moved tokens can differ in the last bits (~1e-6), as they would between the two GPUs anyway. Where the head is not a tensor of its own in device memory (tied to the token embeddings, or in host
+memory, or on a backend that stores weights transformed as a whole, like OpenCL, CANN or SYCL), the model gets a copy
+of the rows instead (same type, split like the head).
+The target still checks every drafted token against the whole vocabulary, so the output does not change (up to the
+rounding noted below); a token outside the list is just never drafted.
 
 ```sh
 llama-draft-vocab -m model.gguf -f code.txt -f prose.txt --coverage 0.998 -o draft-vocab.txt

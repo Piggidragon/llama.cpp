@@ -459,12 +459,12 @@ private:
     bool logits_subset = false;
 
     // the logits of the last decode come from an output head with reordered rows (llama_model::output_row_of_token, a
-    // draft head that is a view of them, see load_draft_head): the logits API puts a row in token order on its first
-    // use, into logits_ordered (~60 us for a vocabulary of 248k), so the rows nobody reads cost nothing
-    bool                 logits_permuted = false;
-    std::vector<float>   logits_ordered;
-    std::vector<uint8_t> logits_ordered_rows; // per output row: 1 once it is in logits_ordered
-    float * logits_ordered_row(int64_t row);
+    // draft head that is a view of them, see load_draft_head): the logits API puts them in token order on its first use,
+    // into logits_ordered (~60 us per row of a vocabulary of 248k), so a decode whose logits nobody reads costs nothing
+    bool               logits_permuted     = false;
+    bool               logits_ordered_done = false;
+    std::vector<float> logits_ordered;
+    float * logits_ordered_all();
 
     // llama_set_draft_vocab(): the draft head is in use (with cparams.draft_vocab)
     bool draft_vocab_on = true;

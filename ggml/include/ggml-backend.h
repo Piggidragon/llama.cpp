@@ -460,6 +460,10 @@ extern "C" {
     // ggml_backend_set_stream_priority() of the simple backends and the AllReduce of a meta backend
     GGML_API bool ggml_backend_meta_set_stream_priority(ggml_backend_t meta_backend, bool high);
 
+    // the simple devices of a meta device: their number (0 if dev is not a meta device) and device i
+    GGML_API size_t             ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple  (ggml_backend_dev_t dev, size_t i);
+
     // the slices of a tensor allocated in a meta buffer (e.g. a weight split by rows): their number (0 if the tensor is
     // not in a meta buffer) and the tensor of slice j on its device
     GGML_API size_t               ggml_backend_meta_tensor_n_slices(const struct ggml_tensor * tensor);

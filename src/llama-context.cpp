@@ -254,9 +254,9 @@ llama_context::llama_context(
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
 
-    cparams.draft_vocab = params.draft_vocab && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.output_draft != nullptr;
+    cparams.draft_vocab = params.draft_vocab && model.output_draft != nullptr;
     if (params.draft_vocab && !cparams.draft_vocab) {
-        LLAMA_LOG_WARN("%s: draft_vocab needs an MTP context of a model loaded with a draft vocabulary, it is not used\n", __func__);
+        LLAMA_LOG_WARN("%s: draft_vocab needs a model loaded with a draft vocabulary, it is not used\n", __func__);
     }
     cparams.pooling_type      = params.pooling_type;
 
@@ -1445,32 +1445,31 @@ float * llama_context::get_logits() {
     output_reorder();
 
     if (logits_permuted) {
-        for (int64_t row = 0; row < n_outputs; ++row) {
-            logits_ordered_row(row);
-        }
-        return logits_ordered.data();
+        return logits_ordered_all();
     }
 
     return logits.data;
 }
 
-// row of the logits of the last decode, in token order (see logits_permuted)
-float * llama_context::logits_ordered_row(int64_t row) {
-    const auto & row_of = model.output_row_of_token;
-    const int64_t n_vocab = (int64_t) row_of.size();
-    if (logits_ordered_rows.size() < (size_t) n_outputs) {
-        logits_ordered_rows.resize(n_outputs, 0);
-        logits_ordered.resize((size_t) n_outputs*n_vocab);
-    }
-    float * dst = logits_ordered.data() + row*n_vocab;
-    if (!logits_ordered_rows[row]) {
-        const float * src = logits.data + row*n_vocab;
-        for (int64_t t = 0; t < n_vocab; ++t) {
-            dst[t] = src[row_of[t]];
+// the logits of the last decode in token order (see logits_permuted), all rows at once: a row of the logits API is
+// followed by the next ones, as in the logits buffer
+float * llama_context::logits_ordered_all() {
+    if (!logits_ordered_done) {
+        const auto & row_of = model.output_row_of_token;
+        const int64_t n_vocab = (int64_t) row_of.size();
+        if (logits_ordered.size() < (size_t) n_outputs*n_vocab) {
+            logits_ordered.resize((size_t) n_outputs*n_vocab); // grows only, no zero fill for every decode
         }
-        logits_ordered_rows[row] = 1;
+        for (int64_t row = 0; row < n_outputs; ++row) {
+            const float * src = logits.data + row*n_vocab;
+            float * dst = logits_ordered.data() + row*n_vocab;
+            for (int64_t t = 0; t < n_vocab; ++t) {
+                dst[t] = src[row_of[t]];
+            }
+        }
+        logits_ordered_done = true;
     }
-    return dst;
+    return logits_ordered.data();
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1512,7 +1511,7 @@ float * llama_context::get_logits_ith(int32_t i) {
 
         const int64_t j = output_resolve_row(i);
         if (logits_permuted) {
-            return logits_ordered_row(j);
+            return logits_ordered_all() + j*model.vocab.n_tokens();
         }
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
@@ -2788,8 +2787,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // the logits of the new outputs
-    logits_permuted = false;
-    logits_ordered_rows.clear();
+    logits_permuted     = false;
+    logits_ordered_done = false;
 
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;

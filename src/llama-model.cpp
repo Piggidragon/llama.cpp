@@ -2197,11 +2197,29 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
 
     // a view of the output head's rows instead of a copy, when the head is a tensor of its own in the plain buffer type
     // of a device (the meta buffer type under split mode tensor; the rows of e.g. a row-split buffer cannot be written or
-    // viewed alone)
+    // viewed alone) whose buffers keep a weight's rows as they are: a partial write writes only its rows, and a view of
+    // the first rows can be multiplied on its own (OpenCL, CANN and SYCL store some weights transformed as a whole)
+    const auto rows_plain = [](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const std::string name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+        return name == "CUDA" || name == "ROCm" || name == "MUSA" || name == "Vulkan" || name == "MTL";
+    };
     const auto view_buft = [&]() {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        return dev != nullptr && ggml_backend_dev_buffer_type(dev) == buft && !ggml_backend_buft_is_host(buft);
+        if (dev == nullptr || ggml_backend_dev_buffer_type(dev) != buft || ggml_backend_buft_is_host(buft)) {
+            return false;
+        }
+        const size_t n_simple = ggml_backend_meta_dev_n_simple(dev);
+        if (n_simple == 0) {
+            return rows_plain(dev);
+        }
+        for (size_t j = 0; j < n_simple; ++j) {
+            if (!rows_plain(ggml_backend_meta_dev_simple(dev, j))) {
+                return false;
+            }
+        }
+        return true;
     };
     if (std::string(ggml_get_name(output)) == "output.weight" && view_buft()) {
         if (ml.no_alloc) {
@@ -2281,7 +2299,9 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
 // the draft head as a view of the output head: the rows of the output head are written again in an order where the
 // draft vocabulary's tokens come first in each device's slice (the tokens of each kind in ascending order, the list's
 // spread over the devices like the head's rows), so the draft head is the first rows of each slice, without memory of its
-// own; the logits of the output head then come in that row order (output_row_of_token), see llama_context::logits_permuted
+// own; the logits of the output head then come in that row order (output_row_of_token), see llama_context::logits_permuted.
+// Under split mode tensor tokens move between the devices: on devices of different types their logits can differ in the
+// last bits from those without the list
 bool llama_model_base::load_draft_head_view(llama_model_loader & ml) {
     const auto & weight = *ml.get_weight(ggml_get_name(output));
     const int64_t n_vocab = vocab.n_tokens();

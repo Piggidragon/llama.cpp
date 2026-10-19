@@ -983,10 +983,13 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
     return ok;
 }
 
-// a model loaded with a draft vocabulary (llama_model_params::draft_vocab, --spec-draft-vocab) gives the same logits as
-// without it: on devices the draft head is a view of the output head's rows, which are reordered at load for it (the
-// list's tokens first in each device's slice) and whose logits are put back in token order. The model is saved from the
-// CPU model and loaded twice from the file, with and without the list, on the devices of the config; compared bitwise.
+// A model loaded with a draft vocabulary (llama_model_params::draft_vocab, --spec-draft-vocab): on devices the draft
+// head is a view of the output head's rows, which are reordered at load (the list's tokens first in each device's slice)
+// and whose logits are put back in token order. Its logits must be those of the model without the list (bitwise on one
+// device; under split mode tensor tokens move between the devices, whose kernels may round differently), and a context
+// with llama_context_params::draft_vocab, whose output projects onto the draft head, the logits of the list's tokens.
+// The model is saved from the CPU model and loaded from the file on the devices of the config, with a list of a third of
+// the tokens and one of a single token (under split mode tensor no rows of the draft head on the first device).
 static bool check_draft_head(
         llama_model * model_cpu, const size_t seed, const float stdev, const std::vector<llama_token> & tokens,
         const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode,
@@ -1002,40 +1005,89 @@ static bool check_draft_head(
     ms.add_tensors_from_model();
     ms.save(file);
 
+    auto load = [&](const std::vector<llama_token> & draft_vocab) {
+        rewind(file);
+        return get_model_and_ctx(nullptr, file, seed, stdev, devs, split_mode, false, overrides, moe_cache_size,
+            attn_split, split_overlap, allreduce_type, workspace, compact_mask, draft_vocab);
+    };
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_cpu));
-    // a third of the vocabulary and the last token, so the list's tokens do not follow the slices of the head
-    std::vector<llama_token> list;
+    std::vector<float> logits_ref;
+    {
+        auto model_and_ctx = load({});
+        logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    }
+
+    std::vector<std::vector<llama_token>> lists(2);
     for (uint32_t t = 0; t < n_vocab; t++) {
         if (t % 3 == 1 || t + 1 == n_vocab) {
-            list.push_back((llama_token) t);
+            lists[0].push_back((llama_token) t);
         }
     }
+    lists[1].push_back((llama_token) (n_vocab - 1));
 
-    auto logits_of = [&](const std::vector<llama_token> & draft_vocab, bool & has_list) {
-        rewind(file);
-        auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, devs, split_mode, false, overrides, moe_cache_size,
-            attn_split, split_overlap, allreduce_type, workspace, compact_mask, draft_vocab);
-        has_list = llama_model_n_draft_vocab(model_and_ctx.first.get()) > 0;
-        return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    auto fail = [&](const char * what) {
+        status = std::string("\033[1;31mFAIL\033[0m (draft head: ") + what + ")";
+        return false;
     };
-    bool has_list = false;
-    const std::vector<float> logits_list = logits_of(list, has_list);
-    if (!has_list) {
-        fclose(file);
-        return true; // the model has no plain output head of its own (e.g. tied to the token embeddings)
-    }
-    bool unused = false;
-    const std::vector<float> logits_ref = logits_of({}, unused);
-    fclose(file);
+    bool ok = true;
+    for (const auto & list : lists) {
+        auto model_and_ctx = load(list);
+        llama_model * model = model_and_ctx.first.get();
+        if (llama_model_n_draft_vocab(model) == 0) {
+            break; // the model has no plain output head of its own (e.g. tied to the token embeddings)
+        }
 
-    GGML_ASSERT(logits_list.size() == logits_ref.size());
-    for (size_t i = 0; i < logits_list.size(); i++) {
-        if (logits_list[i] != logits_ref[i]) {
-            status = "\033[1;31mFAIL\033[0m (draft head)";
-            return false;
+        const std::vector<float> logits_list = get_logits(model, model_and_ctx.second.get(), tokens);
+        GGML_ASSERT(logits_list.size() == logits_ref.size());
+        if (split_mode == LLAMA_SPLIT_MODE_TENSOR ? nmse(logits_ref, logits_list) > 1e-8 : logits_list != logits_ref) {
+            ok = fail("logits");
+            break;
+        }
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 0;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.draft_vocab     = true;
+        llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the draft head context");
+        }
+        common_batch batch(ctx.get());
+        for (uint32_t pos = 0; pos < tokens.size(); pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode the batch of the draft head");
+        }
+        std::vector<float> draft;
+        std::vector<float> full;
+        for (uint32_t i = 0; i < tokens.size() && ok; i++) {
+            const float *       logits = llama_get_sampled_logits_ith(ctx.get(), i);
+            const llama_token * ids    = llama_get_sampled_candidates_ith(ctx.get(), i);
+            if (logits == nullptr || ids == nullptr || llama_get_sampled_logits_count_ith(ctx.get(), i) != list.size()) {
+                ok = fail("rows");
+                break;
+            }
+            for (size_t k = 0; k < list.size(); k++) {
+                if (ids[k] != list[k]) {
+                    ok = fail("tokens");
+                    break;
+                }
+                draft.push_back(logits[k]);
+                full.push_back(logits_ref[(size_t) i*n_vocab + list[k]]);
+            }
+        }
+        if (ok && nmse(full, draft) > 1e-6) {
+            ok = fail("logits of the draft head");
+        }
+        if (!ok) {
+            break;
         }
     }
-    return true;
+    fclose(file);
+    return ok;
 }
 
 // two contexts on one memory (llama_init_from_model_shared_memory, e.g. --concurrent-prefill): a graph that one of them
