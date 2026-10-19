@@ -739,6 +739,11 @@ struct llama_model {
     // llama_model_params::draft_vocab: the rows of the output head for these tokens (sorted ids), see load_draft_head()
     struct ggml_tensor *     output_draft = nullptr;
     std::vector<llama_token> draft_vocab;
+    // with a draft head that is a view of the output head (load_draft_head): the output head's row of each token, the
+    // logits of the output head come in this order (empty: the output head is in token order)
+    std::vector<int32_t>     output_row_of_token;
+    // the rows of output_draft on each device of split mode tensor (empty otherwise)
+    std::vector<int64_t>     output_draft_rows;
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
@@ -943,6 +948,7 @@ struct llama_model_base : public llama_model {
 
     // see llama_model::output_draft
     void load_draft_head(llama_model_loader & ml);
+    bool load_draft_head_view(llama_model_loader & ml);
     virtual ~llama_model_base() = default;
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);

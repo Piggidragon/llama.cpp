@@ -363,8 +363,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // token ids of a subset of the vocabulary: a copy of their rows of the output head is made at load, and a
-        // context with llama_context_params::draft_vocab drafts (MTP) over these tokens only; NULL for none
+        // token ids of a subset of the vocabulary: a context with llama_context_params::draft_vocab drafts (MTP) over
+        // these tokens only; NULL for none. When the output head is a tensor of its own in device memory, its rows are
+        // reordered at load so the draft head is a view of them (the logits still come in token order, put back on the
+        // CPU when they are read; backend samplers are not used with such a model); otherwise a copy of their rows is
+        // made
         const llama_token * draft_vocab;
         uint32_t            n_draft_vocab;
 

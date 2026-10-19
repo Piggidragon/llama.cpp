@@ -390,6 +390,15 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
+
+    // the draft head that is a view of the output head's rows: its rows on each device, see load_draft_head
+    if (tensor == ud->model->output_draft && !ud->model->output_draft_rows.empty()) {
+        ggml_backend_meta_split_state ret = { GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1 };
+        for (size_t j = 0; j < ud->model->output_draft_rows.size(); ++j) {
+            ret.ne[j] = ud->model->output_draft_rows[j];
+        }
+        return ret;
+    }
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
@@ -2186,6 +2195,23 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
         return;
     }
 
+    // a view of the output head's rows instead of a copy, when the head is a tensor of its own in the plain buffer type
+    // of a device (the meta buffer type under split mode tensor; the rows of e.g. a row-split buffer cannot be written or
+    // viewed alone)
+    const auto view_buft = [&]() {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        return dev != nullptr && ggml_backend_dev_buffer_type(dev) == buft && !ggml_backend_buft_is_host(buft);
+    };
+    if (std::string(ggml_get_name(output)) == "output.weight" && view_buft()) {
+        if (ml.no_alloc) {
+            return; // takes no memory
+        }
+        if (load_draft_head_view(ml)) {
+            return;
+        }
+    }
+
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
     // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
     if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
@@ -2250,6 +2276,142 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
     buffers.emplace_back(std::move(buffer));
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
     output_draft = head;
+}
+
+// the draft head as a view of the output head: the rows of the output head are written again in an order where the
+// draft vocabulary's tokens come first in each device's slice (the tokens of each kind in ascending order, the list's
+// spread over the devices like the head's rows), so the draft head is the first rows of each slice, without memory of its
+// own; the logits of the output head then come in that row order (output_row_of_token), see llama_context::logits_permuted
+bool llama_model_base::load_draft_head_view(llama_model_loader & ml) {
+    const auto & weight = *ml.get_weight(ggml_get_name(output));
+    const int64_t n_vocab = vocab.n_tokens();
+    const int64_t n_list  = (int64_t) draft_vocab.size();
+
+    // the slices of the head: one per device under split mode tensor (by rows), else the whole tensor
+    std::vector<ggml_tensor *> slices;
+    const size_t n_slices = ggml_backend_meta_tensor_n_slices(output);
+    if (n_slices > 0) {
+        for (size_t j = 0; j < n_slices; ++j) {
+            slices.push_back(ggml_backend_meta_tensor_slice(output, j));
+        }
+    } else {
+        slices.push_back(output);
+    }
+    int64_t n_rows = 0;
+    for (const ggml_tensor * t : slices) {
+        if (t == nullptr || t->ne[0] != output->ne[0] || t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+        n_rows += t->ne[1];
+    }
+    if (n_rows != n_vocab) {
+        return false; // not split by rows
+    }
+
+    // the list's tokens of each slice, in proportion to its rows
+    std::vector<int64_t> n_list_slice(slices.size(), 0);
+    {
+        int64_t done = 0;
+        int64_t rows_before = 0;
+        for (size_t j = 0; j < slices.size(); ++j) {
+            rows_before += slices[j]->ne[1];
+            const int64_t until = j + 1 == slices.size() ? n_list : std::min(n_list, n_list*rows_before/n_vocab);
+            n_list_slice[j] = std::min(until - done, slices[j]->ne[1]);
+            done += n_list_slice[j];
+        }
+        if (done != n_list) {
+            return false;
+        }
+    }
+
+    // the row order: each slice its list tokens, then its other tokens
+    std::vector<bool> in_list(n_vocab, false);
+    for (const llama_token t : draft_vocab) {
+        in_list[t] = true;
+    }
+    std::vector<llama_token> rest;
+    rest.reserve(n_vocab - n_list);
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        if (!in_list[t]) {
+            rest.push_back(t);
+        }
+    }
+    std::vector<std::vector<llama_token>> order(slices.size());
+    {
+        size_t i_list = 0;
+        size_t i_rest = 0;
+        for (size_t j = 0; j < slices.size(); ++j) {
+            auto & o = order[j];
+            o.insert(o.end(), draft_vocab.begin() + i_list, draft_vocab.begin() + i_list + n_list_slice[j]);
+            i_list += n_list_slice[j];
+            const int64_t n_rest = slices[j]->ne[1] - n_list_slice[j];
+            o.insert(o.end(), rest.begin() + i_rest, rest.begin() + i_rest + n_rest);
+            i_rest += n_rest;
+        }
+    }
+
+    // write the rows in that order, read from the model file in runs of consecutive tokens
+    const size_t row_size = ggml_row_size(output->type, output->ne[0]);
+    const auto & file = ml.files.at(weight.idx);
+    constexpr int64_t chunk = 4096;
+    std::vector<uint8_t> data(row_size*chunk);
+    output_row_of_token.assign(n_vocab, -1);
+    int64_t row_global = 0;
+    for (size_t j = 0; j < slices.size(); ++j) {
+        const auto & o = order[j];
+        for (int64_t r0 = 0; r0 < (int64_t) o.size(); r0 += chunk) {
+            const int64_t nr = std::min<int64_t>(chunk, (int64_t) o.size() - r0);
+            for (int64_t i = 0; i < nr; ) {
+                int64_t k = i + 1;
+                while (k < nr && o[r0 + k] == o[r0 + k - 1] + 1) {
+                    ++k;
+                }
+                file->seek(weight.offs + row_size*o[r0 + i], SEEK_SET);
+                file->read_raw(data.data() + row_size*i, row_size*(k - i));
+                i = k;
+            }
+            ggml_backend_tensor_set(slices[j], data.data(), row_size*r0, row_size*nr);
+            for (int64_t i = 0; i < nr; ++i) {
+                output_row_of_token[o[r0 + i]] = (int32_t) (row_global + r0 + i);
+            }
+        }
+        row_global += (int64_t) o.size();
+    }
+
+    // the draft head: the first rows of each slice
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create the draft head context");
+    }
+    ggml_tensor * head;
+    if (n_slices > 0) {
+        head = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_list);
+        ggml_set_name(head, "output_draft.weight");
+        output_draft_rows = n_list_slice;
+        ggml_backend_meta_tensor_init_row_views(output, head, output_draft_rows.data());
+    } else {
+        head = ggml_view_2d(ctx.get(), output, output->ne[0], n_list, output->nb[1], 0);
+        ggml_set_name(head, "output_draft.weight");
+        if (ggml_backend_view_init(head) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to initialize the draft head view");
+        }
+    }
+
+    std::string desc;
+    for (size_t j = 0; j < slices.size(); ++j) {
+        desc += format("%s%" PRId64, j > 0 ? " + " : "", n_list_slice[j]);
+    }
+    LLAMA_LOG_INFO("%s: draft head of %" PRId64 " tokens (%.1f%% of the vocabulary): the first rows of the output head (%s), "
+            "whose rows are reordered, no memory of its own\n", __func__, n_list, 100.0*n_list/n_vocab, desc.c_str());
+
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::vector<ggml_backend_buffer_ptr>{});
+    output_draft = head;
+    return true;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

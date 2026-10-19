@@ -538,10 +538,12 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         const std::vector<float> & attn_split = {}, const bool split_overlap = false,
         const llama_allreduce_type allreduce_type = LLAMA_ALLREDUCE_TYPE_DEFAULT, const bool workspace = false,
-        const bool compact_mask = false) {
+        const bool compact_mask = false, const std::vector<llama_token> & draft_vocab = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.draft_vocab   = draft_vocab.empty() ? nullptr : draft_vocab.data();
+    model_params.n_draft_vocab = (uint32_t) draft_vocab.size();
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -979,6 +981,61 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
         status = "\033[1;31mFAIL\033[0m (list reuse)";
     }
     return ok;
+}
+
+// a model loaded with a draft vocabulary (llama_model_params::draft_vocab, --spec-draft-vocab) gives the same logits as
+// without it: on devices the draft head is a view of the output head's rows, which are reordered at load for it (the
+// list's tokens first in each device's slice) and whose logits are put back in token order. The model is saved from the
+// CPU model and loaded twice from the file, with and without the list, on the devices of the config; compared bitwise.
+static bool check_draft_head(
+        llama_model * model_cpu, const size_t seed, const float stdev, const std::vector<llama_token> & tokens,
+        const std::vector<ggml_backend_dev_t> & devs, const llama_split_mode split_mode,
+        const llama_model_tensor_buft_override * overrides, const size_t moe_cache_size, const std::vector<float> & attn_split,
+        const bool split_overlap, const llama_allreduce_type allreduce_type, const bool workspace, const bool compact_mask,
+        std::string & status) {
+    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
+    if (file == nullptr) {
+        return true;
+    }
+    llama_model_saver ms = llama_model_saver(model_cpu);
+    ms.add_kv_from_model();
+    ms.add_tensors_from_model();
+    ms.save(file);
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_cpu));
+    // a third of the vocabulary and the last token, so the list's tokens do not follow the slices of the head
+    std::vector<llama_token> list;
+    for (uint32_t t = 0; t < n_vocab; t++) {
+        if (t % 3 == 1 || t + 1 == n_vocab) {
+            list.push_back((llama_token) t);
+        }
+    }
+
+    auto logits_of = [&](const std::vector<llama_token> & draft_vocab, bool & has_list) {
+        rewind(file);
+        auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, devs, split_mode, false, overrides, moe_cache_size,
+            attn_split, split_overlap, allreduce_type, workspace, compact_mask, draft_vocab);
+        has_list = llama_model_n_draft_vocab(model_and_ctx.first.get()) > 0;
+        return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+    };
+    bool has_list = false;
+    const std::vector<float> logits_list = logits_of(list, has_list);
+    if (!has_list) {
+        fclose(file);
+        return true; // the model has no plain output head of its own (e.g. tied to the token embeddings)
+    }
+    bool unused = false;
+    const std::vector<float> logits_ref = logits_of({}, unused);
+    fclose(file);
+
+    GGML_ASSERT(logits_list.size() == logits_ref.size());
+    for (size_t i = 0; i < logits_list.size(); i++) {
+        if (logits_list[i] != logits_ref[i]) {
+            status = "\033[1;31mFAIL\033[0m (draft head)";
+            return false;
+        }
+    }
+    return true;
 }
 
 // two contexts on one memory (llama_init_from_model_shared_memory, e.g. --concurrent-prefill): a graph that one of them
@@ -1685,6 +1742,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (!encode && !shared_known_bad && (dc_plain || dc.split_mode == LLAMA_SPLIT_MODE_TENSOR) &&
                                 !check_shared_memory_reuse(model_and_ctx_dev.first.get(), dc.split_mode == LLAMA_SPLIT_MODE_TENSOR,
                                     dc.split_overlap, dc.allreduce_type, dc.workspace, dc.compact_mask, status_range)) {
+                            test_ok = false;
+                        }
+
+                        if (!encode && llama_model_saver_supports_arch(arch) &&
+                                !check_draft_head(model_and_ctx_cpu.first.get(), seed, stdev, tokens, dc.devs, dc.split_mode,
+                                    overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type,
+                                    dc.workspace, dc.compact_mask, status_range)) {
                             test_ok = false;
                         }
 
