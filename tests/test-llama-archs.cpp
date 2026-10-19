@@ -981,6 +981,101 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
     return ok;
 }
 
+// two contexts on one memory (llama_init_from_model_shared_memory, e.g. --concurrent-prefill): a graph that one of them
+// reuses must still be valid after the other one built and computed graphs of other shapes in between (with split mode
+// tensor the device tensors of its K/V views live in containers of the shared cache buffers). Both directions: the
+// reused graph of the second context gives the logits of its first compute, the one of the first context the logits of
+// a fresh context with its history.
+static bool check_shared_memory_reuse(llama_model * model, std::string & status) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto params = [](uint32_t n_seq) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 512;
+        ctx_params.n_seq_max       = n_seq;
+        ctx_params.n_batch         = 64;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.kv_unified      = false;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        return ctx_params;
+    };
+
+    llama_context_ptr ctx_a(llama_init_from_model(model, params(2)));
+    if (!ctx_a) {
+        throw std::runtime_error("failed to create the context of the shared memory check");
+    }
+    if (llama_get_memory(ctx_a.get()) == nullptr || !llama_memory_seqs_independent(ctx_a.get())) {
+        return true;
+    }
+    llama_context_ptr ctx_b(llama_init_from_model_shared_memory(model, params(2), ctx_a.get()));
+    if (!ctx_b) {
+        throw std::runtime_error("failed to create the second context of the shared memory check");
+    }
+
+    uint32_t rng = 777;
+    auto tok = [&]() {
+        rng = rng*1103515245u + 12345u;
+        return (llama_token) (1 + (rng >> 8) % (n_vocab - 2));
+    };
+    auto decode = [&](llama_context * ctx, llama_seq_id seq_id, const std::vector<llama_token> & toks, llama_pos pos0) {
+        common_batch batch(ctx);
+        for (size_t i = 0; i < toks.size(); i++) {
+            batch.add(toks[i], pos0 + (llama_pos) i, seq_id, i + 1 == toks.size());
+        }
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("failed to decode in the shared memory check");
+        }
+        llama_synchronize(ctx);
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+    // graphs of three other shapes, each built and computed (the positions stay within the training context of 256)
+    auto other_shapes = [&](llama_context * ctx, llama_seq_id seq_id, std::vector<llama_token> & hist) {
+        for (int n : { 7, 13, 21 }) {
+            std::vector<llama_token> toks(n);
+            for (auto & t : toks) {
+                t = tok();
+            }
+            decode(ctx, seq_id, toks, (llama_pos) hist.size());
+            hist.insert(hist.end(), toks.begin(), toks.end());
+        }
+    };
+
+    // the second context reuses its graph of the same ubatch, after the first one computed others
+    std::vector<llama_token> prompt(40);
+    for (auto & t : prompt) {
+        t = tok();
+    }
+    std::vector<llama_token> hist_a;
+    std::vector<llama_token> hist_b;
+    const std::vector<float> logits_b0 = decode(ctx_b.get(), 1, prompt, 0);
+    other_shapes(ctx_a.get(), 0, hist_a);
+    llama_memory_seq_rm(llama_get_memory(ctx_a.get()), 1, 0, -1);
+    const std::vector<float> logits_b1 = decode(ctx_b.get(), 1, prompt, 0);
+    hist_b = prompt;
+    bool ok = nmse(logits_b0, logits_b1) < 1e-4;
+
+    // the first context reuses its graph of one token, after the second one computed others
+    hist_a.push_back(tok());
+    decode(ctx_a.get(), 0, { hist_a.back() }, (llama_pos) hist_a.size() - 1);
+    other_shapes(ctx_b.get(), 1, hist_b);
+    hist_a.push_back(tok());
+    const std::vector<float> logits_a = decode(ctx_a.get(), 0, { hist_a.back() }, (llama_pos) hist_a.size() - 1);
+
+    llama_context_ptr ref(llama_init_from_model(model, params(1)));
+    if (!ref) {
+        throw std::runtime_error("failed to create the reference of the shared memory check");
+    }
+    ok = ok && nmse(decode(ref.get(), 0, hist_a, 0), logits_a) < 1e-4;
+
+    if (!ok) {
+        status = "\033[1;31mFAIL\033[0m (shared memory reuse)";
+    }
+    return ok;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1543,6 +1638,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                         }
                         if (!encode && !check_kv_rows_reuse(model_and_ctx_dev.first.get(), status_range)) {
+                            test_ok = false;
+                        }
+                        if (!encode && (dc_plain || dc.split_mode == LLAMA_SPLIT_MODE_TENSOR) &&
+                                !check_shared_memory_reuse(model_and_ctx_dev.first.get(), status_range)) {
                             test_ok = false;
                         }
 

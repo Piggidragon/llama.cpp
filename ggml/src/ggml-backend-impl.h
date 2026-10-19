@@ -102,6 +102,11 @@ extern "C" {
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
+    // whether the meta backend can compute this graph (a split of a scheduler) again without a new allocation: the
+    // simple tensors of its views of static tensors and of its compute tensors live in containers of their buffers,
+    // which a rebuilt graph of another meta backend on the same buffers (another context on the same KV cache) clears
+    GGML_API bool ggml_backend_meta_graph_reusable(ggml_backend_t meta_backend, const struct ggml_cgraph * cgraph);
+
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 

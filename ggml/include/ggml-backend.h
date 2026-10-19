@@ -352,6 +352,10 @@ extern "C" {
 
     GGML_API bool                 ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner);
     GGML_API void                 ggml_backend_sched_get_buffer_state(ggml_backend_sched_t sched, uint64_t * generation, uint64_t * shrink_generation);
+
+    // whether the last allocated graph can be computed again as it is (graph reuse): false when a meta backend lost
+    // tensors of it, e.g. to the graphs of another scheduler on the same meta buffers (two contexts on one KV cache)
+    GGML_API bool                 ggml_backend_sched_graph_reusable(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph

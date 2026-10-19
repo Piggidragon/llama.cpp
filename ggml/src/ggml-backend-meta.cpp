@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <unordered_map>
 #include <cassert>
 #include <cmath>
@@ -426,6 +427,10 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_compute[2];
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // how often each compute container was cleared: the meta backends of all graphs on this buffer (e.g. two contexts
+    // on one KV cache) share the containers, see ggml_backend_meta_graph_reusable(); shared with the records of the
+    // backends, which may outlive the buffer
+    std::shared_ptr<std::array<uint64_t, 2>> stc_compute_n_cleared = std::make_shared<std::array<uint64_t, 2>>();
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -1865,6 +1870,15 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
+    // per graph (by uid, the last ones that were built): the compute containers that hold its simple tensors and how
+    // often they had been cleared then, see ggml_backend_meta_graph_reusable()
+    struct graph_view {
+        std::shared_ptr<std::array<uint64_t, 2>> n_cleared;
+        int                                      index;
+        uint64_t                                 n;
+    };
+    std::map<uint64_t, std::vector<graph_view>> graph_views;
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -2141,6 +2155,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_reset(ctx.get());
             }
             stc.simple_tensors.clear();
+            (*buf_ctx->stc_compute_n_cleared)[buf_ctx->stc_compute_index_next]++;
+        }
+
+        // the compute containers that hold simple tensors of this graph (its views of static tensors, its tensors of
+        // compute buffers): a later compute of this graph without a rebuild needs them
+        {
+            std::vector<ggml_backend_meta_context::graph_view> & views = backend_ctx->graph_views[cgraph->uid];
+            views.clear();
+            auto note = [&](const ggml_tensor * t) {
+                if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+                    return;
+                }
+                const ggml_backend_meta_buffer_context * bc = (const ggml_backend_meta_buffer_context *) t->buffer->context;
+                for (const auto & v : views) {
+                    if (v.n_cleared == bc->stc_compute_n_cleared) {
+                        return;
+                    }
+                }
+                if (t->view_src == nullptr && bc->stc_static.simple_tensors.count(t) > 0) {
+                    return;
+                }
+                const int index = bc->stc_compute_index;
+                views.push_back({ bc->stc_compute_n_cleared, index, (*bc->stc_compute_n_cleared)[index] });
+            };
+            for (int i = 0; i < cgraph->n_leafs; i++) {
+                note(cgraph->leafs[i]);
+            }
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                note(cgraph->nodes[i]);
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    note(cgraph->nodes[i]->src[k]);
+                }
+            }
+            // the uids grow, the oldest graphs go first
+            while (backend_ctx->graph_views.size() > 16) {
+                backend_ctx->graph_views.erase(backend_ctx->graph_views.begin());
+            }
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -2707,6 +2758,23 @@ static const ggml_backend_i ggml_backend_meta_i = {
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;
+}
+
+bool ggml_backend_meta_graph_reusable(ggml_backend_t meta_backend, const struct ggml_cgraph * cgraph) {
+    GGML_ASSERT(ggml_backend_is_meta(meta_backend));
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+
+    // not computed by this backend, or too long ago
+    const auto it = backend_ctx->graph_views.find(cgraph->uid);
+    if (it == backend_ctx->graph_views.end()) {
+        return false;
+    }
+    for (const auto & v : it->second) {
+        if ((*v.n_cleared)[v.index] != v.n) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {

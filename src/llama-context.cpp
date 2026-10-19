@@ -1947,7 +1947,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // the scheduler check: another context on the same buffers (e.g. --concurrent-prefill on the KV cache of this one)
+    // may have dropped the device tensors of the previous graph under split mode tensor
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) &&
+            ggml_backend_sched_graph_reusable(sched.get())) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
