@@ -67,6 +67,8 @@ llama_model_cogvlm::graph::graph(const llama_model & model, const llm_graph_para
 
     auto * inp_attn = build_attn_inp_kv();
 
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     // check ubatch to see if we have input tokens (text)
     // or an input embedding vector (image)
     bool is_text;
@@ -122,6 +124,12 @@ llama_model_cogvlm::graph::graph(const llama_model & model, const llm_graph_para
                 nullptr, nullptr, nullptr,
                 kq_scale, il);
             cb(cur, "attn_out", il);
+        }
+
+        // only the rows of the tokens that output (the logits are read as the first n_outputs rows)
+        if (il == n_layer - 1 && inp_out_ids) {
+            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);

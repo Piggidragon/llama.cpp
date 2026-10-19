@@ -785,6 +785,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // the list of K/V rows, like the mask (ggml_flash_attn_ext_set_kv_rows())
+        GGML_ASSERT(tensor->src[5] == nullptr || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1011,6 +1013,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
             case GGML_OP_ARANGE:
+            case GGML_OP_ATTN_MASK_RANGES:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

@@ -150,7 +150,9 @@ bool llama_memory_hybrid_idx::get_seqs_independent() const {
     // with a stream per sequence a ubatch writes only the indexer rows of its own sequences: its new and stale pooled
     // keys, and pad cells from its own streams (see kpool_build_state, set_input_kpool). It reads the pooled keys of
     // the other sequences' pools, masked out (-inf): a concurrent write there leaves finite values, never selected
-    return llama_memory_hybrid::get_seqs_independent() && (mem_idx == nullptr || mem_idx->get_seqs_independent());
+    // In a unified cache the pad cells of a ubatch can be cells of other sequences: no.
+    return llama_memory_hybrid::get_seqs_independent() &&
+        (mem_idx == nullptr || (mem_idx->get_seqs_independent() && mem_idx->get_n_stream() > 1));
 }
 
 bool llama_memory_hybrid_idx::has_pending_update() const {

@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_ATTN_MASK_RANGES,
 
         GGML_OP_UNARY,
 
@@ -2523,6 +2524,25 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);
+
+    // Columns from a list of K/V rows: column j of the attention, and of the mask, is row rows[j] of K and V (of the
+    // K/V sequence i3 if rows has one list per sequence, which needs a mask per sequence too). The mask then has
+    // rows->ne[0] columns. For a KV cache that holds several sequences: only the cells of the ubatch's own sequences.
+    // Backends: CPU, CUDA.
+    // rows: I32 [n_cols, 1, 1, 1 or k->ne[3] (= mask->ne[3])]
+    GGML_API void ggml_flash_attn_ext_set_kv_rows(
+            struct ggml_tensor * a,
+            struct ggml_tensor * rows);
+
+    // An attention mask from one column range per row: res[i3][i1][j] = 0.0f if r[i3][i1][0] <= j < r[i3][i1][1],
+    // -INFINITY otherwise. The mask of a causal prefix (or a window) of the KV cells without uploading it.
+    // r:   I32 [2, n_rows, 1, ne3]
+    // res: F16 or F32 [n_cols, n_rows, 1, ne3]
+    GGML_API struct ggml_tensor * ggml_attn_mask_ranges(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            int64_t               n_cols,
+            enum ggml_type        type);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

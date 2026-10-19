@@ -769,7 +769,14 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
 }
 
 bool llama_kv_cache::get_seqs_independent() const {
-    return n_stream > 1 && !other; // one stream per sequence, no cells shared with another cache
+    // A ubatch writes only the cells it was given, which were free; no cells are shared with another cache. With one
+    // stream for all sequences (unified) a ubatch also reads the cells of the other sequences, masked (-inf, or not at
+    // all with --kv-unified-gather): a concurrent write there leaves finite values (the buffers start zeroed). The
+    // server synchronizes the target before another context takes cells that the target's sequences freed.
+    // Not with sliding-window attention in one stream: find_slot() also gives out the cells of another sequence that
+    // its window has left, measured from that sequence's position after a ubatch that may still be computing (its first
+    // tokens still read them).
+    return !other && (n_stream > 1 || swa_type == LLAMA_SWA_TYPE_NONE);
 }
 
 bool llama_kv_cache::has_pending_update() const {
@@ -1333,6 +1340,45 @@ uint32_t llama_kv_cache::get_reserve_n_kv(const slot_info_vec_t & sinfos) const 
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
+    // a token sees only cells of its own sequences (see set_input_kq_mask()); a shared cell counts once per sequence,
+    // as the segments of get_kv_rows() hold it, unless they do not fit n_kv: then the union of the cells
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    uint32_t result = 0;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t strm = sinfo.strm[s];
+        const auto & cells = v_cells[strm];
+
+        size_t n = 0;
+        for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[i];
+            if (seq_to_stream[seq_id] == strm) {
+                n += cells.seq_pos_get(seq_id).size();
+            }
+        }
+        if (n > n_kv) {
+            std::vector<bool> seen(cells.size(), false);
+            n = 0;
+            for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id_unq[i];
+                if (seq_to_stream[seq_id] != strm) {
+                    continue;
+                }
+                for (const auto & [pos, idx] : cells.seq_pos_get(seq_id)) {
+                    n += !seen[idx];
+                    seen[idx] = true;
+                }
+            }
+        }
+
+        result = std::max<uint32_t>(result, GGML_PAD((uint32_t) std::min<size_t>(n, cells.size()), n_pad_cur));
+    }
+
+    return std::min(result, n_kv);
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1838,6 +1884,237 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+// the order of a causal mask: a cell at p0 (ext0) is visible to a token at (p1, x1, y1) iff it is not after it, see
+// set_input_kq_mask_impl()
+static bool llama_kv_causal_leq(llama_pos p0, const llama_kv_cell_ext & ext0, llama_pos p1, llama_pos x1, llama_pos y1, bool is_2d) {
+    if (p0 != p1) {
+        return p0 < p1;
+    }
+    return !is_2d || !ext0.is_2d_gt(x1, y1);
+}
+
+bool llama_kv_cache::can_causal_prefix() const {
+    return !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE;
+}
+
+bool llama_kv_cache::can_kv_rows() const {
+    return can_causal_prefix() && n_stream == 1 && n_seq_max > 1;
+}
+
+bool llama_kv_cache::can_compact() const {
+    return can_causal_prefix() && !(n_stream == 1 && n_seq_max > 1);
+}
+
+bool llama_kv_cache::get_causal_prefix(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const {
+    GGML_UNUSED(sinfo);
+
+    // the streams of the mask, see set_input_kq_mask()
+    const uint32_t n_stream_mask = n_stream == 1 ? 1 : ubatch.n_seqs_unq;
+    if (!can_compact() || ubatch.n_tokens == 0 || ubatch.n_tokens % n_stream_mask != 0) {
+        return false;
+    }
+
+    const uint32_t n_tps = ubatch.n_tokens/n_stream_mask;
+    const bool     is_2d = ubatch.is_pos_2d();
+
+    for (uint32_t s = 0; s < n_stream_mask; ++s) {
+        // the tokens of the stream: one sequence, not decreasing in the causal order
+        const llama_seq_id seq_id = ubatch.seq_id[s*n_tps][0];
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
+                return false;
+            }
+            if (ii > 0) {
+                const llama_kv_cell_ext ext_prev = { is_2d ? ubatch.pos[i - 1 + ubatch.n_tokens*2] : 0, is_2d ? ubatch.pos[i - 1 + ubatch.n_tokens] : 0 };
+                if (!llama_kv_causal_leq(ubatch.pos[i - 1], ext_prev, ubatch.pos[i],
+                            is_2d ? ubatch.pos[i + ubatch.n_tokens*2] : 0, is_2d ? ubatch.pos[i + ubatch.n_tokens] : 0, is_2d)) {
+                    return false;
+                }
+            }
+        }
+
+        // its cells: first, without gaps, in the causal order
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+        if (n_kv > cells.size()) {
+            return false;
+        }
+        bool saw_empty = false;
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                saw_empty = true;
+                continue;
+            }
+            if (saw_empty || !cells.seq_has(j, seq_id)) {
+                return false;
+            }
+            if (j > 0) {
+                const llama_kv_cell_ext ext = is_2d ? cells.ext_get(j) : llama_kv_cell_ext{};
+                if (!llama_kv_causal_leq(cells.pos_get(j - 1), is_2d ? cells.ext_get(j - 1) : llama_kv_cell_ext{},
+                            cells.pos_get(j), ext.x, ext.y, is_2d)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == 2);
+
+    const int64_t n_stream_mask = dst->ne[3];
+    const int64_t n_tps         = dst->ne[1];
+    GGML_ASSERT(n_tps*n_stream_mask == ubatch->n_tokens);
+
+    const bool is_2d = ubatch->is_pos_2d();
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (int64_t s = 0; s < n_stream_mask; ++s) {
+        const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[s*n_tps][0]]];
+
+        // the cells are in the causal order (get_causal_prefix()): each token sees the cells up to the last one not
+        // after it
+        uint32_t j = 0;
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s*n_tps + ii;
+            const llama_pos p1 = ubatch->pos[i];
+            const llama_pos x1 = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+            const llama_pos y1 = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+            while (j < n_kv && !cells.is_empty(j) &&
+                    llama_kv_causal_leq(cells.pos_get(j), is_2d ? cells.ext_get(j) : llama_kv_cell_ext{}, p1, x1, y1, is_2d)) {
+                ++j;
+            }
+            data[2*i + 0] = 0;
+            data[2*i + 1] = (int32_t) j;
+        }
+    }
+}
+
+void llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, llama_kv_rows & out) const {
+    GGML_ASSERT(n_stream == 1);
+    const auto & cells = v_cells[0];
+    const bool is_2d = ubatch.is_pos_2d();
+
+    size_t n_cells = 0;
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        n_cells += cells.seq_pos_get(ubatch.seq_id_unq[s]).size();
+    }
+
+    auto & rows = out.rows;
+    rows.clear();
+    rows.reserve(n_rows);
+    out.seg.clear();
+    out.ordered = true;
+    if (n_cells <= n_rows) {
+        // a segment per sequence, its cells in position order; M-RoPE ties must be in the causal order too
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            out.seg.push_back((uint32_t) rows.size());
+            llama_pos pos_prev = -1;
+            for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[s])) {
+                if (is_2d && pos == pos_prev && out.ordered) {
+                    const llama_kv_cell_ext ext = cells.ext_get(idx);
+                    out.ordered = llama_kv_causal_leq(pos_prev, cells.ext_get(rows.back()), pos, ext.x, ext.y, true);
+                }
+                rows.push_back((int32_t) idx);
+                pos_prev = pos;
+            }
+        }
+        out.seg.push_back((uint32_t) rows.size());
+    } else {
+        // the union of the cells, a shared cell once
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            for (const auto & [pos, idx] : cells.seq_pos_get(ubatch.seq_id_unq[s])) {
+                rows.push_back((int32_t) idx);
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    }
+    out.n_live = rows.size();
+    GGML_ASSERT(out.n_live <= n_rows);
+    rows.resize(n_rows, 0);
+}
+
+bool llama_kv_cache::get_rows_prefix(const llama_kv_rows & kr) const {
+    return can_kv_rows() && !kr.seg.empty() && kr.ordered;
+}
+
+void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_kv_rows & kr) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == (int64_t) kr.rows.size());
+
+    memcpy(dst->data, kr.rows.data(), kr.rows.size()*sizeof(int32_t));
+}
+
+void llama_kv_cache::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_kv_rows & kr) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    const auto & cells = v_cells[0];
+    const bool is_2d = ubatch->is_pos_2d();
+    const uint32_t n_tokens = ubatch->n_tokens;
+    const uint32_t n_rows   = (uint32_t) kr.rows.size();
+    const auto &   rows     = kr.rows;
+    const auto &   seg      = kr.seg;
+
+    // as in set_input_kq_mask(): only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    // a token sees the cells of its first sequence, as in set_input_kq_mask()
+    if (dst->type == GGML_TYPE_I32) {
+        // the segment of its sequence up to the last cell not after it (the cells are in the causal order), or all of it
+        GGML_ASSERT(dst->ne[0] == 2 && dst->ne[1] == n_tokens && !seg.empty() && kr.ordered);
+        int32_t * data = (int32_t *) dst->data;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t s  = ubatch->seq_idx[ubatch->seq_id[i][0]];
+            uint32_t       hi = seg[s + 1];
+            if (causal_attn) {
+                const llama_pos p1 = ubatch->pos[i];
+                const llama_pos x1 = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
+                const llama_pos y1 = is_2d ? ubatch->pos[i + n_tokens]   : 0;
+                hi = (uint32_t) (std::partition_point(rows.begin() + seg[s], rows.begin() + seg[s + 1], [&](int32_t idx) {
+                    return llama_kv_causal_leq(cells.pos_get(idx), is_2d ? cells.ext_get(idx) : llama_kv_cell_ext{}, p1, x1, y1, is_2d);
+                }) - rows.begin());
+            }
+            data[2*i + 0] = (int32_t) seg[s];
+            data[2*i + 1] = (int32_t) hi;
+        }
+        return;
+    }
+
+    // the dense mask over the list: a token sees the cells of its segment, or of its sequence in the union
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_rows && dst->ne[1] == n_tokens && dst->ne[3] == 1);
+
+    std::vector<float> row(n_rows);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const uint32_t s  = ubatch->seq_idx[seq_id];
+        const llama_pos p1 = ubatch->pos[i];
+        const llama_pos x1 = is_2d ? ubatch->pos[i + n_tokens*2] : 0;
+        const llama_pos y1 = is_2d ? ubatch->pos[i + n_tokens]   : 0;
+        for (uint32_t c = 0; c < n_rows; ++c) {
+            bool visible = false;
+            // past the list: the padding
+            if (c < kr.n_live) {
+                const uint32_t idx = (uint32_t) rows[c];
+                const bool own = seg.empty() ? cells.seq_has(idx, seq_id) : (c >= seg[s] && c < seg[s + 1]);
+                visible = own && !cells.is_empty(idx) &&
+                    (!causal_attn || llama_kv_causal_leq(cells.pos_get(idx), is_2d ? cells.ext_get(idx) : llama_kv_cell_ext{}, p1, x1, y1, is_2d));
+            }
+            row[c] = visible ? 0.0f : -INFINITY;
+        }
+        if (dst->type == GGML_TYPE_F16) {
+            ggml_fp32_to_fp16_row(row.data(), (ggml_fp16_t *) dst->data + (size_t) i*n_rows, n_rows);
+        } else {
+            memcpy((float *) dst->data + (size_t) i*n_rows, row.data(), n_rows*sizeof(float));
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2973,6 +3250,17 @@ llama_kv_cache_context::llama_kv_cache_context(
     this->n_kv   = std::max(1u, std::min(n_kv, kv->get_size()));
     reserve_n_kv = this->n_kv;
 
+    // the compute buffers are reserved for the graph shape every causal ubatch of the cache takes (see can_kv_rows()):
+    // with one stream of several sequences a list over all cells with column ranges (--kv-unified-gather), else the
+    // ranges over the cells (--compact-attn-mask)
+    causal_prefix = kv->can_compact();
+    rows_prefix   = kv->can_kv_rows();
+    n_kv_union    = kv->can_kv_rows() ? this->n_kv : 0;
+
+    has_n_kv_union    = true;
+    has_causal_prefix = true;
+    has_rows_prefix   = true;
+
     const uint32_t n_stream = kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
@@ -3028,6 +3316,11 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    has_n_kv_union    = false;
+    has_causal_prefix = false;
+    has_rows_prefix   = false;
+    has_kv_rows       = false;
+
     return true;
 }
 
@@ -3047,6 +3340,64 @@ uint32_t llama_kv_cache_context::get_attn_reserve_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_union() const {
+    if (!has_n_kv_union) {
+        n_kv_union     = kv->get_n_kv_union(sinfos[i_cur], ubatches[i_cur], n_kv);
+        has_n_kv_union = true;
+    }
+    return n_kv_union;
+}
+
+bool llama_kv_cache_context::get_causal_prefix() const {
+    if (!has_causal_prefix) {
+        causal_prefix     = kv->get_causal_prefix(sinfos[i_cur], ubatches[i_cur], n_kv);
+        has_causal_prefix = true;
+    }
+    return causal_prefix;
+}
+
+bool llama_kv_cache_context::get_rows_prefix() const {
+    if (!has_rows_prefix) {
+        rows_prefix     = kv->get_rows_prefix(get_kv_rows());
+        has_rows_prefix = true;
+    }
+    return rows_prefix;
+}
+
+bool llama_kv_cache_context::get_unified() const {
+    return kv->get_n_stream() == 1;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+    // every ubatch of one stream of several sequences reads through the list, also one whose cells are a prefix of
+    // the cells: the graphs keep the shape of the reserve graphs, so the compute buffers are not planned again
+    if (!kv->can_kv_rows()) {
+        return 0;
+    }
+    return get_n_kv_union();
+}
+
+const llama_kv_rows & llama_kv_cache_context::get_kv_rows() const {
+    if (!has_kv_rows) {
+        kv->get_kv_rows(ubatches[i_cur], get_n_kv_union(), kv_rows);
+        has_kv_rows = true;
+    }
+    return kv_rows;
+}
+
+bool llama_kv_cache_context::can_compact() const {
+    return kv->can_compact();
+}
+
+void llama_kv_cache_context::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_UNUSED(ubatch);
+    kv->set_input_kv_rows(dst, get_kv_rows());
+}
+
+void llama_kv_cache_context::set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_mask_rows(dst, ubatch, causal_attn, get_kv_rows());
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
@@ -3102,6 +3453,12 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // --compact-attn-mask: the column range of each token, the graph builds the mask (ggml_attn_mask_ranges())
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(causal_attn && get_causal_prefix());
+        kv->set_input_kq_bounds(dst, ubatch, n_kv);
+        return;
+    }
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
