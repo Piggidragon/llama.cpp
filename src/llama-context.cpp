@@ -572,7 +572,7 @@ llama_context::llama_context(
             const auto & co = memory_owner->cparams;
             if (&memory_owner->model != &model || !memory_owner->memory ||
                     co.n_ctx != cparams.n_ctx || co.n_seq_max != cparams.n_seq_max || co.kv_unified != cparams.kv_unified ||
-                    co.ctx_type != cparams.ctx_type) {
+                    co.ctx_type != cparams.ctx_type || co.flash_attn != cparams.flash_attn) {
                 throw std::runtime_error("the memory owner has another model or other memory parameters");
             }
             memory = memory_owner->memory;
@@ -4824,9 +4824,8 @@ llama_context * llama_init_from_model_shared_memory(
         LLAMA_LOG_ERROR("%s: model and memory_owner cannot be NULL\n", __func__);
         return nullptr;
     }
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED && model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    }
+    // the layout of the V cache follows the owner's flash attention (e.g. off for Grok, on under split mode tensor)
+    params.flash_attn_type = memory_owner->get_cparams().flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     try {
         return new llama_context(*model, params, memory_owner);

@@ -2188,8 +2188,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     note(cgraph->nodes[i]->src[k]);
                 }
             }
-            // the uids grow, the oldest graphs go first
-            while (backend_ctx->graph_views.size() > 16) {
+            // the uids grow, the oldest graphs go first; the records of all splits of a graph must stay (a graph of a
+            // model with layers on the CPU has a meta split per layer)
+            while (backend_ctx->graph_views.size() > 1024) {
                 backend_ctx->graph_views.erase(backend_ctx->graph_views.begin());
             }
         }
