@@ -2083,6 +2083,17 @@ bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_s
     return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);
 }
 
+bool ggml_backend_sched_graph_reusable(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        ggml_backend_t backend = sched->backends[sched->splits[i].backend_id];
+        if (sched->splits[i].graph.n_nodes > 0 && ggml_backend_is_meta(backend) &&
+                !ggml_backend_meta_graph_reusable(backend, &sched->splits[i].graph)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ggml_backend_sched_get_buffer_state(
         ggml_backend_sched_t sched,
         uint64_t * generation,
