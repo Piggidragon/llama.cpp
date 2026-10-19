@@ -1,0 +1,239 @@
+import os
+import shutil
+import tempfile
+import pytest
+from utils import *
+
+# a hybrid model: a cached prompt is restored only up to a checkpoint
+pytestmark = pytest.mark.skipif(not os.environ.get("LLAMA_TEST_HYBRID_MODEL"), reason="needs LLAMA_TEST_HYBRID_MODEL, a small hybrid/recurrent GGUF")
+
+server: ServerProcess
+
+SYSTEM = "You are an assistant. Rules:\n" + "\n".join(f"{k}. When module m{k} changes, run test t{k % 13} and update doc d{k % 7}." for k in range(60))
+
+
+def make_server(**kw):
+    srv = ServerProcess()
+    srv.model_hf_repo = None
+    srv.model_hf_file = None
+    srv.model_file = os.environ["LLAMA_TEST_HYBRID_MODEL"]
+    srv.n_ctx = 32768
+    srv.n_slots = 1
+    srv.n_predict = 8
+    srv.temperature = 0.0
+    srv.jinja = True
+    srv.cache_ram = 512
+    for k, v in kw.items():
+        setattr(srv, k, v)
+    return srv
+
+
+@pytest.fixture(autouse=True)
+def create_server():
+    global server
+    server = make_server()
+    yield
+    server.stop()
+
+
+def chat(messages, id_slot=-1):
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "messages": messages, "max_tokens": 8, "temperature": 0.0, "id_slot": id_slot,
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    assert res.status_code == 200
+    return res.body["timings"]["cache_n"], {"role": "assistant", "content": res.body["choices"][0]["message"]["content"] or ""}
+
+
+def n_system_tokens(head=None):
+    # the tokens of the prompt up to the first user message
+    head = head if head is not None else [{"role": "system", "content": SYSTEM}]
+    res = server.make_request("POST", "/apply-template", data={"messages": head + [{"role": "user", "content": "x"}]})
+    prompt = res.body["prompt"]
+    head = prompt[:prompt.rindex("x")]
+    head = head[:head.rindex("<|im_start|>")] if "<|im_start|>" in head else head
+    res = server.make_request("POST", "/tokenize", data={"content": head, "add_special": False, "parse_special": True})
+    return len(res.body["tokens"])
+
+
+def long_chat(n_turns):
+    msgs = [{"role": "system", "content": SYSTEM}]
+    for t in range(n_turns):
+        msgs.append({"role": "user", "content": f"Turn {t}: " + " ".join(f"what does m{(t * 7 + k) % 60} need?" for k in range(30))})
+        _, reply = chat(msgs)
+        msgs.append(reply)
+    return msgs
+
+
+@pytest.mark.parametrize("root", [False, True])
+def test_new_chat_in_the_other_slot(root):
+    # a new chat with the same system prompt in a slot that never held it: the root prompt comes from the cache
+    global server
+    server = make_server(n_slots=2, checkpoint_root=256 if root else None)
+    server.start()
+    n_sys = n_system_tokens()
+    chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which tests does m5 need?"}], id_slot=0)
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}], id_slot=1)
+    if root:
+        assert cache_n >= n_sys - 4
+    else:
+        assert cache_n == 0
+
+
+@pytest.mark.parametrize("root", [False, True])
+def test_new_chat_after_the_checkpoints_rotated(root):
+    # a long chat fills the checkpoints of its slot; the root survives the rotation and a new chat starts after it
+    global server
+    server = make_server(ctx_checkpoints=3, checkpoint_min_step=0, checkpoint_root=256 if root else None)
+    server.start()
+    n_sys = n_system_tokens()
+    long_chat(6)
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+    if root:
+        assert cache_n >= n_sys - 4
+    else:
+        assert cache_n < n_sys - 4
+
+
+def test_root_after_restart():
+    # the root prompt is stored on the disk level as a file of its own and serves a new chat after a restart
+    global server
+    cache_dir = tempfile.mkdtemp(prefix='checkpoint-root-')
+    try:
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir)
+        server.start()
+        n_sys = n_system_tokens()
+        long_chat(2)
+        server.stop()
+        assert any(os.path.basename(f).split("-")[2].startswith("r") for f in os.listdir(cache_dir) if f.endswith(".bin")) or \
+               any(f.split("-")[2].startswith("r") for f in os.listdir(cache_dir) if f.startswith("pc-") and f.endswith(".bin"))
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir)
+        server.start()
+        cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+        assert cache_n >= n_sys - 4
+    finally:
+        server.stop()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("save_min", [None, 64])
+def test_conversation_back_after_another_chat(save_min):
+    # chat B takes the slot of chat A and keeps most of it (the system prompt): with --cache-save-min chat A is saved
+    # first and comes back whole
+    global server
+    server = make_server(checkpoint_root=256, cache_save_min=save_min)
+    server.start()
+    a = long_chat(3)
+    a_len = server.make_request("POST", "/apply-template", data={"messages": a}).body["prompt"]
+    n_a = len(server.make_request("POST", "/tokenize", data={"content": a_len, "add_special": False, "parse_special": True}).body["tokens"])
+    chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+    a.append({"role": "user", "content": "And m11?"})
+    cache_n, _ = chat(a)
+    if save_min:
+        # restored up to the checkpoint at the end of the last prompt of chat A
+        assert cache_n >= n_a - 32
+    else:
+        assert cache_n < n_a - 64
+
+
+@pytest.mark.parametrize("spread", [False, True])
+def test_edit_far_back(spread):
+    # an agent rewrites a turn far back in a long chat: with --checkpoint-spread a checkpoint before it is still there
+    global server
+    # 6 checkpoints: the root and 5 for the turns; first-in-first-out keeps only the last 5 turns
+    server = make_server(ctx_checkpoints=6, checkpoint_min_step=0, checkpoint_root=256, checkpoint_spread=spread)
+    server.start()
+    n_sys = n_system_tokens()
+    msgs = long_chat(12)
+    # rewrite the user message of turn 5 (index 1 + 2*5) and resend everything up to the end
+    msgs[11] = {"role": "user", "content": "Turn 5, rewritten: what does m1 need?"}
+    cache_n, _ = chat(msgs)
+    if spread:
+        assert cache_n > n_sys + 64
+    else:
+        assert cache_n <= n_sys + 8
+
+
+def test_root_from_disk_without_checkpoints():
+    # a root file from a server with checkpoints, restored by one with --ctx-checkpoints 0: no checkpoint is made
+    global server
+    cache_dir = tempfile.mkdtemp(prefix='checkpoint-root-')
+    try:
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir)
+        server.start()
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which tests does m5 need?"}])
+        server.stop()
+        server = make_server(checkpoint_root=256, cache_disk=cache_dir, ctx_checkpoints=0)
+        server.start()
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+        chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m3 need?"}])
+    finally:
+        server.stop()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def test_nested_roots():
+    # the root of a conversation that starts with an assistant greeting after a system prompt whose own root the slot
+    # holds: the new root reaches the cache too
+    global server
+    server = make_server(n_slots=2, cache_ram=1024, checkpoint_root=256)
+    server.start()
+    greeting = {"role": "assistant", "content": "Hello! I am the build assistant. " + " ".join(f"Module m{k} is owned by team t{k % 5}." for k in range(40))}
+    chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which tests does m5 need?"}], id_slot=0)
+    chat([{"role": "system", "content": SYSTEM}, greeting, {"role": "user", "content": "Which docs does m9 need?"}], id_slot=0)
+    n_root = n_system_tokens([{"role": "system", "content": SYSTEM}, greeting])
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, greeting, {"role": "user", "content": "Who owns m3?"}], id_slot=1)
+    assert cache_n >= n_root - 8
+
+
+def test_root_after_slot_restore():
+    # a slot file has no root flags: the checkpoint at the end of the system prompt becomes the root again, and survives
+    # the rotation of the other checkpoints
+    global server
+    slot_dir = tempfile.mkdtemp(prefix='checkpoint-root-slots-')
+    try:
+        server = make_server(checkpoint_root=256, ctx_checkpoints=3, checkpoint_min_step=0, slot_save_path=slot_dir)
+        server.start()
+        n_sys = n_system_tokens()
+        msgs = long_chat(1)
+        res = server.make_request("POST", "/slots/0?action=save", data={"filename": "root.bin"})
+        assert res.status_code == 200
+        server.stop()
+        server = make_server(checkpoint_root=256, ctx_checkpoints=3, checkpoint_min_step=0, slot_save_path=slot_dir)
+        server.start()
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "root.bin"})
+        assert res.status_code == 200
+        for t in range(1, 6):
+            msgs.append({"role": "user", "content": f"Turn {t}: " + " ".join(f"what does m{(t * 7 + k) % 60} need?" for k in range(30))})
+            _, reply = chat(msgs)
+            msgs.append(reply)
+        cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}])
+        assert cache_n >= n_sys - 4
+    finally:
+        server.stop()
+        shutil.rmtree(slot_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("idle", [True, False])
+def test_root_survives_a_small_cache(idle):
+    # slot 0 holds a conversation with the system prompt, slot 1 serves chats with other system prompts, each saved
+    # when the next takes the slot; the cache holds only a few states: the root stays behind its conversation in the
+    # LRU order, so a new chat with the system prompt in slot 1 starts after it
+    global server
+    server = make_server(n_slots=2, cache_ram=200, checkpoint_root=256)
+    if not idle:
+        server.no_cache_idle_slots = True
+    server.start()
+    n_sys = n_system_tokens()
+    msgs = [{"role": "system", "content": SYSTEM}]
+    def turn(t):
+        msgs.append({"role": "user", "content": f"Turn {t}: " + " ".join(f"what does m{(t * 7 + k) % 60} need?" for k in range(30))})
+        _, reply = chat(msgs, id_slot=0)
+        msgs.append(reply)
+    turn(0)
+    for k in range(6):
+        other = f"You are bot {k}. Policy:\n" + "\n".join(f"{j}. Item i{j} of bot {k} costs {j * (k + 3) % 97} coins." for j in range(70))
+        chat([{"role": "system", "content": other}, {"role": "user", "content": "What does i7 cost?"}], id_slot=1)
+        turn(k + 1)
+    cache_n, _ = chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": "Which docs does m9 need?"}], id_slot=1)
+    assert cache_n >= n_sys - 4

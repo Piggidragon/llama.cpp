@@ -377,7 +377,7 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
         auto next = std::next(it);
 
         // a waiting entry is left alone: fetch() may wait for it after a cancelled write
-        if (&*it != &cur && !it->busy() && !it->pending && !it->foreign && it->tokens.size() <= cur.tokens.size() &&
+        if (&*it != &cur && !it->busy() && !it->pending && !it->foreign && !it->root && it->tokens.size() <= cur.tokens.size() &&
             cur.tokens.get_common_prefix(it->tokens) == it->tokens.size()) {
             SRV_TRC("disk prompt cache: removing prompt with %zu tokens, contained in the new one\n", it->tokens.size());
             erase_entry(it);
@@ -554,7 +554,7 @@ void server_prompt_cache_disk::refresh_foreign() {
             server_prompt_cache_state  state;
             std::vector<server_kv_key> keys;
 
-            const bool ranged = kind == 'h' && read_head(path, fp, state, keys, true);
+            const bool ranged = (kind == 'h' || kind == 'r') && read_head(path, fp, state, keys, true);
 
             entries.emplace_back();
 
@@ -656,7 +656,7 @@ void server_prompt_cache_disk::scan() {
                 continue;
             }
 
-            // a KV block: 'k', a head of a ranged state: 'h', a whole state: hex digits
+            // a KV block: 'k', a head of a ranged state: 'h' ('r' for a root prompt), a whole state: hex digits
             const char kind = name[prefix.size()];
 
             if (kind == 'k') {
@@ -676,7 +676,7 @@ void server_prompt_cache_disk::scan() {
             server_prompt_cache_state  state;
             std::vector<server_kv_key> keys;
 
-            const bool ok = kind == 'h' ? read_head(path, fp, state, keys, true) : read_file(path, state, true);
+            const bool ok = kind == 'h' || kind == 'r' ? read_head(path, fp, state, keys, true) : read_file(path, state, true);
 
             if (!ok) {
                 SRV_WRN("disk prompt cache: removing unreadable file '%s'\n", path.c_str());
@@ -690,7 +690,8 @@ void server_prompt_cache_disk::scan() {
             e.id      = id_next++;
             e.path    = path;
             e.fp      = fp;
-            e.ranged  = kind == 'h';
+            e.ranged  = kind == 'h' || kind == 'r';
+            e.root    = kind == 'r';
             e.blocks  = std::move(keys);
             e.tokens  = std::move(state.prompt.tokens);
             e.size    = de.file_size();
@@ -756,13 +757,25 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
 
     const bool ranged = state.data.ranged;
 
-    const std::string name = prefix + (ranged ? "h" : "") + hex64(fnv1a(FNV_OFFSET, packed.data(), packed.size())) + ".bin";
+    const bool root = ranged && state.root;
+
+    const std::string name = prefix + (root ? "r" : ranged ? "h" : "") + hex64(fnv1a(FNV_OFFSET, packed.data(), packed.size())) + ".bin";
 
     std::lock_guard<std::mutex> lk(mtx);
 
-    for (const auto & e : entries) {
-        if (e.tokens.size() >= n_tokens && e.tokens.get_common_prefix(state.prompt.tokens) == n_tokens) {
+    // a root prompt is stored next to the conversations that continue it, once
+    for (auto & e : entries) {
+        if (e.tokens.size() >= n_tokens && e.tokens.get_common_prefix(state.prompt.tokens) == n_tokens &&
+                (!root || (e.root && e.tokens.size() == n_tokens))) {
             SRV_TRC("disk prompt cache: prompt with %zu tokens is already stored, skipping\n", n_tokens);
+            // it is still in use: newer in the LRU order of the directory
+            if (t_used > e.t_used) {
+                e.t_used = t_used;
+                if (e.on_disk && !e.busy()) {
+                    std::error_code ec;
+                    fs::last_write_time(fs::u8path(e.path), t_used, ec);
+                }
+            }
             return;
         }
     }
@@ -770,7 +783,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     // waiting states that this one continues would be removed once it is written, drop them now
     for (auto it = entries.begin(); it != entries.end();) {
         auto next = std::next(it);
-        if (!it->on_disk && !it->busy() && state.prompt.tokens.get_common_prefix(it->tokens) == it->tokens.size()) {
+        if (!it->on_disk && !it->busy() && !it->root && state.prompt.tokens.get_common_prefix(it->tokens) == it->tokens.size()) {
             erase_entry(it);
         }
         it = next;
@@ -814,6 +827,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     e.fp       = fingerprint;
     e.tokens   = state.prompt.tokens.clone();
     e.ranged   = ranged;
+    e.root     = root;
     e.size     = size_state;
     e.size_mem = size_state;
     e.t_used   = t_used;

@@ -721,6 +721,10 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // the prompt up to the root checkpoint of a conversation (--checkpoint-root), the end of its system prompt:
+    // shared by every conversation that starts with it, restored by copy; it stays recent while they are saved
+    bool root = false;
+
     size_t size_own() const {
         size_t res = data.size_own();
 
@@ -765,6 +769,11 @@ struct server_prompt_cache {
     // the newest n_checkpoints of a prompt
     static std::list<common_prompt_checkpoint> newest_checkpoints(const std::list<common_prompt_checkpoint> & checkpoints);
 
+    // the prefix of tokens_new that a state restores: its common prefix with tokens_new, or, for a memory that rolls
+    // back only to checkpoints (rolls_back_to_checkpoints), the newest checkpoint within it (all of it if the state is a
+    // prefix of tokens_new)
+    size_t n_usable(const server_prompt & prompt, size_t lcp) const;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -776,6 +785,10 @@ struct server_prompt_cache {
     // so it is used only if the new prompt holds it whole
     bool needs_checkpoints = false;
 
+    // the memory rolls back only to a context checkpoint (recurrent state, not a sliding window): a cached prompt
+    // restores up to its newest checkpoint within the common prefix, see n_usable()
+    bool rolls_back_to_checkpoints = false;
+
     // all slots share one KV stream: a restore can fail for a lack of free cells
     bool kv_unified = false;
 
@@ -785,6 +798,13 @@ struct server_prompt_cache {
     // the bytes copy_state() would allocate, without copying: the KV blocks shared with cached prompts are
     // returned in shared and not counted
     size_t copy_size(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, std::vector<server_kv_block_ptr> & shared);
+
+    // a root state (server_prompt_cache_state::root) for the root checkpoint of prompt, if it has one that no state
+    // holds yet; the slot still holds the KV of the prompt
+    void save_root(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // the root state of the root checkpoint of prompt to the most recently used end
+    void touch_root(const server_prompt & prompt);
 
     // copy the prompt of a slot into the cache, false if it is cached already or does not fit
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
