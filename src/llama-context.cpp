@@ -3089,7 +3089,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // with a draft vocabulary, reserve for the whole head: llama_set_draft_vocab() can switch to it, the larger logits
+    const bool draft_vocab_on_saved = draft_vocab_on;
+    draft_vocab_on = false;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    draft_vocab_on = draft_vocab_on_saved;
 
     res->reset();
 

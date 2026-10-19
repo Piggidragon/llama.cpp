@@ -4428,8 +4428,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-vocab-max-miss"}, "P",
         string_format("with --spec-draft-vocab: draft over the whole vocabulary while more than this share of the last 64 "
-                      "tokens of a sequence is outside the list (a language the list does not cover), back below half of "
-                      "it; 1 = never (default: %.2f)", (double) params.speculative.draft.vocab_max_miss),
+                      "tokens of most drafting sequences is outside the list (a language the list does not cover), a "
+                      "sequence is back below half of it; 1 = never (default: %.2f)", (double) params.speculative.draft.vocab_max_miss),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_max_miss = std::stof(value);
             if (!(params.speculative.draft.vocab_max_miss >= 0.0f)) {

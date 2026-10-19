@@ -2173,6 +2173,13 @@ void llama_model_base::load_draft_head(llama_model_loader & ml) {
         skip("the model has no plain output head");
         return;
     }
+    // the MTP layers of some models (e.g. DeepSeek, GLM) can project with their own head instead of the output head
+    for (const auto & layer : layers) {
+        if (layer.nextn.shared_head_head != nullptr) {
+            skip("the MTP layers of this model have their own head (nextn.shared_head_head)");
+            return;
+        }
+    }
     const auto * weight = ml.get_weight(ggml_get_name(output));
     if (weight == nullptr) {
         skip("the output head is not read from the model file");

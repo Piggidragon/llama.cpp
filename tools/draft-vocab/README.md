@@ -15,11 +15,20 @@ llama-server -m model.gguf --spec-type draft-mtp --spec-draft-vocab draft-vocab.
 ```
 
 - `-f FILE` (several allowed): text like the one the model will write: code in the languages you use, the
-  languages of the answers, the format of the tool calls. The list is only as good as the corpus: in a language the
-  corpus lacks, the drafts from the list are mostly rejected (German with a code/English list: a quarter accepted
-  instead of half, slower than no list). While more than `--spec-draft-vocab-max-miss` (default 0.10) of the last 64
-  tokens of a sequence are outside the list, the drafter uses the whole vocabulary instead, so such a conversation
-  runs as without a list; include the languages you use in the corpus to keep the gain there too.
+  languages of the answers, the format of the tool calls, the shell commands and their output. The list is only as
+  good as the corpus: in a language the corpus lacks, the drafts from the list are mostly rejected (German with a
+  code/English list: a quarter accepted instead of half, slower than no list). While more than
+  `--spec-draft-vocab-max-miss` (default 0.10) of the last 64 tokens of a sequence are outside the list, the drafter
+  uses the whole vocabulary instead, so such a conversation runs as without a list; include the languages you use in
+  the corpus to keep the gain there too.
+- The head is one for all sequences of a batch: it goes to the whole vocabulary while most of the drafting sequences
+  are outside the list. With two slots, one in a language the list lacks and one in a covered one, both keep the list
+  (the first drafts as without the fallback, the second keeps its gain).
+- With a list, draft sampling runs on the CPU (the context hands the logits of the list's tokens to the sampler as
+  candidates), also while drafting over the whole vocabulary. Where draft sampling would otherwise run on the device
+  (`--spec-draft-backend-sampling`, not with `-sm tensor`), the fallback is about 2% slower than no list.
+- Models whose MTP layers project with their own head (`nextn.shared_head_head`, e.g. some DeepSeek and GLM files) do
+  not use the list; the model logs a warning at load.
 - `--coverage P` (default 0.995): the most frequent tokens that together make up this share of the corpus's tokens.
 - `--max-tokens N`: at most N tokens.
 - Control, user-defined (e.g. `<think>`, `<tool_call>`) and end-of-generation tokens are always added.

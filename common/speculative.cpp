@@ -1456,6 +1456,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // --spec-draft-vocab: the tokens of the draft head, and whether the context drafts over the whole vocabulary now,
     // because the recent text of a sequence is often outside the list (see vocab_max_miss)
     std::vector<bool> vocab_in;
+    std::vector<bool> seq_miss;          // per sequence: its recent tokens are often outside the list
     bool              vocab_full = false;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1526,12 +1527,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (uint32_t k = 0; k < llama_model_n_draft_vocab(llama_get_model(ctx_dft)); ++k) {
                 vocab_in[ids[k]] = true;
             }
+            seq_miss.assign(n_seq, false);
         }
 
-        // offload draft sampling to the backend (not with a draft vocabulary: the context hands its logits to the CPU
-        // sampler as the candidates of the vocabulary's tokens)
+        // offload draft sampling to the backend (not with a draft head: the context hands its logits to the CPU sampler
+        // as the candidates of the vocabulary's tokens, also while it drafts over the whole vocabulary)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && this->params.vocab.empty()) {
+        if (this->params.backend_sampling && vocab_in.empty()) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1767,11 +1769,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // the list holds the tokens of the corpus it was made from: a sequence whose recent text is often outside it
-        // (e.g. another language) gets few good drafts from it, so the context drafts over the whole vocabulary then
+        // (e.g. another language) gets few good drafts from it, so the context drafts over the whole vocabulary while
+        // most of the drafting sequences are such ones (the head is one for all sequences of the batch)
         if (!vocab_in.empty() && params.vocab_max_miss < 1.0f) {
             constexpr size_t n_recent = 64;
-            const float thr = vocab_full ? 0.5f*params.vocab_max_miss : params.vocab_max_miss;
-            bool miss = false;
+            int32_t n_seq_miss = 0;
+            int32_t n_seq_seen = 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id] || dparams[seq_id].prompt == nullptr) {
                     continue;
@@ -1783,9 +1786,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const llama_token t = prompt[k];
                     n_out += t >= 0 && (size_t) t < vocab_in.size() && !vocab_in[t];
                 }
-                miss = miss || (n > 0 && (float) n_out > thr*n);
+                // a sequence leaves the miss state below half the threshold
+                const float thr = seq_miss[seq_id] ? 0.5f*params.vocab_max_miss : params.vocab_max_miss;
+                seq_miss[seq_id] = n > 0 && (float) n_out > thr*n;
+                n_seq_miss += seq_miss[seq_id];
+                n_seq_seen += 1;
             }
-            if (miss != vocab_full) {
+            const bool miss = 2*n_seq_miss > n_seq_seen;
+            if (n_seq_seen > 0 && miss != vocab_full) {
                 vocab_full = miss;
                 llama_set_draft_vocab(ctx_dft, !vocab_full);
                 SPC_DBG("drafting over the %s\n", vocab_full ? "whole vocabulary" : "draft vocabulary");
