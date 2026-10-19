@@ -130,6 +130,13 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// --kv-unified-gather: the FlashAttention with a list of K/V rows, which CUDA computes for some shapes only
+static const llm_fused_op_probe llm_fused_op_kv_rows_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
+    /*.name             =*/ "kv_unified_gather (Flash Attention with a list of K/V rows)",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_AR,
     /*.name             =*/ "fused Gated Delta Net (autoregressive)",
@@ -211,6 +218,32 @@ llama_context::llama_context(
     cparams.split_overlap            = params.split_overlap;
     cparams.phase_aware_workspace    = params.phase_aware_workspace;
     cparams.live_context_workspace   = params.live_context_workspace;
+    cparams.kv_unified_gather        = params.kv_unified_gather;
+    // the list of K/V rows of --kv-unified-gather is gathered by the CPU and CUDA backends only: other backends would
+    // read the columns of its mask as the first cells
+    if (cparams.kv_unified_gather) {
+        const auto gathers = [](ggml_backend_dev_t dev) {
+            return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
+        };
+        bool ok = true;
+        for (const auto & dev : model.devices) {
+            if (dev.is_meta) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    const auto type = ggml_backend_dev_type(d);
+                    ok &= (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) || gathers(d);
+                }
+            } else {
+                ok &= gathers(dev.dev);
+            }
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: kv_unified_gather needs the CPU or CUDA backend, it is not used\n", __func__);
+            cparams.kv_unified_gather = false;
+        }
+    }
+    cparams.compact_attn_mask        = params.compact_attn_mask;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -322,6 +355,8 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    cparams.auto_kv_rows = cparams.kv_unified_gather;
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
@@ -414,6 +449,12 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: allreduce             = %s\n",   __func__, llama_allreduce_type_name(params.allreduce_type));
     }
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.kv_unified_gather) {
+        LLAMA_LOG_INFO("%s: kv_unified_gather     = true\n", __func__);
+    }
+    if (cparams.compact_attn_mask) {
+        LLAMA_LOG_INFO("%s: compact_attn_mask     = true\n", __func__);
+    }
     LLAMA_LOG_INFO("%s: fa_native_quants      = %s\n",   __func__, cparams.flash_attn_native_quants ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
@@ -726,8 +767,36 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     };
 
     if (cparams.auto_fa) {
+        // without the list of --kv-unified-gather, which is checked on its own below: a device that cannot gather keeps
+        // FlashAttention, the list is not used then
+        const bool kv_unified_gather = cparams.kv_unified_gather;
+        cparams.kv_unified_gather = false;
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
+        cparams.kv_unified_gather = kv_unified_gather;
         cparams.auto_fa = false;
+    }
+
+    // the reserve graphs of a unified cache read it through the list: the attention must stay on the device of its
+    // layer (the CUDA kernels gather at head sizes 128 and 256 from Turing on, without logit softcapping)
+    if (cparams.auto_kv_rows) {
+        if (cparams.flash_attn && cparams.kv_unified) {
+            resolve(llm_fused_op_kv_rows_probe, cparams.kv_unified_gather);
+
+            // a model whose attention never reads the cache through a list (e.g. its mask feeds more than the
+            // attention, ALiBi, SWA only, no KV cache): the flag would only keep the cells of idle sequences
+            bool any_rows = false;
+            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                any_rows = any_rows || (node.op == LLM_FUSED_OP_FLASH_ATTN && node.tensor->src[5] != nullptr);
+            }
+            if (cparams.kv_unified_gather && !any_rows) {
+                LLAMA_LOG_INFO("%s: kv_unified_gather: no attention of this model reads the KV cache through a list, it is not used\n", func);
+                cparams.kv_unified_gather = false;
+            }
+        } else {
+            // a list exists only for a unified KV cache, with FlashAttention
+            cparams.kv_unified_gather = false;
+        }
+        cparams.auto_kv_rows = false;
     }
 
     if (cparams.auto_fgdn) {
@@ -2395,6 +2464,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             lane_switch(0);
         }
 
+        // a mask fallback had the compute buffers planned for its shape: reserve the worst case before the next batch,
+        // else every larger ubatch after it is planned again
+        if (res && !sched_need_reserve) {
+            for (const auto & inp : res->inputs) {
+                if (inp->mask_fallback()) {
+                    sched_need_reserve = true;
+                    break;
+                }
+            }
+        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -3118,6 +3198,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     } else {
         lctx->n_reallocs_same++;
     }
+
+    // the plan now has the sizes of this graph: a graph of another shape (e.g. a mask fallback, see
+    // build_attn_inp_kq_mask_compact) would leave every later, larger graph to be planned again; the next decode
+    // reserves the worst case again
+    lctx->sched_need_reserve = true;
 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
@@ -4611,6 +4696,8 @@ llama_context_params llama_context_default_params() {
         /*.split_overlap               =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
+        /*.kv_unified_gather           =*/ false,
+        /*.compact_attn_mask           =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4827,6 +4914,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+bool llama_get_kv_unified_gather(const llama_context * ctx) {
+    return ctx->get_cparams().kv_unified_gather && ctx->get_cparams().flash_attn;
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

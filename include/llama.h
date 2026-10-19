@@ -444,6 +444,12 @@ extern "C" {
                                        // computes in the buffers of its target
         bool live_context_workspace;   // size the attention part of the compute buffers by the used part of the KV
                                        // cache (power-of-two steps from 1/8 of it) instead of its full size
+        bool kv_unified_gather;        // with a unified KV cache that holds several sequences: the attention of a
+                                       // ubatch reads only the cells of the ubatch's sequences (CUDA, where a gather
+                                       // kernel exists), not every used cell
+        bool compact_attn_mask;        // a causal attention mask whose visible cells are a prefix of the cells for
+                                       // every token is built on the device from one bound per token instead of
+                                       // being uploaded
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1190,6 +1196,10 @@ extern "C" {
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
+    // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
+    // (llama_context_params::kv_unified_gather, if the devices and the model support it)
+    LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

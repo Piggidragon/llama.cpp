@@ -512,6 +512,8 @@ struct common_params {
     bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next
     bool phase_aware_workspace    = false; // size the compute buffers for prompt or generation, share them with the MTP draft
     bool live_context_workspace   = false; // size the attention compute buffers by the used part of the KV cache
+    bool kv_unified_gather        = false; // attention reads only the cells of the ubatch's sequences (unified KV)
+    bool compact_attn_mask        = false; // causal masks built on the device from one bound per token
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
