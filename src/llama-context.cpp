@@ -2464,6 +2464,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             lane_switch(0);
         }
 
+        // a mask fallback had the compute buffers planned for its shape: reserve the worst case before the next batch,
+        // else every larger ubatch after it is planned again
+        if (res && !sched_need_reserve) {
+            for (const auto & inp : res->inputs) {
+                if (inp->mask_fallback()) {
+                    sched_need_reserve = true;
+                    break;
+                }
+            }
+        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -3187,6 +3198,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     } else {
         lctx->n_reallocs_same++;
     }
+
+    // the plan now has the sizes of this graph: a graph of another shape (e.g. a mask fallback, see
+    // build_attn_inp_kq_mask_compact) would leave every later, larger graph to be planned again; the next decode
+    // reserves the worst case again
+    lctx->sched_need_reserve = true;
 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),

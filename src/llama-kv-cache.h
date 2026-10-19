@@ -17,6 +17,14 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// see llama_kv_cache::get_kv_rows()
+struct llama_kv_rows {
+    std::vector<int32_t>  rows;    // n_rows entries
+    std::vector<uint32_t> seg;     // the first row of each sequence of the ubatch (by seq_idx) and the end; empty: union
+    size_t                n_live  = 0;
+    bool                  ordered = true; // the cells of each segment are in the causal order
+};
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -271,19 +279,19 @@ public:
 
     // --kv-unified-gather, one stream: the attention reads the cells of the ubatch's sequences through a list of
     // n_rows rows (get_n_kv_union()): the cells of each sequence in the causal order, one segment per sequence of the
-    // ubatch (seg_begin[seq_idx]), so that a token sees a range of the list; where the segments do not fit n_rows
-    // (several sequences share many cells) the union of the cells by index instead, *seg empty. The rest of the list
-    // repeats cell 0, masked. Returns the length of the list before that.
-    size_t get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, std::vector<int32_t> & rows, std::vector<uint32_t> * seg = nullptr) const;
+    // ubatch (seg[seq_idx], and the end), so that a token sees a range of the list; where the segments do not fit
+    // n_rows (several sequences share many cells) the union of the cells by index, seg empty. The rest of the list
+    // repeats cell 0, masked. Built once per ubatch (llama_kv_cache_context caches it).
+    void get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, llama_kv_rows & out) const;
 
-    // whether every token of a ubatch sees a range of its segment of the list of get_kv_rows()
-    bool get_rows_prefix(const llama_ubatch & ubatch, uint32_t n_rows) const;
+    // whether every token sees one range of its segment: segments, in the causal order (M-RoPE ties included)
+    bool get_rows_prefix(const llama_kv_rows & kr) const;
 
     // I32 [n_rows]
-    void set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kv_rows(ggml_tensor * dst, const llama_kv_rows & kr) const;
 
-    // the mask over the list of n_rows: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const;
+    // the mask over the list: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_kv_rows & kr) const;
 
     // I32 [2, n_tokens/n_stream, 1, n_stream]: the column range [0, n) of the cells token i sees
     void set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const;
@@ -464,17 +472,19 @@ public:
     // see llama_kv_cache::get_causal_prefix()
     bool get_causal_prefix() const;
 
-    // see llama_kv_cache::get_rows_prefix(), and whether the cache has one stream
+    // see llama_kv_cache::get_rows_prefix()
     bool get_rows_prefix() const;
     bool get_unified() const;
 
+    // see llama_kv_cache::can_compact()
+    bool can_compact() const;
+
     // the rows of the list of get_kv_rows() (the cells of the ubatch's sequences, padded), 0 if the attention reads the
-    // first n_kv cells: no list for several streams, SWA or ALiBi, or if it would neither be shorter nor give one
-    // sequence the ranges of a causal prefix
+    // first n_kv cells (llama_kv_cache::can_kv_rows() is false)
     uint32_t get_n_kv_rows() const;
 
     void set_input_kv_rows     (ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t n_rows) const;
+    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -561,8 +571,11 @@ private:
     mutable bool has_causal_prefix = false;
     mutable bool has_rows_prefix   = false;
 
-    // a context for reserving the compute buffers, see get_n_kv_rows()
-    bool is_reserve = false;
+    // the list of the current ubatch, built once for the graph and its inputs
+    mutable llama_kv_rows kv_rows;
+    mutable bool          has_kv_rows = false;
+
+    const llama_kv_rows & get_kv_rows() const;
 
     // the largest n_kv of the ubatches of a batch context, see get_attn_reserve_n_kv()
     uint32_t reserve_n_kv = 0;

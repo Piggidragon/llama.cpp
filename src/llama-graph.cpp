@@ -97,9 +97,12 @@ static ggml_tensor * build_attn_inp_kq_mask_compact(
         bool allow_rows,
         ggml_tensor ** cnv,
         ggml_tensor ** rows,
-        uint32_t * rows_n_kv) {
+        uint32_t * rows_n_kv,
+        bool * dense_fallback) {
     *rows      = nullptr;
     *rows_n_kv = 0;
+    // a dense mask where the reserve graphs of the cache have ranges, see llm_graph_input_i::mask_fallback()
+    *dense_fallback = false;
 
     const uint32_t n_rows = graph_kv_rows(mctx, cparams, allow_rows);
     if (n_rows > 0) {
@@ -108,8 +111,9 @@ static ggml_tensor * build_attn_inp_kq_mask_compact(
         ggml_set_input(*rows);
         ggml_set_name(*rows, "attn_inp_kv_rows");
 
+        // the ranges also for a non-causal ubatch (its whole segment): the shape of the reserve graphs
         ggml_tensor * res;
-        if (cparams.causal_attn && mctx->get_rows_prefix()) {
+        if (mctx->get_rows_prefix()) {
             res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, ubatch.n_tokens, 1, 1);
             ggml_set_input(res);
             ggml_set_name(res, "attn_inp_kq_rows_ranges");
@@ -120,6 +124,7 @@ static ggml_tensor * build_attn_inp_kq_mask_compact(
             ggml_set_input(res);
             ggml_set_name(res, "attn_inp_kq_mask_rows");
             *cnv = res;
+            *dense_fallback = true;
         }
         return res;
     }
@@ -127,6 +132,7 @@ static ggml_tensor * build_attn_inp_kq_mask_compact(
     if (!graph_kq_mask_compact(mctx, cparams)) {
         ggml_tensor * res = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
         *cnv = res;
+        *dense_fallback = cparams.compact_attn_mask && mctx->can_compact();
         return res;
     }
 
@@ -160,7 +166,7 @@ static bool can_reuse_kq_mask_compact(
         if (kv_rows == nullptr || kv_rows->ne[0] != n_rows || kv_rows_n_kv != mctx->get_n_kv()) {
             return false;
         }
-        const bool ranges = cparams.causal_attn && mctx->get_rows_prefix();
+        const bool ranges = mctx->get_rows_prefix();
         return (kq_mask->type == GGML_TYPE_I32) == ranges && kq_mask->ne[1] == ubatch.n_tokens && kq_mask_cnv->ne[0] == n_rows;
     }
 
@@ -181,7 +187,7 @@ static void set_input_kq_mask_compact(
         const llama_kv_cache_context * mctx, ggml_tensor * kq_mask, ggml_tensor * kv_rows, const llama_ubatch * ubatch, bool causal_attn) {
     if (kv_rows != nullptr) {
         mctx->set_input_kv_rows(kv_rows, ubatch);
-        mctx->set_input_kq_mask_rows(kq_mask, ubatch, causal_attn, kv_rows->ne[0]);
+        mctx->set_input_kq_mask_rows(kq_mask, ubatch, causal_attn);
         return;
     }
     mctx->set_input_kq_mask(kq_mask, ubatch, causal_attn);
@@ -3257,7 +3263,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
         inp->allow_rows   = allow_rows;
-        inp->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, mctx_cur, ubatch, cparams, allow_rows, &inp->self_kq_mask_cnv, &inp->self_kv_rows, &inp->self_kv_rows_n_kv);
+        inp->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, mctx_cur, ubatch, cparams, allow_rows, &inp->self_kq_mask_cnv, &inp->self_kv_rows, &inp->self_kv_rows_n_kv, &inp->mask_dense);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3841,7 +3847,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, mctx_cur->get_base(), ubatch, cparams, true, &inp->self_kq_mask_cnv, &inp->self_kv_rows, &inp->self_kv_rows_n_kv);
+        inp->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, mctx_cur->get_base(), ubatch, cparams, true, &inp->self_kq_mask_cnv, &inp->self_kv_rows, &inp->self_kv_rows_n_kv, &inp->mask_dense);
     }
 
     {
@@ -4087,7 +4093,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp_attn->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, attn_ctx->get_base(), ubatch, cparams, true, &inp_attn->self_kq_mask_cnv, &inp_attn->self_kv_rows, &inp_attn->self_kv_rows_n_kv);
+        inp_attn->self_kq_mask = build_attn_inp_kq_mask_compact(ctx0, attn_ctx->get_base(), ubatch, cparams, true, &inp_attn->self_kq_mask_cnv, &inp_attn->self_kv_rows, &inp_attn->self_kv_rows_n_kv, &inp_attn->mask_dense);
     }
 
     {

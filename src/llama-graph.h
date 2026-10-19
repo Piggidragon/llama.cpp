@@ -123,6 +123,12 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // the attention mask takes another shape than the reserve graphs (a dense fallback of --kv-unified-gather or
+    // --compact-attn-mask): the compute buffers get planned for this graph, the context reserves again after it
+    virtual bool mask_fallback() const {
+        return false;
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -373,6 +379,11 @@ public:
     // whether the model reads the attention mask only through the attention (a list of rows changes its columns)
     bool allow_rows = true;
 
+    // see llm_graph_input_i::mask_fallback()
+    bool mask_dense = false;
+
+    bool mask_fallback() const override { return mask_dense; }
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -550,6 +561,11 @@ public:
     ggml_tensor * self_kv_rows = nullptr;
     uint32_t      self_kv_rows_n_kv = 0;
 
+    // see llm_graph_input_i::mask_fallback()
+    bool mask_dense = false;
+
+    bool mask_fallback() const override { return mask_dense; }
+
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
@@ -707,6 +723,8 @@ public:
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
 
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
+
+    bool mask_fallback() const override { return inp_attn->mask_fallback(); }
     llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
 
     const llama_cparams cparams;
@@ -763,6 +781,8 @@ public:
     std::unique_ptr<llm_graph_input_rs>          inp_rs;
 
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
+
+    bool mask_fallback() const override { return inp_attn->mask_fallback(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
     const llama_cparams cparams;
