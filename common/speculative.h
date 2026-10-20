@@ -8,6 +8,9 @@ struct common_speculative;
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
+// the type drafts with a model (a draft context with its own state), not by lookup in the text (n-gram types)
+bool common_speculative_type_is_model(enum common_speculative_type type);
+
 // comma separated list of all types
 const char * common_speculative_all_types_str();
 
