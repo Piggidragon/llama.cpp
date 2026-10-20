@@ -2453,9 +2453,7 @@ struct common_speculative_selector {
     }
 
     static bool is_model(common_speculative_type type) {
-        return type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
-               type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-               type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        return common_speculative_type_is_model(type);
     }
 
     // a draft of impl ii was seen up to n_seen positions, the first n_hit of them accepted; positions before from were
@@ -2623,6 +2621,12 @@ static common_speculative_impl_ngram_cache create_state_ngram_cache(
     common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
 
     return state;
+}
+
+bool common_speculative_type_is_model(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+           type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+           type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {

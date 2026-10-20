@@ -1074,8 +1074,17 @@ private:
 
         const auto & dft = params_base.speculative.draft;
 
+        // the drafters with a draft context: their KV is stored with the target's; n-gram drafters store nothing, so
+        // adding one (e.g. ngram-simple next to MTP for --spec-select) keeps the files of the cache
+        std::vector<common_speculative_type> types_dft;
+        for (const auto type : params_base.speculative.types) {
+            if (common_speculative_type_is_model(type)) {
+                types_dft.push_back(type);
+            }
+        }
+
         std::string config = string_format("spec %s%s kv %s %s dft-kv %s %s rope %g %g %d yarn %g %g %g %g %d",
-                common_speculative_type_name_str(params_base.speculative.types).c_str(), ctx_dft ? " +dft" : "",
+                common_speculative_type_name_str(types_dft).c_str(), ctx_dft ? " +dft" : "",
                 ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v),
                 ggml_type_name(dft.cache_type_k), ggml_type_name(dft.cache_type_v),
                 params_base.rope_freq_base, params_base.rope_freq_scale, (int) params_base.rope_scaling_type,
