@@ -99,6 +99,12 @@ bool common_speculative_process_from(common_speculative * spec, const common_bat
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// --spec-select: the draft of seq_id was verified, n_accepted of its tokens accepted; called once per draft at its
+// verification, before a checkpoint restore (whose replay reports one more to common_speculative_accept). n_batch: the
+// tokens of the batch that verified it; clean: no prompt was computed alongside (a second context), so that a step's
+// time is only learned from a batch of the drafts alone
+void common_speculative_verified(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_batch, bool clean);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
