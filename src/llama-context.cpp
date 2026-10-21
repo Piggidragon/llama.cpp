@@ -1542,8 +1542,9 @@ float * llama_context::get_logits_ith(int32_t i) {
 }
 
 // llama_set_logits_topk: the top k of each device's share of the logits, by a small graph on that device, and their
-// copy to the host, queued after the decode's graph. Only when all outputs of the decode come from this ubatch (their
-// rows stay in the device tensor until the next graph) and the logits are in device memory; false: copy them all
+// copy to the host, queued after the decode's graph. Only when all outputs of the decode come from this ubatch, its
+// last one (their rows stay in the device tensor until the next graph), and the logits are in device memory; false:
+// copy them all
 bool llama_context::logits_topk_extract(ggml_backend_t backend_res, ggml_tensor * t_logits, int64_t n_outputs, int64_t n_outputs_all) {
     if (logits_topk <= 0 || n_outputs != n_outputs_all || n_outputs <= 0) {
         return false;
@@ -2824,7 +2825,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 const int64_t n_cols = t_logits->ne[0];
                 if (n_cols == n_vocab) {
-                    if (!logits_topk_extract(backend_res, t_logits, n_outputs_prev == 0 ? n_outputs : -1, n_outputs_all)) {
+                    // the whole rows stay in t_logits until the next graph: the outputs must be in the last ubatch
+                    const bool last = n_tokens_prev + (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all;
+                    if (!logits_topk_extract(backend_res, t_logits, n_outputs_prev == 0 && last ? n_outputs : -1, n_outputs_all)) {
                         ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
                         logits_permuted = !model.output_row_of_token.empty();
                     }
@@ -5245,6 +5248,10 @@ void llama_set_draft_vocab(llama_context * ctx, bool enabled) {
 
 void llama_set_logits_topk(llama_context * ctx, int32_t k) {
     ctx->set_logits_topk(k);
+}
+
+bool llama_get_logits_topk_active(const llama_context * ctx) {
+    return ctx->get_logits_topk_active();
 }
 
 bool llama_get_kv_unified_gather(const llama_context * ctx) {

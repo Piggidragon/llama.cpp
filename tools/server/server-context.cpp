@@ -3852,14 +3852,18 @@ private:
         spec_step_bg = bg_slot != nullptr;
 
         // --logits-topk: the target copies the top k of each device's share of the logits when the sampler of every
-        // slot in the batch samples the same token from them
+        // slot in the batch samples the same token from them. A sampler that may read a whole row needs all logits: the
+        // draft context computes in the target's buffers before the sampling. That is a grammar that constrains the next
+        // token, or one a replay may start (a replay cannot stop early; a verification stops at the token that starts it)
         if (params_base.logits_topk) {
             int32_t k = 0;
             for (const auto & slot : slots) {
                 if (!slot.is_processing() || !slot.task) {
                     continue;
                 }
-                const int32_t k_slot = slot.task->decision.labels.empty() ? common_sampler_logits_topk(slot.task->params.sampling, vocab) : 0;
+                const bool all = !slot.task->decision.labels.empty() || common_sampler_needs_all_logits(slot.smpl.get()) ||
+                                 (slot.spec_is_replay && common_sampler_can_need_all_logits(slot.smpl.get()));
+                const int32_t k_slot = all ? 0 : common_sampler_logits_topk(slot.task->params.sampling, vocab);
                 if (k_slot == 0) {
                     k = 0;
                     break;

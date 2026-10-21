@@ -1911,9 +1911,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--logits-topk"},
         {"--no-logits-topk"},
         "copy only the largest logits of each GPU's share of the vocabulary to the host, found on the GPU, when the\n"
-        "sampler of every slot in a batch samples the same token from them (a top-k after penalties and logit biases\n"
-        "<= 0, or greedy; not with n_probs, mirostat, DRY or top-n-sigma); saves the copy of whole rows (over PCIe)\n"
-        "and the CPU sampling over the whole vocabulary, most with long drafts (default: disabled)",
+        "sampler of every slot in a batch samples the same token from them (a top-k after penalties that lower logits\n"
+        "and logit biases <= 0, or greedy; not with n_probs, mirostat, DRY, top-n-sigma, or while a grammar constrains\n"
+        "the tokens); saves the copy of whole rows (over PCIe) and the CPU sampling over the whole vocabulary, most\n"
+        "with long drafts (default: disabled)",
         [](common_params & params, bool value) {
             params.logits_topk = value;
         }

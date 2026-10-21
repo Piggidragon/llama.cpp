@@ -70,9 +70,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // llama_set_logits_topk: how many of the largest logits of each device's share of the vocabulary the sampler chain of
 // these params needs to sample the same token as from all of them; 0: it needs all of them. The chain must take the
 // top k (or end greedily) after samplers that only lower a bounded number of logits (logit biases <= 0, the model's
-// suppressed tokens, penalties of the last n tokens); a grammar or a forced token of the reasoning budget read a whole
-// row when they need one (see common_sampler_sample)
+// suppressed tokens, penalties of the last n tokens that only lower logits); a token forced by the reasoning budget
+// is added to the candidates. A grammar reads a whole row: see common_sampler_needs_all_logits
 int32_t common_sampler_logits_topk(const struct common_params_sampling & params, const struct llama_vocab * vocab);
+
+// whether the next common_sampler_sample() may read the whole row of logits instead of the candidates of
+// llama_set_logits_topk: with a grammar that constrains the next token (a token it rejects is sampled again from the
+// whole row; a lazy grammar that waits for its trigger constrains none). Whole rows are gone once another graph is
+// computed, so a decode for such a sampler needs all logits. common_sampler_sample_and_accept_n* stop at a draft token
+// that starts such a grammar when the logits came as candidates
+bool common_sampler_needs_all_logits(const struct common_sampler * gsmpl);
+
+// whether a token accepted from now on can make common_sampler_needs_all_logits() true (the sampler has a grammar)
+bool common_sampler_can_need_all_logits(const struct common_sampler * gsmpl);
 
 // generalized version of common_sampler_sample
 //

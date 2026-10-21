@@ -460,7 +460,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -473,6 +473,11 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+// whether the grammar constrains the next token: a lazy one that waits for its trigger does not
+static bool grammar_constrains(const struct common_sampler * gsmpl) {
+    return grammar_should_apply(gsmpl) && !llama_sampler_grammar_waiting(gsmpl->grmr);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -644,6 +649,9 @@ int32_t common_sampler_logits_topk(const struct common_params_sampling & params,
                     if (params.penalty_last_n < 0) {
                         return 0; // the whole context
                     }
+                    if (params.penalty_repeat < 1.0f || params.penalty_freq < 0.0f || params.penalty_present < 0.0f) {
+                        return 0; // raises the logits of recent tokens: one far below the candidates can pass them
+                    }
                     n_lowered += params.penalty_last_n;
                 }
                 break;
@@ -707,6 +715,20 @@ int32_t common_sampler_logits_topk(const struct common_params_sampling & params,
     return n <= 1024 ? (int32_t) n : 0;
 }
 
+bool common_sampler_needs_all_logits(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && grammar_constrains(gsmpl);
+}
+
+bool common_sampler_can_need_all_logits(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->grmr != nullptr;
+}
+
+// a token accepted while the logits came as the candidates of llama_set_logits_topk made the next rows need all of
+// them, which another graph may have overwritten by now (e.g. the draft context in the same buffers)
+static bool common_sampler_topk_stop(const struct common_sampler * gsmpl, const struct llama_context * ctx) {
+    return llama_get_logits_topk_active(ctx) && common_sampler_needs_all_logits(gsmpl);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -720,11 +742,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    // a forced token of the reasoning budget, or a grammar applied first, may need a token outside the candidates of
-    // llama_set_logits_topk (no effect without them)
-    const bool full = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
-                      (grammar_first && grammar_should_apply(gsmpl));
+    // a grammar applied first may allow only tokens outside the candidates of llama_set_logits_topk (no effect without
+    // them)
+    const bool full = grammar_first && grammar_constrains(gsmpl);
     gsmpl->set_logits(ctx, idx, full);
+
+    // the token the reasoning budget forces may be outside the candidates: it is the only one left whatever its logit
+    if (!full && llama_get_logits_topk_active(ctx)) {
+        const llama_token forced = common_reasoning_budget_get_forced(rbudget);
+        if (forced != LLAMA_TOKEN_NULL && std::none_of(gsmpl->cur.begin(), gsmpl->cur.end(), [&](const llama_token_data & td) { return td.id == forced; })) {
+            gsmpl->cur.push_back({ forced, 0.0f, 0.0f });
+            cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+        }
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -817,6 +847,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
+
+        // the token started a grammar whose next rows may need all logits: stop at it (as if sampled here)
+        if (common_sampler_topk_stop(gsmpl, ctx)) {
+            break;
+        }
     }
 
     if (i == draft.size()) {
@@ -904,6 +939,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            // the token started a grammar whose next rows may need all logits: stop at it (as if sampled here)
+            if (common_sampler_topk_stop(gsmpl, ctx)) {
+                break;
+            }
             continue;
         }
 

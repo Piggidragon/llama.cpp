@@ -1225,10 +1225,13 @@ extern "C" {
     // output head on that device), found on the devices: the sampled-logits API reports them with their tokens
     // (llama_get_sampled_logits_ith / llama_get_sampled_candidates_ith, k per device), so only those are copied to the
     // host. llama_get_logits_ith / llama_get_logits copy a whole row from the device when asked, until a graph is
-    // computed again. Used when all the outputs of a decode come from one ubatch and the logits are in device memory;
-    // a sampler chain that takes the top k after penalties gets the same tokens with k >= top_k + the penalized
+    // computed again, also by a context computing in this one's buffers (llama_attach_shared_workspace). Used when all
+    // the outputs of a decode come from its last ubatch and the logits are in device memory; a sampler chain that
+    // takes the top k after penalties that only lower logits gets the same tokens with k >= top_k + the penalized
     // tokens. 0: all logits (default)
     LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);
+    // Returns whether the outputs of the last decode came as the candidates of llama_set_logits_topk
+    LLAMA_API bool llama_get_logits_topk_active(const struct llama_context * ctx);
     // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
     // (llama_context_params::kv_unified_gather, if the devices and the model support it)
     LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);
@@ -1672,6 +1675,9 @@ extern "C" {
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
 
+
+    /// @details Whether smpl is a lazy grammar sampler that waits for its trigger: it constrains no token until then
+    LLAMA_API bool llama_sampler_grammar_waiting(const struct llama_sampler * smpl);
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

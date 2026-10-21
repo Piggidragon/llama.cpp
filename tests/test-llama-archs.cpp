@@ -992,13 +992,14 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
 static bool check_logits_topk(llama_model * model, const std::vector<llama_token> & tokens_all, std::string & status) {
     const int32_t  k       = 8;
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    // one ubatch: all outputs of the decode come from its graph
     const std::vector<llama_token> tokens(tokens_all.begin(), tokens_all.begin() + std::min<size_t>(tokens_all.size(), 48));
+    const uint32_t n_tokens = tokens.size();
 
-    auto decode = [&](int32_t topk) {
+    // the outputs [out_begin, out_end) of a decode in ubatches of n_ubatch tokens
+    auto decode = [&](int32_t topk, uint32_t n_ubatch, uint32_t out_begin, uint32_t out_end) {
         llama_context_params ctx_params = llama_context_default_params();
         ctx_params.n_ctx           = 0;
-        ctx_params.n_ubatch        = 64;
+        ctx_params.n_ubatch        = n_ubatch;
         ctx_params.n_threads       = 4;
         ctx_params.n_threads_batch = 4;
         llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
@@ -1007,52 +1008,76 @@ static bool check_logits_topk(llama_model * model, const std::vector<llama_token
         }
         llama_set_logits_topk(ctx.get(), topk);
         common_batch batch(ctx.get());
-        for (uint32_t pos = 0; pos < tokens.size(); pos++) {
-            batch.add(tokens[pos], pos, 0, true);
+        for (uint32_t pos = 0; pos < n_tokens; pos++) {
+            batch.add(tokens[pos], pos, 0, pos >= out_begin && pos < out_end);
         }
         if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             throw std::runtime_error("failed to decode the batch of the top-k check");
         }
         return ctx;
     };
-    auto fail = [&](const char * what) {
+    auto fail = [&](const std::string & what) {
         status = std::string("\033[1;31mFAIL\033[0m (logits top-k: ") + what + ")";
         return false;
     };
 
-    llama_context_ptr ref = decode(0);
-    llama_context_ptr ctx = decode(k);
-    for (uint32_t i = 0; i < tokens.size(); i++) {
-        const float * row_ref = llama_get_logits_ith(ref.get(), i);
-        const float *       cand_logits = llama_get_sampled_logits_ith(ctx.get(), i);
-        const llama_token * cand_tokens = llama_get_sampled_candidates_ith(ctx.get(), i);
-        if (cand_logits != nullptr) {
-            const uint32_t n = llama_get_sampled_logits_count_ith(ctx.get(), i);
-            if (n < (uint32_t) k || n > n_vocab || cand_tokens == nullptr) {
-                return fail("candidate count");
-            }
-            std::vector<uint8_t> seen(n_vocab, 0);
-            for (uint32_t c = 0; c < n; c++) {
-                const llama_token t = cand_tokens[c];
-                if (t < 0 || (uint32_t) t >= n_vocab || seen[t] || cand_logits[c] != row_ref[t]) {
-                    return fail("candidate tokens or values");
-                }
-                seen[t] = 1;
-            }
-            // every logit above the k-th largest of the row is a candidate
-            std::vector<float> sorted(row_ref, row_ref + n_vocab);
-            std::nth_element(sorted.begin(), sorted.begin() + (k - 1), sorted.end(), std::greater<float>());
-            const float kth = sorted[k - 1];
-            for (uint32_t t = 0; t < n_vocab; t++) {
-                if (row_ref[t] > kth && !seen[t]) {
-                    return fail("a token of the top k missing");
-                }
-            }
+    // all outputs in one ubatch; over three ubatches with the outputs in the last one; and with the outputs in the
+    // first one, whose rows the next ubatches overwrite: then all logits are copied
+    struct topk_case {
+        const char * name;
+        uint32_t     n_ubatch;
+        uint32_t     out_begin;
+        uint32_t     out_end;
+        bool         topk_allowed;
+    };
+    const uint32_t n_ub = (n_tokens + 2) / 3;
+    const topk_case cases[] = {
+        { "one ubatch",          64,   0,                        n_tokens,                   true  },
+        { "last of 3 ubatches",  n_ub, n_tokens - n_ub/2,        n_tokens,                   true  },
+        { "first of 3 ubatches", n_ub, 0,                        std::min(n_ub, 3u),         false },
+    };
+    for (const auto & tc : cases) {
+        if (tc.out_begin >= tc.out_end) {
+            continue;
         }
-        // a whole row on request
-        const float * row = llama_get_logits_ith(ctx.get(), i);
-        if (row == nullptr || memcmp(row, row_ref, n_vocab*sizeof(float)) != 0) {
-            return fail("whole row");
+        llama_context_ptr ref = decode(0, tc.n_ubatch, tc.out_begin, tc.out_end);
+        llama_context_ptr ctx = decode(k, tc.n_ubatch, tc.out_begin, tc.out_end);
+        if (!tc.topk_allowed && llama_get_logits_topk_active(ctx.get())) {
+            return fail(std::string(tc.name) + ": top-k while later ubatches overwrite the rows");
+        }
+        // the _ith getters take the position in the batch
+        for (uint32_t i = tc.out_begin; i < tc.out_end; i++) {
+            const float * row_ref = llama_get_logits_ith(ref.get(), i);
+            const float *       cand_logits = llama_get_sampled_logits_ith(ctx.get(), i);
+            const llama_token * cand_tokens = llama_get_sampled_candidates_ith(ctx.get(), i);
+            if (cand_logits != nullptr) {
+                const uint32_t n = llama_get_sampled_logits_count_ith(ctx.get(), i);
+                if (n < (uint32_t) k || n > n_vocab || cand_tokens == nullptr) {
+                    return fail(std::string(tc.name) + ": candidate count");
+                }
+                std::vector<uint8_t> seen(n_vocab, 0);
+                for (uint32_t c = 0; c < n; c++) {
+                    const llama_token t = cand_tokens[c];
+                    if (t < 0 || (uint32_t) t >= n_vocab || seen[t] || cand_logits[c] != row_ref[t]) {
+                        return fail(std::string(tc.name) + ": candidate tokens or values");
+                    }
+                    seen[t] = 1;
+                }
+                // every logit above the k-th largest of the row is a candidate
+                std::vector<float> sorted(row_ref, row_ref + n_vocab);
+                std::nth_element(sorted.begin(), sorted.begin() + (k - 1), sorted.end(), std::greater<float>());
+                const float kth = sorted[k - 1];
+                for (uint32_t t = 0; t < n_vocab; t++) {
+                    if (row_ref[t] > kth && !seen[t]) {
+                        return fail(std::string(tc.name) + ": a token of the top k missing");
+                    }
+                }
+            }
+            // a whole row on request
+            const float * row = llama_get_logits_ith(ctx.get(), i);
+            if (row == nullptr || memcmp(row, row_ref, n_vocab*sizeof(float)) != 0) {
+                return fail(std::string(tc.name) + ": whole row");
+            }
         }
     }
     return true;
