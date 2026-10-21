@@ -131,10 +131,12 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    // full: the whole row of the logits, also where the context reports candidates (llama_set_logits_topk) - for a
+    // grammar or a forced token, which may need a token outside them
+    void set_logits(struct llama_context * ctx, int idx, bool full = false) {
+        const float *       sampled_probs  = full ? nullptr : llama_get_sampled_probs_ith     (ctx, idx);
+        const float *       sampled_logits = full ? nullptr : llama_get_sampled_logits_ith    (ctx, idx);
+        const llama_token * sampled_ids    = full ? nullptr : llama_get_sampled_candidates_ith(ctx, idx);
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -616,6 +618,95 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+int32_t common_sampler_logits_topk(const struct common_params_sampling & params, const struct llama_vocab * vocab) {
+    if (params.mirostat != 0 || params.n_probs > 0 || params.backend_sampling) {
+        return 0;
+    }
+
+    // the tokens whose logits the chain may lower before it takes the top k
+    int64_t n_lowered = 0;
+    for (const auto & lb : params.logit_bias) {
+        if (lb.bias > 0.0f) {
+            return 0;
+        }
+        n_lowered++;
+    }
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    n_lowered += n_suppress;
+
+    int64_t k = 0;
+    for (const auto type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 &&
+                        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    if (params.penalty_last_n < 0) {
+                        return 0; // the whole context
+                    }
+                    n_lowered += params.penalty_last_n;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                // a temperature scales the logits monotonically; a dynamic one reads the entropy of all of them
+                if (params.dynatemp_range > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                k = params.top_k;
+                break;
+            // these read the whole distribution when they are active
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_penalty_last_n != 0) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (params.typ_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (params.top_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (params.min_p > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0; // infill, adaptive-p
+        }
+        if (k > 0) {
+            break; // the samplers after the top k see only those
+        }
+    }
+    if (k <= 0) {
+        // without a top k only a greedy chain (temperature 0 at its end) takes the largest after the lowering
+        const bool greedy = !params.samplers.empty() && params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE &&
+                            params.temp == 0.0f && params.dynatemp_range == 0.0f;
+        if (!greedy) {
+            return 0;
+        }
+        k = 1;
+    }
+    const int64_t n = k + n_lowered;
+    return n <= 1024 ? (int32_t) n : 0;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -629,7 +720,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // a forced token of the reasoning budget, or a grammar applied first, may need a token outside the candidates of
+    // llama_set_logits_topk (no effect without them)
+    const bool full = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
+                      (grammar_first && grammar_should_apply(gsmpl));
+    gsmpl->set_logits(ctx, idx, full);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -682,8 +777,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain (over
+    // the whole row: the grammar may allow only tokens outside the candidates of llama_set_logits_topk)
+    gsmpl->set_logits(ctx, idx, true);
 
     llama_sampler_apply(rbudget,  &cur_p);
 

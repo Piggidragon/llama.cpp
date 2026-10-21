@@ -1220,6 +1220,15 @@ extern "C" {
     // An MTP context created with llama_context_params::draft_vocab drafts over the draft vocabulary (true, the
     // default) or over the whole vocabulary (false), e.g. while the text leaves the list
     LLAMA_API void llama_set_draft_vocab(struct llama_context * ctx, bool enabled);
+
+    // The logits of the next decodes come as the k largest of each device's share of the vocabulary (the rows of the
+    // output head on that device), found on the devices: the sampled-logits API reports them with their tokens
+    // (llama_get_sampled_logits_ith / llama_get_sampled_candidates_ith, k per device), so only those are copied to the
+    // host. llama_get_logits_ith / llama_get_logits copy a whole row from the device when asked, until a graph is
+    // computed again. Used when all the outputs of a decode come from one ubatch and the logits are in device memory;
+    // a sampler chain that takes the top k after penalties gets the same tokens with k >= top_k + the penalized
+    // tokens. 0: all logits (default)
+    LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);
     // Returns whether the attention reads a unified KV cache through the list of the ubatch's cells
     // (llama_context_params::kv_unified_gather, if the devices and the model support it)
     LLAMA_API bool llama_get_kv_unified_gather(const struct llama_context * ctx);

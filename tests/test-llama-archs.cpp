@@ -17,7 +17,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <functional>
 #include <cstdint>
 #include <random>
 #include <map>
@@ -983,6 +985,79 @@ static bool check_kv_rows_reuse(llama_model * model, std::string & status) {
     return ok;
 }
 
+// llama_set_logits_topk: the candidates of each output row (the top k of each device's share, found on the device) hold
+// the k largest logits of the row with their tokens and values, and a whole row read through llama_get_logits_ith (copied
+// from the device) equals the row of a context without it; compared bitwise with a context without top-k. Logits in host
+// memory (CPU) keep the whole rows, then only the rows are compared.
+static bool check_logits_topk(llama_model * model, const std::vector<llama_token> & tokens_all, std::string & status) {
+    const int32_t  k       = 8;
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    // one ubatch: all outputs of the decode come from its graph
+    const std::vector<llama_token> tokens(tokens_all.begin(), tokens_all.begin() + std::min<size_t>(tokens_all.size(), 48));
+
+    auto decode = [&](int32_t topk) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 0;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the context of the top-k check");
+        }
+        llama_set_logits_topk(ctx.get(), topk);
+        common_batch batch(ctx.get());
+        for (uint32_t pos = 0; pos < tokens.size(); pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode the batch of the top-k check");
+        }
+        return ctx;
+    };
+    auto fail = [&](const char * what) {
+        status = std::string("\033[1;31mFAIL\033[0m (logits top-k: ") + what + ")";
+        return false;
+    };
+
+    llama_context_ptr ref = decode(0);
+    llama_context_ptr ctx = decode(k);
+    for (uint32_t i = 0; i < tokens.size(); i++) {
+        const float * row_ref = llama_get_logits_ith(ref.get(), i);
+        const float *       cand_logits = llama_get_sampled_logits_ith(ctx.get(), i);
+        const llama_token * cand_tokens = llama_get_sampled_candidates_ith(ctx.get(), i);
+        if (cand_logits != nullptr) {
+            const uint32_t n = llama_get_sampled_logits_count_ith(ctx.get(), i);
+            if (n < (uint32_t) k || n > n_vocab || cand_tokens == nullptr) {
+                return fail("candidate count");
+            }
+            std::vector<uint8_t> seen(n_vocab, 0);
+            for (uint32_t c = 0; c < n; c++) {
+                const llama_token t = cand_tokens[c];
+                if (t < 0 || (uint32_t) t >= n_vocab || seen[t] || cand_logits[c] != row_ref[t]) {
+                    return fail("candidate tokens or values");
+                }
+                seen[t] = 1;
+            }
+            // every logit above the k-th largest of the row is a candidate
+            std::vector<float> sorted(row_ref, row_ref + n_vocab);
+            std::nth_element(sorted.begin(), sorted.begin() + (k - 1), sorted.end(), std::greater<float>());
+            const float kth = sorted[k - 1];
+            for (uint32_t t = 0; t < n_vocab; t++) {
+                if (row_ref[t] > kth && !seen[t]) {
+                    return fail("a token of the top k missing");
+                }
+            }
+        }
+        // a whole row on request
+        const float * row = llama_get_logits_ith(ctx.get(), i);
+        if (row == nullptr || memcmp(row, row_ref, n_vocab*sizeof(float)) != 0) {
+            return fail("whole row");
+        }
+    }
+    return true;
+}
+
 // A model loaded with a draft vocabulary (llama_model_params::draft_vocab, --spec-draft-vocab): on devices the draft
 // head is a view of the output head's rows, which are reordered at load (the list's tokens first in each device's slice)
 // and whose logits are put back in token order. Its logits must be those of the model without the list (bitwise on one
@@ -1039,6 +1114,11 @@ static bool check_draft_head(
 
         const std::vector<float> logits_list = get_logits(model, model_and_ctx.second.get(), tokens);
         GGML_ASSERT(logits_list.size() == logits_ref.size());
+        // the candidates of llama_set_logits_topk map the rows of the reordered head to their tokens
+        if (!check_logits_topk(model, tokens, status)) {
+            ok = false;
+            break;
+        }
         if (split_mode == LLAMA_SPLIT_MODE_TENSOR ? nmse(logits_ref, logits_list) > 1e-8 : logits_list != logits_ref) {
             ok = fail("logits");
             break;
@@ -1797,6 +1877,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                         }
 
+                        if (!encode && !check_logits_topk(model_and_ctx_dev.first.get(), tokens, status_range)) {
+                            test_ok = false;
+                        }
                         if (!encode && llama_model_saver_supports_arch(arch) &&
                                 !check_draft_head(model_and_ctx_cpu.first.get(), seed, stdev, tokens, dc.devs, dc.split_mode,
                                     overrides, dc.moe_cache_size, dc.attn_split, dc.split_overlap, dc.allreduce_type,

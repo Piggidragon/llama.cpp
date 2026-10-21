@@ -67,6 +67,13 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// llama_set_logits_topk: how many of the largest logits of each device's share of the vocabulary the sampler chain of
+// these params needs to sample the same token as from all of them; 0: it needs all of them. The chain must take the
+// top k (or end greedily) after samplers that only lower a bounded number of logits (logit biases <= 0, the model's
+// suppressed tokens, penalties of the last n tokens); a grammar or a forced token of the reasoning budget read a whole
+// row when they need one (see common_sampler_sample)
+int32_t common_sampler_logits_topk(const struct common_params_sampling & params, const struct llama_vocab * vocab);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
