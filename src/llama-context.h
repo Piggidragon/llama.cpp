@@ -98,6 +98,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    bool    get_logits_topk_active() const { return topk_active; }
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -138,6 +139,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_draft_vocab(bool value);
+    void set_logits_topk(int32_t k);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -480,6 +482,38 @@ private:
 
     // llama_set_draft_vocab(): the draft head is in use (with cparams.draft_vocab)
     bool draft_vocab_on = true;
+
+    // llama_set_logits_topk(): the logits of a decode come as the top k of each device's share of the vocabulary, found
+    // on the device by a small graph per device after the decode's graph; the sampled-logits API reports them with
+    // their tokens, a whole row is copied from the device tensor when the logits API asks for it
+    int32_t logits_topk = 0;
+    struct topk_share {
+        ggml_backend_t             backend = nullptr; // the backend that computed this share of the logits
+        ggml_backend_buffer_type_t buft    = nullptr;
+        ggml_gallocr_ptr           galloc;
+        ggml_tensor *              src  = nullptr;    // the share, [rows, n_outputs], in topk_ctx
+        int64_t                    row0 = 0;          // its first row of the output head
+        int64_t                    rows = 0;
+        int64_t                    k    = 0;
+        size_t                     off  = 0;          // in topk_idx / topk_val
+    };
+    std::vector<topk_share>  topk_shares;
+    ggml_context_ptr         topk_ctx;
+    bool                     topk_active = false; // the logits of the last decode are top-k candidates
+    int64_t                  topk_n      = 0;     // candidates per output row
+    std::vector<int32_t>     topk_idx;            // [share][device row][k], filled asynchronously
+    std::vector<float>       topk_val;
+    std::vector<int32_t>     topk_dev_row;        // output row -> row of the device tensors (see output_reorder)
+    std::vector<uint8_t>     topk_row_full;       // output row copied whole into logits.data
+    bool                     topk_merged = false;
+    std::vector<llama_token> topk_tokens;         // [output row][topk_n], by topk_merge()
+    std::vector<float>       topk_logits;
+    std::vector<llama_token> topk_token_of_row;   // the inverse of model.output_row_of_token
+    uint64_t                 n_graph_computes = 0;
+    uint64_t                 topk_graph       = 0; // n_graph_computes of the decode
+    bool    logits_topk_extract(ggml_backend_t backend_res, ggml_tensor * t_logits, int64_t n_outputs, int64_t n_outputs_all);
+    void    topk_merge();
+    float * topk_full_row(int64_t row);
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

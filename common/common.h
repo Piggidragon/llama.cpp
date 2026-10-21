@@ -663,6 +663,7 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_prefill_budget    = 0;     // prompt tokens per step while a slot generates (0 = up to n_batch)
     bool    concurrent_prefill  = false; // a second context computes the prompt of a slot while others generate
+    bool    logits_topk         = false; // copy only the largest logits of each device's share when the samplers allow it
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

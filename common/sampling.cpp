@@ -131,10 +131,12 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    // full: the whole row of the logits, also where the context reports candidates (llama_set_logits_topk) - for a
+    // grammar or a forced token, which may need a token outside them
+    void set_logits(struct llama_context * ctx, int idx, bool full = false) {
+        const float *       sampled_probs  = full ? nullptr : llama_get_sampled_probs_ith     (ctx, idx);
+        const float *       sampled_logits = full ? nullptr : llama_get_sampled_logits_ith    (ctx, idx);
+        const llama_token * sampled_ids    = full ? nullptr : llama_get_sampled_candidates_ith(ctx, idx);
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -458,7 +460,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -471,6 +473,11 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+// whether the grammar constrains the next token: a lazy one that waits for its trigger does not
+static bool grammar_constrains(const struct common_sampler * gsmpl) {
+    return grammar_should_apply(gsmpl) && !llama_sampler_grammar_waiting(gsmpl->grmr);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -616,6 +623,112 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+int32_t common_sampler_logits_topk(const struct common_params_sampling & params, const struct llama_vocab * vocab) {
+    if (params.mirostat != 0 || params.n_probs > 0 || params.backend_sampling) {
+        return 0;
+    }
+
+    // the tokens whose logits the chain may lower before it takes the top k
+    int64_t n_lowered = 0;
+    for (const auto & lb : params.logit_bias) {
+        if (lb.bias > 0.0f) {
+            return 0;
+        }
+        n_lowered++;
+    }
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    n_lowered += n_suppress;
+
+    int64_t k = 0;
+    for (const auto type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 &&
+                        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    if (params.penalty_last_n < 0) {
+                        return 0; // the whole context
+                    }
+                    if (params.penalty_repeat < 1.0f || params.penalty_freq < 0.0f || params.penalty_present < 0.0f) {
+                        return 0; // raises the logits of recent tokens: one far below the candidates can pass them
+                    }
+                    n_lowered += params.penalty_last_n;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                // a temperature scales the logits monotonically; a dynamic one reads the entropy of all of them
+                if (params.dynatemp_range > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                k = params.top_k;
+                break;
+            // these read the whole distribution when they are active
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_penalty_last_n != 0) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (params.typ_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (params.top_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (params.min_p > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (params.xtc_probability > 0.0f && params.xtc_threshold <= 0.5f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0; // infill, adaptive-p
+        }
+        if (k > 0) {
+            break; // the samplers after the top k see only those
+        }
+    }
+    if (k <= 0) {
+        // without a top k only a greedy chain (temperature 0 at its end) takes the largest after the lowering
+        const bool greedy = !params.samplers.empty() && params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE &&
+                            params.temp == 0.0f && params.dynatemp_range == 0.0f;
+        if (!greedy) {
+            return 0;
+        }
+        k = 1;
+    }
+    const int64_t n = k + n_lowered;
+    return n <= 1024 ? (int32_t) n : 0;
+}
+
+bool common_sampler_needs_all_logits(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && grammar_constrains(gsmpl);
+}
+
+bool common_sampler_can_need_all_logits(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->grmr != nullptr;
+}
+
+// a token accepted while the logits came as the candidates of llama_set_logits_topk made the next rows need all of
+// them, which another graph may have overwritten by now (e.g. the draft context in the same buffers)
+static bool common_sampler_topk_stop(const struct common_sampler * gsmpl, const struct llama_context * ctx) {
+    return llama_get_logits_topk_active(ctx) && common_sampler_needs_all_logits(gsmpl);
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -629,7 +742,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // a grammar applied first may allow only tokens outside the candidates of llama_set_logits_topk (no effect without
+    // them)
+    const bool full = grammar_first && grammar_constrains(gsmpl);
+    gsmpl->set_logits(ctx, idx, full);
+
+    // the token the reasoning budget forces may be outside the candidates: it is the only one left whatever its logit
+    if (!full && llama_get_logits_topk_active(ctx)) {
+        const llama_token forced = common_reasoning_budget_get_forced(rbudget);
+        if (forced != LLAMA_TOKEN_NULL && std::none_of(gsmpl->cur.begin(), gsmpl->cur.end(), [&](const llama_token_data & td) { return td.id == forced; })) {
+            gsmpl->cur.push_back({ forced, 0.0f, 0.0f });
+            cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+        }
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -682,8 +807,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain (over
+    // the whole row: the grammar may allow only tokens outside the candidates of llama_set_logits_topk)
+    gsmpl->set_logits(ctx, idx, true);
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -719,6 +845,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         // do not accept draft tokens after an EOG - they are not output but would stay in the context
         // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
         if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+            break;
+        }
+
+        // the token started a grammar whose next rows may need all logits: stop at it (as if sampled here)
+        if (common_sampler_topk_stop(gsmpl, ctx)) {
             break;
         }
     }
@@ -808,6 +939,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            // the token started a grammar whose next rows may need all logits: stop at it (as if sampled here)
+            if (common_sampler_topk_stop(gsmpl, ctx)) {
+                break;
+            }
             continue;
         }
 
