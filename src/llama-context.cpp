@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1444,6 +1445,19 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (topk_active) {
+        const int64_t n_vocab = model.vocab.n_tokens();
+        float * first = nullptr;
+        for (int64_t row = 0; row < (int64_t) topk_dev_row.size(); ++row) {
+            float * r = topk_full_row(row);
+            if (row == 0) {
+                first = r;
+            }
+            GGML_ASSERT(r == first + row*n_vocab);
+        }
+        return first;
+    }
+
     if (logits_permuted) {
         return logits_ordered_all();
     }
@@ -1510,6 +1524,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if (topk_active) {
+            return topk_full_row(j);
+        }
         if (logits_permuted) {
             return logits_ordered_all() + j*model.vocab.n_tokens();
         }
@@ -1522,6 +1539,174 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+// llama_set_logits_topk: the top k of each device's share of the logits, by a small graph on that device, and their
+// copy to the host, queued after the decode's graph. Only when all outputs of the decode come from this ubatch, its
+// last one (their rows stay in the device tensor until the next graph), and the logits are in device memory; false:
+// copy them all
+bool llama_context::logits_topk_extract(ggml_backend_t backend_res, ggml_tensor * t_logits, int64_t n_outputs, int64_t n_outputs_all) {
+    if (logits_topk <= 0 || n_outputs != n_outputs_all || n_outputs <= 0) {
+        return false;
+    }
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    // the shares of the vocabulary: one per device of a meta backend (rows of the output head), else the whole tensor
+    std::vector<std::pair<ggml_backend_t, ggml_tensor *>> shares;
+    const size_t n_simple = ggml_backend_meta_n_simple_backends(backend_res);
+    if (n_simple > 0) {
+        if (ggml_backend_meta_tensor_n_slices(t_logits) != n_simple) {
+            return false;
+        }
+        for (size_t j = 0; j < n_simple; ++j) {
+            shares.emplace_back(ggml_backend_meta_get_simple_backend(backend_res, j), ggml_backend_meta_tensor_slice(t_logits, j));
+        }
+    } else {
+        shares.emplace_back(backend_res, t_logits);
+    }
+    int64_t n_rows = 0;
+    for (const auto & [backend, t] : shares) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) ||
+                t->ne[1] != n_outputs || t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != t->ne[0]*sizeof(float)) {
+            return false;
+        }
+        n_rows += t->ne[0];
+    }
+    if (n_rows != n_vocab) {
+        return false;
+    }
+
+    const size_t n_tensors = 8*shares.size();
+    ggml_init_params params = {
+        /*.mem_size   =*/ n_tensors*ggml_tensor_overhead() + shares.size()*ggml_graph_overhead_custom(8, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    topk_ctx.reset(ggml_init(params));
+    if (topk_shares.size() != shares.size()) {
+        topk_shares.clear();
+        topk_shares.resize(shares.size());
+    }
+
+    // the graphs first: a share that cannot be allocated leaves nothing queued
+    std::vector<ggml_cgraph *> graphs;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> outs;
+    size_t  off  = 0;
+    int64_t row0 = 0;
+    for (size_t j = 0; j < shares.size(); ++j) {
+        auto & sh = topk_shares[j];
+        const auto & [backend, t] = shares[j];
+        ggml_context * ctx = topk_ctx.get();
+
+        // the share of the logits as the decode computed it
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t->ne[0], n_outputs);
+        x->data   = t->data;
+        x->buffer = t->buffer;
+
+        const int64_t k = std::min<int64_t>(logits_topk, t->ne[0]);
+        ggml_tensor * idx = ggml_top_k(ctx, x, (int) k);
+        ggml_tensor * val = ggml_get_rows(ctx, ggml_reshape_3d(ctx, x, 1, t->ne[0], n_outputs), idx);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, val);
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        if (!sh.galloc || sh.buft != buft) {
+            sh.galloc.reset(ggml_gallocr_new(buft));
+            sh.buft = buft;
+        }
+        if (!ggml_gallocr_alloc_graph(sh.galloc.get(), gf)) {
+            LLAMA_LOG_WARN("%s: cannot allocate the top-k graph, copying all logits\n", __func__);
+            return false;
+        }
+
+        sh.backend = backend;
+        sh.src     = x;
+        sh.row0    = row0;
+        sh.rows    = t->ne[0];
+        sh.k       = k;
+        sh.off     = off;
+        graphs.push_back(gf);
+        outs.emplace_back(idx, val);
+        off  += k*n_outputs;
+        row0 += t->ne[0];
+    }
+
+    topk_idx.resize(off);
+    topk_val.resize(off);
+    for (size_t j = 0; j < shares.size(); ++j) {
+        const auto & sh = topk_shares[j];
+        if (ggml_backend_graph_compute_async(sh.backend, graphs[j]) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("%s: the top-k graph failed", __func__);
+        }
+        ggml_backend_tensor_get_async(sh.backend, outs[j].first,  topk_idx.data() + sh.off, 0, sh.k*n_outputs*sizeof(int32_t));
+        ggml_backend_tensor_get_async(sh.backend, outs[j].second, topk_val.data() + sh.off, 0, sh.k*n_outputs*sizeof(float));
+    }
+
+    topk_active = true;
+    topk_merged = false;
+    topk_n      = (int64_t) off/n_outputs;
+    topk_graph  = n_graph_computes;
+    topk_dev_row.resize(n_outputs);
+    std::iota(topk_dev_row.begin(), topk_dev_row.end(), 0);
+    topk_row_full.assign(n_outputs, 0);
+    return true;
+}
+
+// the candidates of each output row with their tokens, after the context synchronized
+void llama_context::topk_merge() {
+    if (topk_merged) {
+        return;
+    }
+    const auto & row_of = model.output_row_of_token;
+    if (!row_of.empty() && topk_token_of_row.size() != row_of.size()) {
+        topk_token_of_row.resize(row_of.size());
+        for (size_t t = 0; t < row_of.size(); ++t) {
+            topk_token_of_row[row_of[t]] = (llama_token) t;
+        }
+    }
+    const int64_t n_rows = (int64_t) topk_dev_row.size();
+    topk_tokens.resize(n_rows*topk_n);
+    topk_logits.resize(n_rows*topk_n);
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const int64_t d = topk_dev_row[r];
+        int64_t c = r*topk_n;
+        for (const auto & sh : topk_shares) {
+            const int32_t * idx = topk_idx.data() + sh.off + d*sh.k;
+            const float   * val = topk_val.data() + sh.off + d*sh.k;
+            for (int64_t i = 0; i < sh.k; ++i, ++c) {
+                const int64_t row = sh.row0 + idx[i];
+                topk_tokens[c] = row_of.empty() ? (llama_token) row : topk_token_of_row[row];
+                topk_logits[c] = val[i];
+            }
+        }
+    }
+    topk_merged = true;
+}
+
+// a whole row of the logits in token order, copied from the device tensors (they hold it until the next graph)
+float * llama_context::topk_full_row(int64_t row) {
+    const auto & row_of = model.output_row_of_token;
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (!topk_row_full[row]) {
+        GGML_ASSERT(n_graph_computes == topk_graph && "the logits of the last decode are no longer on the device");
+        const int64_t d = topk_dev_row[row];
+        float * dst = logits.data + row*n_vocab;
+        for (const auto & sh : topk_shares) {
+            ggml_backend_tensor_get(sh.src, dst + sh.row0, d*sh.rows*sizeof(float), sh.rows*sizeof(float));
+        }
+        if (!row_of.empty()) {
+            // the rows of a reordered output head (see logits_permuted)
+            if (logits_ordered.size() < (size_t) n_outputs*n_vocab) {
+                logits_ordered.resize((size_t) n_outputs*n_vocab);
+            }
+            float * ord = logits_ordered.data() + row*n_vocab;
+            for (int64_t t = 0; t < n_vocab; ++t) {
+                ord[t] = dst[row_of[t]];
+            }
+        }
+        topk_row_full[row] = 1;
+    }
+    return (row_of.empty() ? logits.data : logits_ordered.data()) + row*n_vocab;
 }
 
 float * llama_context::get_embeddings() {
@@ -1651,6 +1836,17 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
         return get_logits_ith(idx);
     }
 
+    if (topk_active) {
+        try {
+            const int64_t row = output_resolve_row(idx);
+            topk_merge();
+            return topk_logits.data() + row*topk_n;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, idx, err.what());
+            return nullptr;
+        }
+    }
+
     if (!sampling.logits.has_data()) {
         return nullptr;
     }
@@ -1672,6 +1868,17 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
 
     if (logits_subset) {
         return model.draft_vocab.data();
+    }
+
+    if (topk_active) {
+        try {
+            const int64_t row = output_resolve_row(idx);
+            topk_merge();
+            return topk_tokens.data() + row*topk_n;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: invalid candidates id %d, reason: %s\n", __func__, idx, err.what());
+            return nullptr;
+        }
     }
 
     try {
@@ -1696,6 +1903,10 @@ size_t llama_context::get_sampled_candidates_count(int32_t idx) {
         return model.draft_vocab.size();
     }
 
+    if (topk_active) {
+        return topk_n;
+    }
+
     if (!sampling.candidates.has_data()) {
         return 0;
     }
@@ -1717,6 +1928,10 @@ size_t llama_context::get_sampled_logits_count(int32_t idx) {
 
     if (logits_subset) {
         return model.draft_vocab.size();
+    }
+
+    if (topk_active) {
+        return topk_n;
     }
 
     if (!sampling.logits.has_data()) {
@@ -1836,6 +2051,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 void llama_context::set_draft_vocab(bool value) {
     // the graphs compare their head (llm_graph_params::head_draft), a switch builds a new one
     draft_vocab_on = value;
+}
+
+void llama_context::set_logits_topk(int32_t k) {
+    logits_topk = std::max(0, k);
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2606,8 +2825,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 const int64_t n_cols = t_logits->ne[0];
                 if (n_cols == n_vocab) {
-                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-                    logits_permuted = !model.output_row_of_token.empty();
+                    // the whole rows stay in t_logits until the next graph: the outputs must be in the last ubatch
+                    const bool last = n_tokens_prev + (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all;
+                    if (!logits_topk_extract(backend_res, t_logits, n_outputs_prev == 0 && last ? n_outputs : -1, n_outputs_all)) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                        logits_permuted = !model.output_row_of_token.empty();
+                    }
                 } else {
                     // the draft head (llama_context_params::draft_vocab): its rows at the stride of the vocabulary
                     GGML_ASSERT(cparams.draft_vocab && n_cols == (int64_t) model.draft_vocab.size());
@@ -2789,6 +3012,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // the logits of the new outputs
     logits_permuted     = false;
     logits_ordered_done = false;
+    topk_active         = false;
 
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
@@ -2993,7 +3217,12 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        if (topk_active) {
+            // the rows are still on the device (logits.data holds no logits yet)
+            GGML_ASSERT(!topk_merged);
+            std::swap(topk_dev_row[i0], topk_dev_row[i1]);
+            std::swap(topk_row_full[i0], topk_row_full[i1]);
+        } else if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -3327,7 +3556,9 @@ ggml_status llama_context::graph_compute(
 
     if (workspace_peer() != nullptr) {
         ws_in_flight = true;
+        workspace_peer()->n_graph_computes++; // it computes in these buffers too
     }
+    n_graph_computes++;
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -5015,6 +5246,14 @@ void llama_set_draft_vocab(llama_context * ctx, bool enabled) {
     ctx->set_draft_vocab(enabled);
 }
 
+void llama_set_logits_topk(llama_context * ctx, int32_t k) {
+    ctx->set_logits_topk(k);
+}
+
+bool llama_get_logits_topk_active(const llama_context * ctx) {
+    return ctx->get_logits_topk_active();
+}
+
 bool llama_get_kv_unified_gather(const llama_context * ctx) {
     return ctx->get_cparams().kv_unified_gather && ctx->get_cparams().flash_attn;
 }
@@ -5042,7 +5281,8 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 
     float * res = nullptr;
 
-    res = ctx->get_sampled_logits_ith(i);
+    // with llama_set_logits_topk a whole row (the sampled-logits API reports the candidates)
+    res = ctx->get_logits_topk_active() ? nullptr : ctx->get_sampled_logits_ith(i);
 
     if (!res) {
         res = ctx->get_logits_ith(i);

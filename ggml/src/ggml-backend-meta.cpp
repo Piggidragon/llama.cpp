@@ -2761,6 +2761,14 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_optimize          = */ nullptr,
 };
 
+size_t ggml_backend_meta_n_simple_backends(ggml_backend_t backend) {
+    return ggml_backend_is_meta(backend) ? ggml_backend_meta_n_backends(backend) : 0;
+}
+
+ggml_backend_t ggml_backend_meta_get_simple_backend(ggml_backend_t backend, size_t i) {
+    return ggml_backend_meta_simple_backend(backend, i);
+}
+
 size_t ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev) {
     return ggml_backend_dev_is_meta(dev) ? ggml_backend_meta_dev_n_devs(dev) : 0;
 }

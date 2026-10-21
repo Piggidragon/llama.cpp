@@ -460,6 +460,11 @@ extern "C" {
     // ggml_backend_set_stream_priority() of the simple backends and the AllReduce of a meta backend
     GGML_API bool ggml_backend_meta_set_stream_priority(ggml_backend_t meta_backend, bool high);
 
+    // the simple backends of a meta backend, in the order of its devices: their number (0 if backend is not a meta
+    // backend) and backend i
+    GGML_API size_t         ggml_backend_meta_n_simple_backends (ggml_backend_t backend);
+    GGML_API ggml_backend_t ggml_backend_meta_get_simple_backend(ggml_backend_t backend, size_t i);
+
     // the simple devices of a meta device: their number (0 if dev is not a meta device) and device i
     GGML_API size_t             ggml_backend_meta_dev_n_simple(ggml_backend_dev_t dev);
     GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple  (ggml_backend_dev_t dev, size_t i);

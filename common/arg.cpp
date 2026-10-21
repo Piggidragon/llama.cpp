@@ -1908,6 +1908,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CONCURRENT_PREFILL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--logits-topk"},
+        {"--no-logits-topk"},
+        "copy only the largest logits of each GPU's share of the vocabulary to the host, found on the GPU, when the\n"
+        "sampler of every slot in a batch samples the same token from them (a top-k after penalties that lower logits\n"
+        "and logit biases <= 0, or greedy; not with n_probs, mirostat, DRY, top-n-sigma, or while a grammar constrains\n"
+        "the tokens); saves the copy of whole rows (over PCIe) and the CPU sampling over the whole vocabulary, most\n"
+        "with long drafts (default: disabled)",
+        [](common_params & params, bool value) {
+            params.logits_topk = value;
+        }
+    ).set_env("LLAMA_ARG_LOGITS_TOPK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
