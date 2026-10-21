@@ -394,6 +394,7 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_seq_snapshots;       // device snapshots of the recurrent state of a sequence (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT), 0 = none
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -1000,6 +1001,14 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Keeps the recurrent state of the sequence in a device snapshot of the context (llama_context_params::n_seq_snapshots)
+// instead of the buffer: a copy within the device memory instead of one to the host and back (e.g. for the
+// checkpoints of speculative decoding). Getting a state takes the snapshot that seq_id holds or a free one; without
+// one, the tensor data goes to the buffer as without this flag. Such a buffer is set as usual, its tensor data then
+// comes from the snapshot: until the next get of seq_id with this flag or llama_state_seq_snapshot_release(), after
+// which setting it fails. Its tensor data cannot be read in host memory.
+#define LLAMA_STATE_SEQ_FLAGS_SNAPSHOT 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -1020,6 +1029,11 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // releases the device snapshot that seq_id holds (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT) for other sequences, -1: all
+    LLAMA_API void llama_state_seq_snapshot_release(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id);
 
     // Ranges of a sequence state, to store a growing sequence piece by piece.
     // A range holds the KV cells of a position range that can be rolled back: the ones that

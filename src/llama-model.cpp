@@ -427,9 +427,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
-    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
-    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
-    static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    static const std::regex pattern_r_cache         ("cache_r(_snap)?_l\\d*");
+    static const std::regex pattern_ple_r_cache     ("cache_ple_r(_snap)?_l\\d*");
+    static const std::regex pattern_s_cache         ("cache_s(_snap)?_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 

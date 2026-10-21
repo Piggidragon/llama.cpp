@@ -380,6 +380,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            llama_state_seq_snapshot_release(ctx_tgt, id);
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -4094,7 +4095,8 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    // with --spec-ckpt-snapshot, the recurrent state stays in a device snapshot if one is free
+                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_SNAPSHOT);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -5302,6 +5304,9 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+
+            // the checkpoint of this draft is no longer needed: its device snapshot is free for the other slots
+            llama_state_seq_snapshot_release(slot.ctx_tgt, slot.id);
 
             slot.stats.update_gen_last();
 

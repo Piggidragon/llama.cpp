@@ -4581,6 +4581,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SELECT"));
     add_opt(common_arg(
+        {"--spec-ckpt-snapshot"},
+        {"--no-spec-ckpt-snapshot"},
+        "models with a recurrent state (e.g. Qwen 3.5): keep the checkpoint that a verification of a long draft needs "
+        "(restored when the draft is rejected in part) in a device snapshot instead of host memory, a copy within "
+        "the GPU memory instead of over PCIe both ways; takes the recurrent state of one sequence in VRAM, split "
+        "like the state; one sequence uses it at a time, the others keep their checkpoints in host memory "
+        "(default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.ckpt_snapshot = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_CKPT_SNAPSHOT"));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {

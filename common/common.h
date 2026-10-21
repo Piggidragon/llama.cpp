@@ -402,6 +402,10 @@ struct common_params_speculative {
     // per draft position and step times, learned per sequence) instead of the first one, see --spec-select
     bool select = false;
 
+    // keep the checkpoint before a verification in a device snapshot of the recurrent state instead of host memory,
+    // see --spec-ckpt-snapshot
+    bool ckpt_snapshot = false;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
