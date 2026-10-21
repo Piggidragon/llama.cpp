@@ -235,6 +235,14 @@ void llama_memory_hybrid::state_read_range(llama_io_read_i & io, llama_seq_id se
     mem_recr->state_read_range(io, seq_id, append);
 }
 
+bool llama_memory_hybrid::snapshot_alloc(uint32_t n) {
+    return mem_recr->snapshot_alloc(n);
+}
+
+void llama_memory_hybrid::snapshot_release(llama_seq_id seq_id) {
+    mem_recr->snapshot_release(seq_id);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

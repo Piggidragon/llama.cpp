@@ -393,12 +393,103 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// keep a partial state in the device snapshot (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT) like a speculative checkpoint: restoring it
+// matches a restore from host memory exactly, a second sequence falls back to host memory while the first holds it, and
+// a released snapshot can no longer be restored
+struct case_snapshot : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "snapshot"; }
+
+    const char * description() const override {
+        return "a partial state kept in a device snapshot restores like one in host memory";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_state_seq_flags partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        constexpr llama_state_seq_flags snap    = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_SNAPSHOT;
+
+        constexpr llama_pos n_prompt = 12;
+        constexpr llama_pos n_draft  = 5;
+
+        ctx_opts opts;
+        opts.n_seq_max       = 2;
+        opts.n_seq_snapshots = 1;
+        opts.kv_unified      = 0;
+
+        llama_context_ptr ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        bool ok = true;
+        for (llama_seq_id s = 0; s < 2 && ok; s++) {
+            ok = decode_gen(ctx.get(), n_vocab, s, 0, n_prompt);
+        }
+        CTX_REQUIRE(ok, "the prompt decode failed");
+
+        // the checkpoint of seq 0 in host memory and in the snapshot
+        std::vector<uint8_t> host;
+        std::vector<uint8_t> dev;
+        CTX_REQUIRE(get_seq_state(ctx.get(), 0, partial, host) && get_seq_state(ctx.get(), 0, snap, dev), "saving seq 0 failed");
+        if (host == dev) {
+            return case_result::skip("the memory has no device snapshots");
+        }
+
+        // a draft from the checkpoint that is then rejected: restore it, drop the draft cells, decode another token
+        const auto restore = [&](const std::vector<uint8_t> & state) {
+            return set_seq_state(ctx.get(), 0, partial, state) && llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, n_prompt, -1);
+        };
+        const auto restore_next = [&](const std::vector<uint8_t> & state, std::vector<float> & logits) {
+            return restore(state) &&
+                decode_gen(ctx.get(), n_vocab, 0, n_prompt, n_prompt + n_draft) &&
+                restore(state) &&
+                decode_one(ctx.get(), (gen_token(n_vocab, 0, n_prompt) + 1) % n_vocab, n_prompt, 0) &&
+                get_current_logits(ctx.get(), logits);
+        };
+
+        std::vector<float> logits_dev;
+        std::vector<float> logits_host;
+        std::vector<float> logits_dev2;
+        CTX_REQUIRE(restore_next(dev, logits_dev), "the restore from the snapshot failed");
+        CTX_REQUIRE(restore_next(host, logits_host), "the restore from host memory failed");
+
+        // the snapshot stays valid for another restore (a replay that is rejected again)
+        CTX_REQUIRE(restore_next(dev, logits_dev2), "the second restore from the snapshot failed");
+
+        const logits_diff diff  = compare_logits(logits_host.data(), logits_dev.data(),  n_vocab);
+        const logits_diff diff2 = compare_logits(logits_host.data(), logits_dev2.data(), n_vocab);
+        CTX_REQUIRE(diff.nmse() == 0.0 && diff2.nmse() == 0.0,
+                "the restore from the snapshot differs from the one from host memory (nmse " + std::to_string(diff.nmse()) +
+                ", " + std::to_string(diff2.nmse()) + ")");
+
+        // seq 0 holds the snapshot: seq 1 gets its checkpoint in host memory
+        std::vector<uint8_t> host1;
+        std::vector<uint8_t> dev1;
+        CTX_REQUIRE(get_seq_state(ctx.get(), 1, partial, host1) && get_seq_state(ctx.get(), 1, snap, dev1), "saving seq 1 failed");
+        CTX_REQUIRE(host1 == dev1, "seq 1 took the snapshot that seq 0 holds");
+
+        // released, the snapshot of seq 0 cannot be restored, and seq 1 can take it
+        llama_state_seq_snapshot_release(ctx.get(), 0);
+        CTX_REQUIRE(llama_state_seq_set_data_ext(ctx.get(), dev.data(), dev.size(), 0, partial) == 0,
+                "a released snapshot was restored");
+        CTX_REQUIRE(get_seq_state(ctx.get(), 1, snap, dev1) && host1 != dev1, "seq 1 did not take the released snapshot");
+
+        TLOG_INF("%s: the snapshot restored like host memory\n", __func__);
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_snapshot>());
 
     return cases;
 }

@@ -159,6 +159,11 @@ struct llama_memory_i {
     virtual void state_read_range(llama_io_read_i & /*io*/, llama_seq_id /*seq_id*/, bool /*append*/) {
         throw std::runtime_error("this memory does not support state ranges");
     }
+
+    // device snapshots of the state of a sequence (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT): allocate n of them (false if this
+    // memory has no state that a snapshot can hold), release the one that seq_id holds (-1: all)
+    virtual bool snapshot_alloc(uint32_t /*n*/) { return false; }
+    virtual void snapshot_release(llama_seq_id /*seq_id*/) {}
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

@@ -112,6 +112,7 @@ struct ctx_opts {
     uint32_t n_ubatch  = 0; // 0 = from params
     uint32_t n_seq_max = 0; // 0 = from params
     uint32_t n_rs_seq  = 0; // 0 = from params, n_batch / n_ubatch are raised to fit it
+    uint32_t n_seq_snapshots = 0; // device snapshots of a sequence state (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT)
     int      kv_unified = -1; // -1 = from params, 0 = off, 1 = on
 
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO; // AUTO = from params

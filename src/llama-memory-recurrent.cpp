@@ -11,7 +11,17 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <random>
 #include <stdexcept>
+
+// at the start of the tensor data in the buffer of a state that a device snapshot holds (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT)
+struct llama_rs_snap_tag {
+    uint64_t magic;
+    uint64_t nonce; // of the memory
+    uint64_t gen;   // of the state
+};
+
+static constexpr uint64_t rs_snap_magic = 0x31706e73746174ffull;
 
 //
 // llama_memory_recurrent
@@ -436,6 +446,9 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
+        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    }
+    for (const auto & [_, buf] : snap_ctxs_bufs) {
         ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
@@ -883,10 +896,21 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     }
     GGML_ASSERT(cell_count == cell_count_check);
 
+    // a snapshot holds the one cell of a sequence; a new state of seq_id replaces the one it holds in any case (not a
+    // writer without snapshots, e.g. one that counts the size)
+    int32_t snap = -1;
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_SNAPSHOT) && seq_id >= 0 && !snaps.empty() && io.can_snapshot()) {
+        if (cell_count == 1) {
+            snap = snapshot_take(seq_id);
+        } else {
+            snapshot_drop(seq_id);
+        }
+    }
+
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, snap);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -939,9 +963,21 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, int32_t snap) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
+
+    // with a snapshot, the tag goes to the start of the first tensor data
+    const llama_rs_snap_tag tag = { rs_snap_magic, snap_nonce, snap >= 0 ? snaps[snap].gen : 0 };
+    bool tagged = false;
+    auto write_rows = [&](ggml_tensor * t, ggml_tensor * t_snap, size_t offset, size_t size) {
+        if (snap < 0) {
+            io.write_tensor(t, offset, size);
+            return;
+        }
+        io.write_tensor_snap(t, offset, size, t_snap, snap * t_snap->nb[1], &tag, tagged ? 0 : sizeof(tag));
+        tagged = true;
+    };
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
@@ -965,7 +1001,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            write_rows(r_l[il], snap_r_l.empty() ? nullptr : snap_r_l[il], range.first * r_size_row, buf_size);
         }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
@@ -975,7 +1011,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
-                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+                write_rows(p_l[il], snap_p_l.empty() ? nullptr : snap_p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
         }
     }
@@ -998,7 +1034,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                write_rows(s_l[il], snap_s_l.empty() ? nullptr : snap_s_l[il], range.first * s_size_row, buf_size);
             }
         }
     } else {
@@ -1154,6 +1190,24 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         return false;
     }
 
+    // a state that a snapshot holds has the tag at the start of its first tensor data
+    int32_t snap = -1;
+    bool checked = false;
+    auto read_rows = [&](ggml_tensor * t, ggml_tensor * t_snap, size_t offset, size_t size) {
+        if (!checked) {
+            checked = true;
+            snap = snapshot_find(io, size);
+            if (snap >= 0 && cell_count != 1) {
+                throw std::runtime_error("a device snapshot holds one cell");
+            }
+        }
+        if (snap < 0) {
+            io.read_tensor(t, offset, size);
+            return;
+        }
+        io.read_tensor_snap(t, offset, size, t_snap, snap * t_snap->nb[1]);
+    };
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (uint32_t il = 0; il < n_layer; ++il) {
         // skip null layers
@@ -1179,7 +1233,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
         if (cell_count) {
             // Read and set the keys for the whole cell range
-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+            read_rows(r_l[il], snap_r_l.empty() ? nullptr : snap_r_l[il], head * r_size_row, cell_count * r_size_row);
         }
 
         if (p_l[il] != nullptr) {
@@ -1192,7 +1246,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
+                read_rows(p_l[il], snap_p_l.empty() ? nullptr : snap_p_l[il], head * p_size_row, cell_count * p_size_row);
             }
         }
     }
@@ -1223,7 +1277,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                read_rows(s_l[il], snap_s_l.empty() ? nullptr : snap_s_l[il], head * s_size_row, cell_count * s_size_row);
             }
         }
     } else {
@@ -1306,6 +1360,161 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
             llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
         }
     }
+}
+
+bool llama_memory_recurrent::snapshot_alloc(uint32_t n) {
+    GGML_ASSERT(snaps.empty());
+    if (n == 0 || is_empty()) {
+        return false;
+    }
+
+    const int32_t n_layer = hparams.n_layer();
+
+    // a context per buffer type of the state rows, in the same order as for the state
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    // the names select the same split across the devices as for the state rows (see llama_meta_device_get_split_state)
+    auto new_snap = [&](const ggml_tensor * t, const char * fmt, int il) -> ggml_tensor * {
+        if (t == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(3u*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            it = ctx_map.emplace(buft, ggml_context_ptr(ggml_init(params))).first;
+        }
+        ggml_tensor * snap = ggml_new_tensor_2d(it->second.get(), t->type, t->ne[0], n);
+        ggml_format_name(snap, fmt, il);
+        return snap;
+    };
+
+    snap_r_l.assign(n_layer, nullptr);
+    snap_s_l.assign(n_layer, nullptr);
+    snap_p_l.assign(n_layer, nullptr);
+    for (int il = 0; il < n_layer; il++) {
+        snap_r_l[il] = new_snap(r_l[il], "cache_r_snap_l%d",     il);
+        snap_s_l[il] = new_snap(s_l[il], "cache_s_snap_l%d",     il);
+        snap_p_l[il] = new_snap(p_l[il], "cache_ple_r_snap_l%d", il);
+    }
+
+    auto fail = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: no device snapshots of a sequence state: %s\n", __func__, why);
+        snap_r_l.clear();
+        snap_s_l.clear();
+        snap_p_l.clear();
+        snap_ctxs_bufs.clear();
+        return false;
+    };
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            return fail("failed to allocate the buffer");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        snap_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // a row of a snapshot must be split across the devices like a row of the state
+    for (int il = 0; il < n_layer; il++) {
+        const std::pair<const ggml_tensor *, const ggml_tensor *> pairs[3] = {
+            { r_l[il], snap_r_l[il] }, { s_l[il], snap_s_l[il] }, { p_l[il], snap_p_l[il] },
+        };
+        for (const auto & [t, snap] : pairs) {
+            if (t == nullptr) {
+                continue;
+            }
+            const size_t n_slices = ggml_backend_meta_tensor_n_slices(t);
+            if (ggml_backend_meta_tensor_n_slices(snap) != n_slices) {
+                return fail("the snapshot rows are not in the buffer type of the state rows");
+            }
+            for (size_t j = 0; j < n_slices; j++) {
+                if (ggml_backend_meta_tensor_slice(t, j)->ne[0] != ggml_backend_meta_tensor_slice(snap, j)->ne[0]) {
+                    return fail("the snapshot rows are split across the devices differently from the state rows");
+                }
+            }
+        }
+    }
+
+    // the tag must fit into the first tensor data
+    for (int il = 0; il < n_layer; il++) {
+        if (r_l[il] != nullptr) {
+            if (r_l[il]->nb[1] < sizeof(llama_rs_snap_tag)) {
+                return fail("the state rows are too short");
+            }
+            break;
+        }
+    }
+
+    std::random_device rd;
+    snap_nonce = ((uint64_t) rd() << 32 | rd()) | 1;
+    snaps.assign(n, {});
+
+    for (const auto & [_, buf] : snap_ctxs_bufs) {
+        LLAMA_LOG_INFO("%s: %10s snapshot buffer size = %8.2f MiB (%u device snapshots of a sequence state)\n", __func__,
+                ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0, n);
+    }
+
+    return true;
+}
+
+void llama_memory_recurrent::snapshot_release(llama_seq_id seq_id) {
+    snapshot_drop(seq_id);
+}
+
+int32_t llama_memory_recurrent::snapshot_take(llama_seq_id seq_id) const {
+    int32_t k = -1;
+    for (size_t i = 0; i < snaps.size() && k < 0; i++) {
+        if (snaps[i].seq_id == seq_id) {
+            k = i;
+        }
+    }
+    for (size_t i = 0; i < snaps.size() && k < 0; i++) {
+        if (snaps[i].seq_id < 0) {
+            k = i;
+        }
+    }
+    if (k >= 0) {
+        snaps[k].seq_id = seq_id;
+        snaps[k].gen    = ++snap_gen;
+    }
+    return k;
+}
+
+void llama_memory_recurrent::snapshot_drop(llama_seq_id seq_id) const {
+    for (auto & cell : snaps) {
+        if (seq_id < 0 || cell.seq_id == seq_id) {
+            cell = {};
+        }
+    }
+}
+
+int32_t llama_memory_recurrent::snapshot_find(llama_io_read_i & io, size_t size) const {
+    const uint8_t * p = size >= sizeof(llama_rs_snap_tag) ? io.peek(sizeof(llama_rs_snap_tag)) : nullptr;
+    if (p == nullptr) {
+        return -1;
+    }
+    llama_rs_snap_tag tag;
+    memcpy(&tag, p, sizeof(tag));
+    if (tag.magic != rs_snap_magic) {
+        return -1;
+    }
+    for (size_t i = 0; i < snaps.size(); i++) {
+        if (tag.nonce == snap_nonce && snaps[i].seq_id >= 0 && snaps[i].gen == tag.gen) {
+            return i;
+        }
+    }
+    throw std::runtime_error("the device snapshot that held this state holds another one by now");
 }
 
 //

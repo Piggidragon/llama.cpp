@@ -86,6 +86,9 @@ public:
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
     void state_read_range (llama_io_read_i  & io, llama_seq_id seq_id, bool append) override;
 
+    bool snapshot_alloc(uint32_t n) override;
+    void snapshot_release(llama_seq_id seq_id) override;
+
     //
     // llama_memory_hybrid specific API
     //

@@ -1,5 +1,6 @@
 #include "llama-io.h"
 
+#include <stdexcept>
 #include <vector>
 
 void llama_io_write_i::write_string(const std::string & str) {
@@ -17,4 +18,13 @@ void llama_io_read_i::read_string(std::string & str) {
     read(buf.data(), str_size);
 
     str.assign(buf.data(), str_size);
+}
+
+void llama_io_write_i::write_tensor_snap(
+        ggml_tensor * /*tensor*/, size_t /*offset*/, size_t /*size*/, ggml_tensor * /*snap*/, size_t /*snap_offset*/, const void * /*tag*/, size_t /*n_tag*/) {
+    throw std::runtime_error("this writer cannot keep tensor data in a device snapshot");
+}
+
+void llama_io_read_i::read_tensor_snap(ggml_tensor * /*tensor*/, size_t /*offset*/, size_t /*size*/, ggml_tensor * /*snap*/, size_t /*snap_offset*/) {
+    throw std::runtime_error("this reader cannot read tensor data from a device snapshot");
 }

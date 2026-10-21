@@ -215,6 +215,18 @@ struct llama_context {
     // copies the tensor ranges to host memory (to_host) or from it, through pinned memory when a device offers it
     void state_copy(const std::vector<state_copy_item> & items, bool to_host);
 
+    // a copy between rows of two state tensors on the same devices (a device snapshot, LLAMA_STATE_SEQ_FLAGS_SNAPSHOT)
+    struct state_d2d_item {
+        ggml_tensor * src;
+        size_t        src_offset;
+        ggml_tensor * dst;
+        size_t        dst_offset;
+        size_t        size;
+    };
+
+    // copies the rows on their devices, slice by slice for tensors in a meta buffer (split along the rows)
+    void state_copy_d2d(const std::vector<state_d2d_item> & items);
+
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,

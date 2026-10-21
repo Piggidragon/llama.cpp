@@ -583,6 +583,10 @@ llama_context::llama_context(
             memory = memory_owner->memory;
         } else {
             memory.reset(model.create_memory(params_mem, cparams));
+
+            if (memory && params.n_seq_snapshots > 0 && !memory->snapshot_alloc(params.n_seq_snapshots)) {
+                LLAMA_LOG_WARN("%s: n_seq_snapshots = %u is not used: the memory of this model has no device snapshots\n", __func__, params.n_seq_snapshots);
+            }
         }
     }
 
@@ -3622,6 +3626,82 @@ void llama_context::state_copy(const std::vector<state_copy_item> & items, bool 
     }
 }
 
+void llama_context::state_copy_d2d(const std::vector<state_d2d_item> & items) {
+    if (items.empty()) {
+        return;
+    }
+
+    // the simple backends of the meta backend, in the order of the slices of a tensor in its buffers
+    ggml_backend_t backend_meta = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_meta_n_simple_backends(backend.get()) > 0) {
+            backend_meta = backend.get();
+            break;
+        }
+    }
+
+    // the views of the rows on each device
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*items.size()*GGML_BACKEND_META_MAX_DEVICES*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_views(ggml_init(params));
+
+    std::vector<ggml_backend_t> used;
+    for (const auto & it : items) {
+        if (it.size == 0) {
+            continue;
+        }
+        const size_t row = it.src->nb[1];
+        GGML_ASSERT(it.dst->nb[1] == row && it.src_offset % row == 0 && it.dst_offset % row == 0 && it.size % row == 0);
+        const int64_t n_rows = it.size / row;
+
+        const size_t n_slices = ggml_backend_meta_tensor_n_slices(it.src);
+        GGML_ASSERT(ggml_backend_meta_tensor_n_slices(it.dst) == n_slices);
+        GGML_ASSERT(n_slices == 0 || backend_meta != nullptr);
+
+        for (size_t j = 0; j < std::max<size_t>(n_slices, 1); j++) {
+            ggml_tensor * src = n_slices > 0 ? ggml_backend_meta_tensor_slice(it.src, j) : it.src;
+            ggml_tensor * dst = n_slices > 0 ? ggml_backend_meta_tensor_slice(it.dst, j) : it.dst;
+            if (src->ne[0] == 0) {
+                continue; // no share of the rows on this device
+            }
+
+            ggml_tensor * src_rows = ggml_view_2d(ctx_views.get(), src, src->ne[0], n_rows, src->nb[1], it.src_offset/row*src->nb[1]);
+            ggml_tensor * dst_rows = ggml_view_2d(ctx_views.get(), dst, dst->ne[0], n_rows, dst->nb[1], it.dst_offset/row*dst->nb[1]);
+            ggml_backend_view_init(src_rows);
+            ggml_backend_view_init(dst_rows);
+
+            ggml_backend_t backend = nullptr;
+            if (n_slices > 0) {
+                backend = ggml_backend_meta_get_simple_backend(backend_meta, j);
+            } else if (!ggml_backend_buffer_is_host(src->buffer)) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+                for (auto & b : backends) {
+                    if (ggml_backend_supports_buft(b.get(), buft)) {
+                        backend = b.get();
+                        break;
+                    }
+                }
+            }
+
+            if (backend == nullptr) {
+                ggml_backend_tensor_copy(src_rows, dst_rows);
+                continue;
+            }
+            ggml_backend_tensor_copy_async(backend, backend, src_rows, dst_rows);
+            if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                used.push_back(backend);
+            }
+        }
+    }
+
+    for (ggml_backend_t backend : used) {
+        ggml_backend_synchronize(backend);
+    }
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
@@ -3629,6 +3709,7 @@ public:
 
     ~llama_io_write_host() {
         lctx->state_copy(winfos, /*to_host =*/ true);
+        lctx->state_copy_d2d(snaps);
     }
 
     void write(const void * src, size_t size) override {
@@ -3654,6 +3735,24 @@ public:
         buf_size -= size;
     }
 
+    bool can_snapshot() const override {
+        return true;
+    }
+
+    void write_tensor_snap(
+            ggml_tensor * tensor, size_t offset, size_t size, ggml_tensor * snap, size_t snap_offset, const void * tag, size_t n_tag) override {
+        if (size > buf_size || n_tag > size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        memcpy(ptr, tag, n_tag);
+        snaps.push_back({tensor, offset, snap, snap_offset, size});
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -3666,6 +3765,7 @@ private:
     size_t size_written = 0;
 
     std::vector<llama_context::state_copy_item> winfos;
+    std::vector<llama_context::state_d2d_item>  snaps;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3675,6 +3775,7 @@ public:
     ~llama_io_read_host() {
         // flush the reads
         lctx->state_copy(rinfos, /*to_host =*/ false);
+        lctx->state_copy_d2d(snaps);
     }
 
     void read(void * dst, size_t size) override {
@@ -3700,8 +3801,25 @@ public:
         buf_size -= size;
     }
 
+    const uint8_t * peek(size_t size) override {
+        return size <= buf_size ? ptr : nullptr;
+    }
+
+    void read_tensor_snap(ggml_tensor * tensor, size_t offset, size_t size, ggml_tensor * snap, size_t snap_offset) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        snaps.push_back({snap, snap_offset, tensor, offset, size});
+
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
     void discard() override {
         rinfos.clear();
+        snaps.clear();
     }
 
     size_t n_bytes() override {
@@ -3716,6 +3834,7 @@ private:
     size_t size_read = 0;
 
     std::vector<llama_context::state_copy_item> rinfos;
+    std::vector<llama_context::state_d2d_item>  snaps;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -4756,6 +4875,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_seq_snapshots             =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -5410,6 +5530,12 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+void llama_state_seq_snapshot_release(llama_context * ctx, llama_seq_id seq_id) {
+    if (auto * mem = ctx->get_memory()) {
+        mem->snapshot_release(seq_id);
+    }
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

@@ -73,6 +73,9 @@ public:
     void state_write_range(llama_io_write_i & /*io*/, llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) const override {}
     void state_read_range (llama_io_read_i  & /*io*/, llama_seq_id /*seq_id*/, bool /*append*/) override {}
 
+    bool snapshot_alloc(uint32_t n) override;
+    void snapshot_release(llama_seq_id seq_id) override;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -130,6 +133,34 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // device snapshots of the state of a sequence (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT): row k of these tensors is snapshot k,
+    // split across the devices like the rows of r_l, s_l and p_l
+    std::vector<ggml_tensor *> snap_r_l;
+    std::vector<ggml_tensor *> snap_s_l;
+    std::vector<ggml_tensor *> snap_p_l;
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> snap_ctxs_bufs;
+
+    struct snap_cell {
+        llama_seq_id seq_id = -1; // the sequence that holds it, -1: free
+        uint64_t     gen    = 0;  // the state in it, named by the tag in the buffer of that state
+    };
+
+    // taken by state_write()
+    mutable std::vector<snap_cell> snaps;
+    mutable uint64_t snap_gen = 0;
+
+    // tells the tags of this memory from those of others
+    uint64_t snap_nonce = 0;
+
+    // the snapshot that seq_id holds or a free one, now holding a new state of seq_id; -1 if none is free
+    int32_t snapshot_take(llama_seq_id seq_id) const;
+    void    snapshot_drop(llama_seq_id seq_id) const;
+
+    // the snapshot that holds the state whose tensor data starts at the next size bytes of io, -1 if io holds the
+    // data; throws if it names a snapshot that holds another state by now
+    int32_t snapshot_find(llama_io_read_i & io, size_t size) const;
+
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
 
@@ -140,7 +171,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // snap: the snapshot that holds the tensor data instead of the buffer, -1: none
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, int32_t snap = -1) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
