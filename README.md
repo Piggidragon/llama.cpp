@@ -36,20 +36,82 @@ Notes:
 
 ## Upstream vs this fork
 
-Setup: RTX 4070 (12 GB, PCIe 4.0 x16) + RTX 3060 (12 GB, PCIe 3.0 x4), Qwen3.8-27B UD-Q4_K_S with its MTP head (2 draft tokens), `llama-server` with 2 slots of 131k context, q5_1 K/V cache.
+Measured on 2026-10-22: RTX 4070 (12 GB, PCIe 4.0 x16) + RTX 3060 (12 GB, PCIe 3.0 x4), peer-to-peer access through patched kernel modules and libcuda for both servers, Qwen3.8-27B UD-Q4_K_S with MTP depth 2, `llama-server` with 2 slots and `--split-mode tensor`, q5_1 K/V cache and q4_0 draft K/V cache on both.
 
-- Upstream: `-sm tensor -fa on -ctk q5_1 -ctv q5_1`, the best split that fits.
-- This fork: additionally `--flash-attn-native-quants -ts 0.625,0.375 --attn-split 1,3 --allreduce p2p --split-overlap -ub 256 --phase-aware-workspace --live-context-workspace --cache-disk ...`.
+- **This fork** (`main` 3fc7684fa) runs the production config: 2 x 131k context, `-ts 0.625,0.375 --attn-split 1,3 -ub 256 --flash-attn-native-quants --allreduce p2p --split-overlap --phase-aware-workspace --live-context-workspace --concurrent-prefill --compact-attn-mask --spec-type ngram-simple,draft-mtp --spec-select --spec-draft-vocab <English + German list> --logits-topk --spec-ckpt-snapshot --cache-disk ... --checkpoint-root 2048 --checkpoint-spread --cache-save-min 512`.
+- **Upstream** (ggml-org `master` a37cc4610, built with all FlashAttention quants, `GGML_CUDA_FA_ALL_QUANTS=ON`) runs the largest context tested that leaves about 400 MiB free on each GPU after loading: 2 x 82k at `-ts 0.5,0.5 -ub 512`.
+  - At 2 x 131k it runs out of memory at `-ts 0.5,0.5`, and with the smaller q5_0 cache at every split tried from 0.4375 to 0.625. The compute buffer, 1.0-1.25 GiB on the 4070, holds the F16 copy of the attention window that `--flash-attn-native-quants` avoids.
+  - 2 x 86k loads with 201 / 278 MiB free, 2 x 90k with 29 / 106.
+  - The fork's split, `-ts 0.625,0.375`, puts more weights on the faster 4070, which helps generation. Upstream cannot use it: it runs out of memory there even at 2 x 41k. The fork can, because `--attn-split 1,3` moves the KV cache to the 3060 and its FlashAttention needs no F16 copy.
+- **The 95k values** (marked †) come from a second upstream config, 2 x 98k. At `-ub 512` it loads only with an F16 draft cache: q4_0 and q8_0 do not fit in the MTP draft context. At 1k-64k it is within 7% of the 2 x 82k config. With `-ub 256`, 2 x 106k still loads, with 73 / 150 MiB free (not measured).
+- **Drafting:** upstream drafts with MTP alone (it has no `--spec-select`). Its chain `--spec-type ngram-simple,draft-mtp` always takes an n-gram draft when there is one; it was measured for the task table only.
 
-| | upstream | this fork |
+Method:
+- **Sampling:** both servers get the fork's production defaults on the command line: temperature 1.0, top-p 0.95, top-k 20, presence penalty 1.5, reasoning effort medium. The client sends no sampling parameters.
+- **CPU check:** before every request the client waited until other CPU use stayed below 1.5 cores. That is the machine's CPU time minus the server's and the client's, so kernel threads count too. A request during which it went higher was repeated once; a request disturbed on both attempts was left out.
+- **VRAM:** sampled by nvidia-smi every 250 ms.
+- **Prompts:** the tasks are English and German, the languages of the draft vocabulary.
+- The feature rows above measure one feature at a time with other prompts, so their numbers differ from these.
+
+**Generation by task** (generated tokens per second, thinking included; median of 3 requests after a warm-up round):
+
+| task | this fork (n-gram or MTP, `--spec-select`) | upstream (MTP) | upstream (n-gram, then MTP) |
+|---|--:|--:|--:|
+| reasoning (probability puzzle) | 76.8 | 56.4 | 52.6 |
+| creative writing, English | 54.5 | 39.8 | 40.0 |
+| creative writing, German | 53.8 | 40.2 | 39.6 |
+| writing code (Python module + tests) | 73.0 | 52.2 | 49.1 |
+| editing code (C++ functions) | 71.5 | 53.5 | 56.9 |
+| editing a quoted docker-compose file | 193.5 | 58.2 | 105.0 |
+| explaining (B-tree vs binary search tree) | 61.0 | 43.4 | 44.3 |
+
+Notes:
+- **Different outputs:** each request writes its own text, and the thinking length varies. For example, code edit came out at 0.8k-1.7k tokens, and one fork reasoning request thought 2.8k tokens and ran at 66.3 t/s. Writing code stops at the 4096-token limit in every request.
+- **First fork run:** a first fork run, with other CPU use of up to 1 core, measured within 2% of these values, except code edit (76.3 t/s, within that task's spread) and the compose edit (145-154 t/s). The compose edit's fast steps depend more on the CPU.
+
+**Prompt processing and generation by context** (a German Wikipedia text to summarize, thinking off, 384 tokens generated):
+
+| prompt | prompt processing (t/s), fork / upstream | generation at that depth (t/s), fork / upstream |
 |---|--:|--:|
-| prompt processing, 10k context (t/s) | | |
-| prompt processing, 95k context (t/s) | | |
-| generation, 10k context (t/s) | | |
-| generation, 95k context (t/s) | | |
-| resume a 25k-token conversation after a restart (s) | | |
-| generation while the other slot processes a 20k-token prompt (t/s) | | |
-| VRAM after a 95k request, 4070 / 3060 (MiB) | | |
+| 1k | 643 / 576 | 64.0 / 48.4 |
+| 4k | 933 / 659 | 65.3 / 45.8 |
+| 10k | 833 / 668 | 52.0 / 43.9 |
+| 32k | 924 / 627 | 59.4 / 38.4 |
+| 64k | 786 / 565 | 50.4 / 32.3 |
+| 95k (96.7k tokens) | 713 / 518 † | 36.7 / 26.9 † |
+
+Notes:
+- **Samples:** up to 10k, both columns are the median of 2 requests with different texts. Single requests vary a lot, e.g. fork generation at 10k 43.2 and 60.9 t/s, upstream at 1k 43.8 and 53.0.
+- **From 32k:** prompt processing is one request. Generation is the median of that request and 2 repeats of it from the cache.
+- **CPU:** the fork's run had more other CPU use than upstream's (median 0.8 against 0.1 cores).
+
+**Two slots, and a long prompt next to a generating slot:**
+
+| | this fork | upstream (MTP) |
+|---|--:|--:|
+| two slots generating at once, combined t/s: German story + Python module / B-tree explanation + English story / probability puzzle + compose edit | 96.0 / 92.2 / 127.1 | 59.3 / 60.1 / 78.0 |
+| generating slot while the other slot processes a 20k / 64k / 95k prompt (t/s) | 22.3 / 20.1 / 18.9 | 1.3 / 1.2 / 1.1 † |
+| that prompt meanwhile (t/s) | 542 / 489 / 457 | 622 / 530 / 477 † |
+| first token of a 26k-token conversation, cold / after a server restart (s) | 31.6 / 1.3 | 44.4 / 42.0 |
+| stopping the server (s) | 11.0 | 2.3 |
+
+Notes:
+- **Two slots:** each value is the median of 2 runs per pair. Combined t/s counts the tokens of both requests in the time both were streaming: the token counts come from the server's per-token count, the time from when both streams had sent their first token until the first one ended. In the third pair upstream drafts with MTP only; its n-gram chain, not run here, edits the compose file at 105 t/s on one slot.
+- **Long prompt next to a generating slot:** the fork computes the prompt in a second context next to the generating slots (`--concurrent-prefill`). In exchange its prompt goes 4-13% slower. Upstream processes the prompt in the generation batches, which almost stalls the generating slot until the prompt is done.
+- **Restart:** after a restart the fork restores the conversation from its disk prompt cache: 37 tokens computed, 26,485 read from the cache. Upstream computes all of it again; it has no disk prompt cache, only manual slot save and restore. The fork's stop takes longer because it writes its prompt cache to disk on exit.
+- **Load time:** both load in 5-6 s with the model in the page cache; starts without it took 14-19 s.
+
+**Memory:**
+
+| | this fork | upstream (MTP) |
+|---|--:|--:|
+| context | 2 x 131k | 2 x 82k (2 x 98k †) |
+| free VRAM after loading, 4070 / 3060 (MiB) | 581 / 436 | 407 / 480 (221 / 294 †) |
+| least free VRAM during the runs, 4070 / 3060 (MiB) | 156 / 52 | 335 / 416 (151 / 234 †) |
+
+Notes:
+- **Fork:** its compute buffers follow the batch and the context, so its free VRAM falls during long prompts. The least, 52 MiB on the 3060, came with a 95k prompt next to a generating slot. The deepest prompt measured was 96.7k tokens, not the full 131k.
+- **2 x 98k config:** it ran only the prompt and next-to tests.
 
 ---
 
