@@ -25,7 +25,6 @@
 #include "base64.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -35,7 +34,6 @@
 #include <random>
 #include <utility>
 #include <fstream>
-#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -4107,6 +4105,11 @@ private:
 
             // a TTS decode of ctx_tgt is not in the batch that bg_wait_target() checks: not while ctx_bg computes
             bg_wait();
+
+            // --logits-topk: the k of the last batch did not count this slot's sampler (the batch sets its own k after)
+            if (params_base.logits_topk) {
+                llama_set_logits_topk(ctx_tgt, 0);
+            }
 
             llama_set_embeddings(ctx_tgt, true);
 
