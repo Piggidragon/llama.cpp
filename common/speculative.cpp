@@ -2434,6 +2434,8 @@ struct common_speculative_selector {
     std::array<float, NT> t_norm{};
     float t_model = 0.0f; // the time (us) of a draft call of a model drafter
 
+    float max_loss = 0.1f; // see common_params_speculative::select_max_loss
+
     // the step in flight
     int64_t step_t0      = 0;
     int64_t step_t_draft = 0;
@@ -3176,6 +3178,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         } else {
             result->select = std::make_unique<common_speculative_selector>();
             result->select->init(n_seq, result->impls);
+            result->select->max_loss = params.select_max_loss;
             SPC_INF("%s", "--spec-select: each step takes the draft with the most expected tokens per time\n");
         }
     }
@@ -3352,7 +3355,7 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
     // the choices: bit i set = c_seqs[i] takes its n-gram draft. A choice may not make any sequence more than
     // max_loss slower than with every sequence on the model drafter: a long draft of one conversation must not slow
     // the others down (with a recurrent or hybrid model it costs them a pass over the model)
-    constexpr float max_loss = 0.1f;
+    const float max_loss = sel->max_loss;
     uint32_t best_mask = (1u << n_c) - 1;
     if (known) {
         std::vector<int> lens0;

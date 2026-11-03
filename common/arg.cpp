@@ -4594,12 +4594,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "with several --spec-type: per step, each sequence uses the draft with the most expected tokens per time "
         "(e.g. an n-gram draft of copied text where it is accepted, MTP elsewhere) instead of the first draft; the "
         "acceptance of each draft position is learned per sequence, also from the drafts that were not used, and the "
-        "step times per number of verified tokens; no sequence is made more than 10% slower than with every one on "
-        "the model drafter (default: first draft)",
+        "step times per number of verified tokens; no sequence is made more than --spec-select-max-loss slower than "
+        "with every one on the model drafter (default: first draft)",
         [](common_params & params) {
             params.speculative.select = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SELECT"));
+    add_opt(common_arg(
+        {"--spec-select-max-loss"}, "F",
+        string_format("with --spec-select and several generating sequences: a choice of drafts (e.g. a long n-gram draft "
+        "of copied text for one sequence) may lower the tokens per time of each sequence by at most this share, against "
+        "every sequence on the model drafter; 1: no limit, the choice maximizes the product of the tokens per time of "
+        "the sequences (default: %.2f)", (double) params.speculative.select_max_loss),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f >= 0.0f && f <= 1.0f)) {
+                throw std::invalid_argument("--spec-select-max-loss must be in [0, 1]");
+            }
+            params.speculative.select_max_loss = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_SELECT_MAX_LOSS"));
     add_opt(common_arg(
         {"--spec-ckpt-snapshot"},
         {"--no-spec-ckpt-snapshot"},
