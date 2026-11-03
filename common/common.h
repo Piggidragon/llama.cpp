@@ -402,6 +402,10 @@ struct common_params_speculative {
     // per draft position and step times, learned per sequence) instead of the first one, see --spec-select
     bool select = false;
 
+    // --spec-select: a choice may lower the tokens per time of each sequence by at most this share, against every
+    // sequence on the model drafter (1: no limit), see --spec-select-max-loss
+    float select_max_loss = 0.1f;
+
     // keep the checkpoint before a verification in a device snapshot of the recurrent state instead of host memory,
     // see --spec-ckpt-snapshot
     bool ckpt_snapshot = false;
