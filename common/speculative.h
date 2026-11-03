@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -82,6 +84,10 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // --spec-draft-adaptive: called for each token that a drafter drafts token by token, with its position i, draft
+    // probability p and id; 0: drop it and stop, 1: keep it and stop, 2: keep it and draft on (empty: up to n_max)
+    std::function<int(int i, float p, llama_token id)> keep;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -107,6 +113,9 @@ void common_speculative_draft(common_speculative * spec);
 // tokens of the batch that verified it; clean: no prompt was computed alongside (a second context), so that a step's
 // time is only learned from a batch of the drafts alone
 void common_speculative_verified(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_batch, bool clean);
+
+// --spec-draft-adaptive: the replay step of seq_id after a checkpoint restore was verified
+void common_speculative_replayed(common_speculative * spec, llama_seq_id seq_id);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

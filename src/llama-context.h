@@ -347,6 +347,16 @@ private:
     // make a scheduler lane the active one (sched, gf_res_prev, backend_ptrs)
     void lane_switch(int lane);
 
+    // make a graph slot the active one, -1: the main scheduler
+    void graph_slot_switch(int slot);
+
+    // forget the graphs of the graph slots, free: also their schedulers
+    void graph_slots_reset(bool free);
+
+    // make the graph slot for a ubatch the active one: the one that can reuse its graph, else a free one or the one
+    // used longest ago; the main scheduler stays active for the other ubatches
+    void graph_slot_select(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -581,6 +591,24 @@ private:
     bool             lanes       = false;
     const uint32_t   lanes_min_tokens = 64; // smaller ubatches stay on lane 0
     ggml_backend_ptr backend_lane1;         // the meta backend of lane 1
+
+    // Graph slots (n_graph_cache): a ubatch of up to graph_cache_tokens tokens computes in a scheduler that keeps the
+    // graph of one of the last batch shapes, so that a step of another size (e.g. a draft of another length) reuses its
+    // graph instead of building and allocating one again (under split mode tensor that maps every tensor to the devices
+    // again). The schedulers borrow the compute buffers of the main one (with the workspace options) and compute one
+    // after the other on its backends. The active slot is swapped into sched and gf_res_prev; outside of decode() the
+    // main scheduler is the active one.
+    struct graph_slot {
+        ggml_backend_sched_ptr              sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active = nullptr;
+        uint64_t                            generation = 0; // of the buffers after its last graph
+        uint64_t                            used       = 0;
+    };
+    std::vector<graph_slot> graph_slots;
+    int            graph_slot_active  = -1;
+    uint64_t       graph_slot_tick    = 0;
+    const uint32_t graph_cache_tokens = 16;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

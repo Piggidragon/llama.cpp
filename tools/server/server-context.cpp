@@ -5533,6 +5533,8 @@ private:
                 // --spec-select learns the draft's outcome here, before a restore (the replay reports one more)
                 if (!slot.spec_is_replay) {
                     common_speculative_verified(spec.get(), slot.id, accepted.size() - 1, batch.size(), !spec_step_bg);
+                } else {
+                    common_speculative_replayed(spec.get(), slot.id);
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();

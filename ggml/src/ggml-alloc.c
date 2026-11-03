@@ -532,17 +532,18 @@ struct ggml_gallocr {
     int * shared_entry_ids; // [n_buffers], -1 for private buffers
 };
 
+// role 0 owns the buffers, the others borrow them (e.g. an MTP draft context, the schedulers of graphs kept per batch
+// shape); they compute one after the other
 enum ggml_gallocr_shared_role {
-    GGML_GALLOCR_SHARED_ROLE_OWNER    = 0,
-    GGML_GALLOCR_SHARED_ROLE_BORROWER = 1,
-    GGML_GALLOCR_SHARED_ROLE_COUNT    = 2,
+    GGML_GALLOCR_SHARED_ROLE_OWNER = 0,
+    GGML_GALLOCR_SHARED_ROLE_COUNT = 32,
 };
 
 struct ggml_gallocr_shared_entry {
     ggml_backend_buffer_type_t buft;
     struct vbuffer * buffer;
-    // a meta buffer maps its tensors for one graph at a time, so the borrower uses an alias of it
-    struct vbuffer * borrower_alias;
+    // a meta buffer maps its tensors for one graph at a time, so each borrower uses an alias of it
+    struct vbuffer * alias[GGML_GALLOCR_SHARED_ROLE_COUNT];
     size_t requirements[GGML_GALLOCR_SHARED_ROLE_COUNT][GGML_VBUFFER_MAX_CHUNKS];
 };
 
@@ -659,8 +660,10 @@ static bool ggml_gallocr_resize_shared_entry(
         return true;
     }
 
-    ggml_vbuffer_free(entry->borrower_alias);
-    entry->borrower_alias = NULL;
+    for (int role = 0; role < GGML_GALLOCR_SHARED_ROLE_COUNT; ++role) {
+        ggml_vbuffer_free(entry->alias[role]);
+        entry->alias[role] = NULL;
+    }
     ggml_vbuffer_free(entry->buffer);
     entry->buffer = NULL;
     shared->generation++;
@@ -723,9 +726,13 @@ static bool ggml_gallocr_publish_shared_requirements(ggml_gallocr_t galloc) {
         if (!ggml_gallocr_resize_shared_entry(shared, entry, shrink)) {
             return false;
         }
-        if (shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER] && entry->buffer != NULL &&
-                entry->borrower_alias == NULL && ggml_backend_buft_is_meta(entry->buft)) {
-            entry->borrower_alias = ggml_vbuffer_meta_alias(entry->buffer);
+        if (entry->buffer == NULL || !ggml_backend_buft_is_meta(entry->buft)) {
+            continue;
+        }
+        for (int role = 1; role < GGML_GALLOCR_SHARED_ROLE_COUNT; ++role) {
+            if (shared->active[role] && entry->alias[role] == NULL) {
+                entry->alias[role] = ggml_vbuffer_meta_alias(entry->buffer);
+            }
         }
     }
 
@@ -752,8 +759,8 @@ static struct vbuffer * ggml_gallocr_get_vbuffer(ggml_gallocr_t galloc, int buff
         const int entry_id = galloc->shared_entry_ids[buffer_id];
         if (entry_id >= 0) {
             struct ggml_gallocr_shared_entry * entry = &galloc->shared_buffers->entries[entry_id];
-            if (galloc->shared_role == GGML_GALLOCR_SHARED_ROLE_BORROWER && entry->borrower_alias != NULL) {
-                return entry->borrower_alias;
+            if (galloc->shared_role != GGML_GALLOCR_SHARED_ROLE_OWNER && entry->alias[galloc->shared_role] != NULL) {
+                return entry->alias[galloc->shared_role];
             }
             return entry->buffer;
         }
@@ -809,7 +816,9 @@ static void ggml_gallocr_shared_start_shrink(struct ggml_gallocr_shared_buffers 
 
 static void ggml_gallocr_shared_free(struct ggml_gallocr_shared_buffers * shared) {
     for (int i = 0; i < shared->n_entries; ++i) {
-        ggml_vbuffer_free(shared->entries[i].borrower_alias);
+        for (int role = 0; role < GGML_GALLOCR_SHARED_ROLE_COUNT; ++role) {
+            ggml_vbuffer_free(shared->entries[i].alias[role]);
+        }
         ggml_vbuffer_free(shared->entries[i].buffer);
     }
     free(shared->entries);
@@ -829,10 +838,8 @@ static void ggml_gallocr_detach_shared_buffers(ggml_gallocr_t galloc) {
     shared->shrink_seen[role] = false;
     for (int i = 0; i < shared->n_entries; ++i) {
         memset(shared->entries[i].requirements[role], 0, sizeof(shared->entries[i].requirements[role]));
-        if (role == GGML_GALLOCR_SHARED_ROLE_BORROWER) {
-            ggml_vbuffer_free(shared->entries[i].borrower_alias);
-            shared->entries[i].borrower_alias = NULL;
-        }
+        ggml_vbuffer_free(shared->entries[i].alias[role]);
+        shared->entries[i].alias[role] = NULL;
     }
 
     shared->refs--;
@@ -938,8 +945,17 @@ static bool ggml_gallocr_set_resizable_borrower(ggml_gallocr_t galloc, ggml_gall
     GGML_ASSERT(!galloc->resizable);
 
     struct ggml_gallocr_shared_buffers * shared = owner->shared_buffers;
-    if (shared == NULL || owner->shared_role != GGML_GALLOCR_SHARED_ROLE_OWNER ||
-            shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER]) {
+    if (shared == NULL || owner->shared_role != GGML_GALLOCR_SHARED_ROLE_OWNER) {
+        return false;
+    }
+    int role = -1;
+    for (int r = 1; r < GGML_GALLOCR_SHARED_ROLE_COUNT; ++r) {
+        if (!shared->active[r]) {
+            role = r;
+            break;
+        }
+    }
+    if (role < 0) {
         return false;
     }
 
@@ -967,12 +983,12 @@ static bool ggml_gallocr_set_resizable_borrower(ggml_gallocr_t galloc, ggml_gall
     }
 
     shared->refs++;
-    shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER] = true;
-    shared->shrink_seen[GGML_GALLOCR_SHARED_ROLE_BORROWER] = false;
+    shared->active[role] = true;
+    shared->shrink_seen[role] = false;
 
     galloc->resizable = true;
     galloc->shared_buffers = shared;
-    galloc->shared_role = GGML_GALLOCR_SHARED_ROLE_BORROWER;
+    galloc->shared_role = role;
     galloc->shared_entry_ids = entry_ids;
     return true;
 }
@@ -1484,7 +1500,14 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("LLAMA_TRACE_GRAPH") != NULL;
+    }
+    const int64_t t0 = ggml_time_us();
+    bool replanned = false;
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
+        replanned = true;
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1541,6 +1564,9 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
         }
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+    }
+    if (trace && graph->n_nodes > 500) {
+        GGML_LOG_WARN("gallocr: nodes %d, replanned %d, %.2f ms\n", graph->n_nodes, (int) replanned, (ggml_time_us() - t0)/1000.0);
     }
 
     return true;

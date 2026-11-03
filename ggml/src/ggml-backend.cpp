@@ -1797,6 +1797,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        static const bool trace = getenv("LLAMA_TRACE_GRAPH") != nullptr;
+        if (trace && sched->graph.n_nodes > 500) {
+            GGML_LOG_WARN("sched alloc: reserve path, backend_ids_changed %d\n", (int) backend_ids_changed);
+        }
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
@@ -2178,10 +2182,16 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    static const bool trace = getenv("LLAMA_TRACE_GRAPH") != nullptr;
+    const int64_t t0 = ggml_time_us();
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t t1 = ggml_time_us();
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+    if (trace && graph->n_nodes > 500) {
+        GGML_LOG_WARN("sched alloc: nodes %d, splits %d, split_graph %.2f ms, alloc_splits %.2f ms\n", graph->n_nodes, sched->n_splits, (t1 - t0)/1000.0, (ggml_time_us() - t1)/1000.0);
     }
 
     sched->is_alloc = true;

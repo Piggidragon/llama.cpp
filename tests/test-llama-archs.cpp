@@ -1350,8 +1350,9 @@ static bool check_shared_memory_reuse(
         const float * logits = llama_get_logits_ith(ctx, -1);
         return std::vector<float>(logits, logits + n_vocab);
     };
-    // graphs of three other shapes, each built and computed (the positions stay within the training context of 256)
-    static const int n_shapes[3] = { 7, 13, 21 };
+    // graphs of 17 other shapes, each built and computed: more than a static meta buffer keeps the views of (the
+    // positions stay within the training context of 256)
+    static const int n_shapes[17] = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 };
     auto shapes = [&](std::vector<llama_token> & toks) {
         for (int n : n_shapes) {
             for (int i = 0; i < n; i++) {
@@ -1414,6 +1415,86 @@ static bool check_shared_memory_reuse(
         status = "\033[1;31mFAIL\033[0m (shared memory reuse: " + what + ")";
     }
     return ok_a && ok_b;
+}
+
+// n_graph_cache: decodes of small ubatches of changing shapes (one or two sequences, every token an output) give the same
+// logits bitwise with and without the graph slots, and the slots reuse more graphs
+static bool check_graph_cache(
+        llama_model * model, llama_allreduce_type allreduce_type, bool workspace, bool compact_mask, std::string & status) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto make_ctx = [&](uint32_t n_graph_cache) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx                  = 512;
+        ctx_params.n_seq_max              = 2;
+        ctx_params.n_batch                = 64;
+        ctx_params.n_ubatch               = 64;
+        ctx_params.kv_unified             = false;
+        ctx_params.flash_attn_type        = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.n_threads              = 4;
+        ctx_params.n_threads_batch        = 4;
+        ctx_params.allreduce_type         = allreduce_type;
+        ctx_params.phase_aware_workspace  = workspace;
+        ctx_params.live_context_workspace = workspace;
+        ctx_params.compact_attn_mask      = compact_mask;
+        ctx_params.n_graph_cache          = n_graph_cache;
+        llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create the context of the graph cache check");
+        }
+        return ctx;
+    };
+
+    // steps: the tokens each sequence adds (0: none); the shapes repeat in between others
+    static const int steps[][2] = {
+        { 9, 6 }, { 1, 0 }, { 3, 0 }, { 2, 0 }, { 3, 0 }, { 0, 1 }, { 1, 0 }, { 0, 3 }, { 4, 0 }, { 3, 0 },
+        { 0, 2 }, { 3, 0 }, { 1, 0 }, { 3, 3 }, { 2, 2 }, { 3, 3 }, { 1, 0 }, { 3, 0 }, { 0, 3 }, { 3, 3 },
+    };
+
+    uint32_t rng = 2468;
+    auto tok = [&]() {
+        rng = rng*1103515245u + 12345u;
+        return (llama_token) (1 + (rng >> 8) % (n_vocab - 2));
+    };
+    std::vector<std::vector<llama_token>> toks(std::size(steps));
+    for (size_t i = 0; i < std::size(steps); i++) {
+        for (int k = 0; k < steps[i][0] + steps[i][1]; k++) {
+            toks[i].push_back(tok());
+        }
+    }
+
+    auto run = [&](llama_context * ctx, std::vector<float> & out) {
+        llama_pos pos[2] = { 0, 0 };
+        for (size_t i = 0; i < std::size(steps); i++) {
+            common_batch batch(ctx);
+            size_t t = 0;
+            for (llama_seq_id s = 0; s < 2; s++) {
+                for (int k = 0; k < steps[i][s]; k++) {
+                    batch.add(toks[i][t++], pos[s]++, s, true);
+                }
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                throw std::runtime_error("failed to decode in the graph cache check");
+            }
+            for (size_t j = 0; j < t; j++) {
+                const float * logits = llama_get_logits_ith(ctx, (int32_t) j);
+                out.insert(out.end(), logits, logits + n_vocab);
+            }
+        }
+        return llama_perf_context(ctx).n_reused;
+    };
+
+    std::vector<float> logits_cache;
+    std::vector<float> logits_ref;
+    const int32_t n_reused_cache = run(make_ctx(4).get(), logits_cache);
+    const int32_t n_reused_ref   = run(make_ctx(0).get(), logits_ref);
+
+    const bool same  = logits_cache == logits_ref;
+    const bool reuse = n_reused_cache > n_reused_ref;
+    if (!same || !reuse) {
+        status = "\033[1;31mFAIL\033[0m (graph cache: " + std::string(!same ? "logits differ" : "no more graphs reused") + ")";
+    }
+    return same && reuse;
 }
 
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
@@ -2005,6 +2086,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
 
                         if (!encode && !check_logits_topk(model_and_ctx_dev.first.get(), tokens, status_range)) {
+                            test_ok = false;
+                        }
+                        if (!encode && !shared_known_bad && (dc_plain || dc.split_mode == LLAMA_SPLIT_MODE_TENSOR) &&
+                                !check_graph_cache(model_and_ctx_dev.first.get(), dc.allreduce_type, dc.workspace, dc.compact_mask,
+                                    status_range)) {
                             test_ok = false;
                         }
                         if (!encode && llama_model_saver_supports_arch(arch) &&

@@ -1838,6 +1838,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_OVERLAP"));
     add_opt(common_arg(
+        {"--graph-cache"}, "N",
+        "decode batches of up to 16 tokens keep the graphs of the last N batch shapes (per set of sequences), so that a "
+        "step of another size (e.g. a draft of another length) does not build and allocate its graph again; with the "
+        "workspace options they share the compute buffers of the context, else each has its own (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 15) {
+                throw std::invalid_argument("--graph-cache must be in [0, 15]");
+            }
+            params.graph_cache = value;
+        }
+    ).set_env("LLAMA_ARG_GRAPH_CACHE"));
+    add_opt(common_arg(
         {"--phase-aware-workspace"},
         {"--no-phase-aware-workspace"},
         "size the compute buffers for the current phase: generation batches reserve only for their few tokens, the "
@@ -4473,6 +4485,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        "draft models that draft token by token (MTP): the draft length per step. A token is kept while the tokens it is "
+        "expected to add pay for its time (its verification, its draft call, a restore when it cannot be rolled back); "
+        "its acceptance is learned per sequence against the draft probability. The draft stops at an adaptive maximum "
+        "at or below --spec-draft-n-max, set from the measured tokens per time; also with a single --spec-type "
+        "(default: disabled)",
+        [](common_params & params) {
+            params.speculative.draft.adaptive = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
@@ -4612,6 +4635,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ckpt_snapshot = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_CKPT_SNAPSHOT"));
+    add_opt(common_arg(
+        {"--spec-rollback"}, "N",
+        "models with a recurrent state (e.g. Qwen 3.5): the number of rejected draft tokens that are rolled back from "
+        "per-token copies of the state, without a checkpoint; each takes one more copy of the recurrent state per "
+        "sequence in VRAM; a longer draft takes a checkpoint and, when more of it is rejected, a restore and a replay "
+        "(default: --spec-draft-n-max)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-rollback must be >= 0");
+            }
+            params.speculative.n_rollback = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ROLLBACK"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

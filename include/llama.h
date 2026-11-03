@@ -395,6 +395,8 @@ extern "C" {
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_seq_snapshots;       // device snapshots of the recurrent state of a sequence (LLAMA_STATE_SEQ_FLAGS_SNAPSHOT), 0 = none
+        uint32_t n_graph_cache;         // decode ubatches of up to 16 tokens keep the graphs of this many batch shapes, so that
+                                        // switching between them does not build and allocate a graph again (0 = off)
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation

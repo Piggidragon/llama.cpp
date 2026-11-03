@@ -4950,7 +4950,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            static const bool trace = getenv("LLAMA_TRACE_CUDA_GRAPHS") != nullptr; // WIP measurement
+            size_t free0 = 0, free1 = 0, total = 0;
+            if (trace) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemGetInfo(&free0, &total));
+            }
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (trace) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemGetInfo(&free1, &total));
+                size_t n_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_nodes));
+                GGML_LOG_WARN("cuda graph instantiate: device %d, graphs %zu, nodes %zu, %.1f KiB\n", cuda_ctx->device, cuda_ctx->cuda_graphs.size(), n_nodes, ((double) free0 - (double) free1)/1024.0);
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);

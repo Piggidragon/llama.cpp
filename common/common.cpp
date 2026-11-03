@@ -1769,6 +1769,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.flash_attn_native_quants = params.flash_attn_native_quants;
     cparams.split_overlap            = params.split_overlap;
+    cparams.n_graph_cache            = params.graph_cache;
     cparams.phase_aware_workspace    = params.phase_aware_workspace;
     cparams.live_context_workspace   = params.live_context_workspace;
     cparams.kv_unified_gather        = params.kv_unified_gather;

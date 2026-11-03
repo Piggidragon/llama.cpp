@@ -205,6 +205,7 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    cparams.n_graph_cache = params.n_graph_cache;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
@@ -918,6 +919,111 @@ void llama_context::lane_switch(int lane) {
     gf_res_prev_active = nullptr;
 }
 
+void llama_context::graph_slot_switch(int slot) {
+    if (slot == graph_slot_active) {
+        return;
+    }
+    auto swap_with = [&](graph_slot & s) {
+        std::swap(sched,              s.sched);
+        std::swap(gf_res_prev,        s.gf_res_prev);
+        std::swap(gf_res_prev_active, s.gf_res_prev_active);
+    };
+    if (graph_slot_active >= 0) {
+        swap_with(graph_slots[graph_slot_active]);
+        auto & s = graph_slots[graph_slot_active];
+        uint64_t shrink_generation = 0;
+        ggml_backend_sched_get_buffer_state(s.sched.get(), &s.generation, &shrink_generation);
+    }
+    graph_slot_active = -1;
+    if (slot >= 0) {
+        swap_with(graph_slots[slot]);
+        graph_slot_active = slot;
+    }
+}
+
+void llama_context::graph_slots_reset(bool free) {
+    GGML_ASSERT(graph_slot_active < 0);
+    for (auto & s : graph_slots) {
+        for (auto & res : s.gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        s.gf_res_prev_active = nullptr;
+    }
+    if (free) {
+        graph_slots.clear();
+    }
+}
+
+void llama_context::graph_slot_select(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype) {
+    graph_slot_switch(-1);
+    if (cparams.n_graph_cache == 0 || lane_active != 0 || cparams.pipeline_parallel || graph_reuse_disable ||
+            gtype == LLM_GRAPH_TYPE_ENCODER || ubatch.n_tokens > graph_cache_tokens || !sched) {
+        return;
+    }
+
+    for (size_t k = 0; k < graph_slots.size(); ++k) {
+        auto & s = graph_slots[k];
+        if (!s.sched || s.gf_res_prev_active == nullptr) {
+            continue;
+        }
+        // the buffers were allocated again: its graph points to the old ones
+        uint64_t generation        = 0;
+        uint64_t shrink_generation = 0;
+        ggml_backend_sched_get_buffer_state(s.sched.get(), &generation, &shrink_generation);
+        if (generation != s.generation) {
+            ggml_backend_sched_reset(s.sched.get());
+            for (auto & res : s.gf_res_prev) {
+                if (res) {
+                    res->reset();
+                }
+            }
+            s.gf_res_prev_active = nullptr;
+            continue;
+        }
+        graph_slot_switch((int) k);
+        auto * res = get_gf_res_prev();
+        if (gf_res_prev_active == res && res->can_reuse(graph_params(res, ubatch, mctx, gtype)) &&
+                ggml_backend_sched_graph_reusable(sched.get())) {
+            graph_slots[k].used = ++graph_slot_tick;
+            return;
+        }
+        graph_slot_switch(-1);
+    }
+
+    // a new graph: in a free slot, else in the one used longest ago
+    int k = -1;
+    if (graph_slots.size() < cparams.n_graph_cache) {
+        graph_slots.emplace_back();
+        k = (int) graph_slots.size() - 1;
+    } else {
+        k = 0;
+        for (size_t i = 1; i < graph_slots.size(); ++i) {
+            if (graph_slots[i].used < graph_slots[k].used) {
+                k = (int) i;
+            }
+        }
+    }
+    auto & s = graph_slots[k];
+    if (!s.sched) {
+        s.sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), ws.max_nodes > 0 ? ws.max_nodes : graph_max_nodes(cparams.n_ubatch),
+                false, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(s.sched.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(s.sched.get(), sched_graph_realloc, this);
+        // the buffers of the main scheduler (of the owner, for a context that computes in the buffers of another one)
+        if (sched_resizable()) {
+            ggml_backend_sched_t owner = ws_owner != nullptr && ws_owner->sched ? ws_owner->sched.get() : sched.get();
+            if (!ggml_backend_sched_set_resizable(s.sched.get(), owner)) {
+                GGML_ASSERT(ggml_backend_sched_set_resizable(s.sched.get(), nullptr));
+            }
+        }
+    }
+    s.used = ++graph_slot_tick;
+    graph_slot_switch(k);
+}
+
 bool llama_context::sched_resizable() const {
     return cparams.phase_aware_workspace || cparams.live_context_workspace;
 }
@@ -992,6 +1098,7 @@ void llama_context::sched_reserve(uint32_t n_tokens, uint32_t n_kv) {
     }
 
     GGML_ASSERT(lane_active == 0);
+    graph_slot_switch(-1);
     sched_reserve_lane(plan, force);
     // lane 1 computes only the large ubatches
     if (lanes && (force || n_tokens >= lanes_min_tokens)) {
@@ -1019,6 +1126,10 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     if (resizable && sched && !sched_new_needed) {
         if (ws.n_tokens > plan.n_tokens || ws.n_kv > plan.n_kv) {
             ggml_backend_sched_request_buffer_shrink(sched.get());
+            // the graph slots would keep the buffers at their size: they allocate again when they are used
+            if (lane_active == 0) {
+                graph_slots_reset(true);
+            }
         }
 
         uint64_t generation        = 0;
@@ -1077,6 +1188,10 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
         if (resizable && sched && lane_active == 0 && ws_borrower != nullptr) {
             ws_borrower->ws_reattach        = true;
             ws_borrower->sched_need_reserve = true;
+        }
+        // the graph slots borrow the buffers of the old scheduler
+        if (lane_active == 0) {
+            graph_slots_reset(true);
         }
         sched_new(max_nodes, cparams.pipeline_parallel);
         ws = {};
@@ -1316,6 +1431,7 @@ int llama_context::attach_shared_workspace(llama_context & owner) {
     owner.synchronize();
 
     // a new scheduler that borrows the buffers of the owner
+    graph_slots_reset(true);
     sched.reset();
     for (auto & res : gf_res_prev) {
         res.reset();
@@ -1430,6 +1546,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        graph_slots_reset(false);
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2249,6 +2366,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // a small ubatch computes in the graph slot of its shape
+    graph_slot_select(ubatch, mctx, gtype);
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -2277,11 +2397,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        static const bool trace_graph = getenv("LLAMA_TRACE_GRAPH") != nullptr;
+        const auto t_built_us = ggml_time_us();
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2294,9 +2415,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (trace_graph) {
+            LLAMA_LOG_WARN("graph rebuild: n_tokens %u, build %.2f ms, alloc %.2f ms\n", ubatch.n_tokens, (t_built_us - t_start_us)/1000.0, (ggml_time_us() - t_built_us)/1000.0);
+        }
 
         gf_res_prev_active = res;
     }
+    static const bool trace_graph_c = getenv("LLAMA_TRACE_GRAPH") != nullptr;
+    const auto t_c0 = ggml_time_us();
 
     // set the input data for the input tensors
     {
@@ -2313,6 +2439,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (trace_graph_c && ubatch.n_tokens <= 8) {
+        LLAMA_LOG_WARN("graph compute: n_tokens %u, reused %d, inputs+compute %.2f ms\n", ubatch.n_tokens, (int) (gf_res_prev_active == res && n_reused > 0), (ggml_time_us() - t_c0)/1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2566,6 +2695,14 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // outside of decode() the main scheduler is the active one, see graph_slot_select()
+    struct graph_slot_guard {
+        llama_context * ctx;
+        ~graph_slot_guard() {
+            ctx->graph_slot_switch(-1);
+        }
+    } slot_guard { this };
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2764,6 +2901,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         // large ubatches alternate between the lanes, also across calls
+        graph_slot_switch(-1);
         if (lanes && ubatch.n_tokens >= lanes_min_tokens) {
             lane_switch(lane_next);
             lane_next ^= 1;
@@ -5123,6 +5261,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_seq_snapshots             =*/ 0,
+        /*.n_graph_cache               =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

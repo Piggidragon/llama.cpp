@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -28,6 +29,19 @@
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
+// WIP measurement trace, LLAMA_SPEC_TRACE=<file>
+static FILE * spec_trace() {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_SPEC_TRACE");
+        FILE * f = path ? fopen(path, "a") : nullptr;
+        if (f) {
+            setvbuf(f, nullptr, _IOLBF, 0);
+        }
+        return f;
+    }();
+    return f;
+}
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -1689,12 +1703,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t t_p0 = ggml_time_us();
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
                     ok = false;
                     break;
+                }
+                if (spec_trace()) {
+                    fprintf(spec_trace(), "P %d %lld\n", batch.size(), (long long) (ggml_time_us() - t_p0));
                 }
             }
 
@@ -1821,6 +1839,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_it0 = ggml_time_us();
+            const int n_it = batch.size();
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -1844,6 +1864,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
+                if (spec_trace()) {
+                    fprintf(spec_trace(), "D %d %d %.5f %.5f %d\n", seq_id, i, cur_p->data[0].p, cur_p->size > 1 ? cur_p->data[1].p : 0.0f, (int) vocab_full);
+                }
+
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
@@ -1861,6 +1885,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                int keep = 2;
+                if (dparams.at(seq_id).keep) {
+                    float p_id = cur_p->data[0].p;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            p_id = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                    keep = dparams.at(seq_id).keep((int) dparams.at(seq_id).result->size(), p_id, id);
+                    if (keep == 0) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+                }
+
                 common_sampler_accept(smpl, id, true);
 
                 auto & dp = dparams.at(seq_id);
@@ -1872,7 +1914,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || keep == 1) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1900,6 +1942,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 }
+            }
+
+            if (spec_trace()) {
+                fprintf(spec_trace(), "T %d %d %lld\n", i, n_it, (long long) (ggml_time_us() - t_it0));
             }
 
             if (batch.size() == 0) {
@@ -2381,6 +2427,17 @@ struct common_speculative_selector {
         return n <= 4 ? std::max(n, 1) - 1 : n <= 8 ? 4 : n <= 16 ? 5 : n <= 32 ? 6 : n <= 64 ? 7 : n <= 128 ? 8 : 9;
     }
 
+    // --spec-draft-adaptive: the draft probability of a model draft's token in bins
+    static constexpr int NP = 8;
+    static int pbin(float p) {
+        static const float edges[NP - 1] = { 0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.99f };
+        int b = 0;
+        while (b < NP - 1 && p >= edges[b]) {
+            ++b;
+        }
+        return b;
+    }
+
     // the time of a step that verifies n tokens relative to one token, the shape between measured sizes (a decode
     // step of a 27B model on two GPUs: matrix-vector products up to 8 tokens, matrix products beyond)
     static float f_verify(int n) {
@@ -2426,13 +2483,120 @@ struct common_speculative_selector {
         size_t       shadow_done = 0;               // positions already compared
         size_t       shadow_from = 0;               // positions before it were verified (the used part of the draft)
         size_t       shadow_seen = 0;               // positions learned (as the text came)
+
+        // --spec-draft-adaptive: [bucket][pbin] hits and trials of a model draft's token, decayed: how often the target
+        // accepts a token of this draft probability at this position, given the earlier ones
+        std::array<std::array<float, NP>, NB> c_hit{};
+        std::array<std::array<float, NP>, NB> c_try{};
+
+        // the model draft of this step: the draft probability of each kept token, and the chance that the target accepts
+        // it and all tokens before it
+        std::vector<float> p_draft;
+        std::vector<float> run;
+
+        float n_acc_model = -1.0f; // accepted tokens per model draft, decayed (-1: no model draft yet)
+        float k_model     = -1.0f; // tokens per model draft, decayed
+
+        int64_t t_restore = 0; // the last draft was rolled back by a restore at this time; its replay follows
+
+        // the token the model drafter dropped at position drop_i of the last draft (its probability drop_p): accepted if
+        // the target sampled it there, known once the text is drop_prompt + drop_i + 1 long with all tokens before it
+        // accepted (drop_nacc, -1: no verification, a draft of no tokens)
+        int         drop_i      = -1;
+        float       drop_p      = 0.0f;
+        llama_token drop_tok    = LLAMA_TOKEN_NULL;
+        int         drop_nacc   = -1;
+        size_t      drop_prompt = 0;
+
+        int explore_i = -1; // a token drafted to learn it, dropped
+        int explore_n = 0;
+
+        // the adaptive maximum of a model draft (at most n_max) and, per maximum, the tokens and time of the steps under
+        // it, decayed; every cap_every steps a neighbour maximum is tried for cap_try_n steps
+        int cap       = 0; // 0: not set yet
+        int cap_home  = 0; // the maximum before the trial
+        int cap_left  = 0; // steps left in the trial
+        int cap_steps = 0; // steps since the last trial
+        bool cap_up   = true; // the direction of the next trial
+        std::vector<float> cap_tok;
+        std::vector<float> cap_t;
+        std::vector<int>   cap_n;
+
+        // the cycle from one draft of the sequence to the next: its text grows by the tokens of the step (and of a replay)
+        int64_t cyc_t     = 0;
+        size_t  cyc_n     = 0;
+        bool    cyc_model = false; // the cycle started with a model draft
     };
 
     std::vector<seq_state> seqs;
 
     // [tbucket] the time (us) of a step without its drafting, divided by f_verify of its verified tokens; 0: not measured
     std::array<float, NT> t_norm{};
+    std::array<int,   NT> t_cnt{};      // the samples of t_norm
+    static constexpr int  t_trust = 4;
     float t_model = 0.0f; // the time (us) of a draft call of a model drafter
+
+    // --spec-draft-adaptive
+    bool    adaptive  = false;
+    int     n_free    = INT_MAX; // rejected draft tokens that the target rolls back without a restore (INT_MAX: no recurrent state)
+    float   t_depth   = 0.0f;    // the time (us) of one more token of the model drafter
+    float   t_replay  = 0.0f;    // the time (us) from a restore to the end of its replay step
+    int64_t t_draft0  = 0;       // the start of the draft of the step
+    int64_t t_keep    = 0;       // the first keep call at the last draft position, for t_depth
+    int     keep_i    = -1;      // that position
+    int     n_max_model = 0;     // the n_max of the model drafter: the adaptive maximum stays at or below it
+    std::vector<int> step_seqs;  // the drafting sequences of the step
+
+    static constexpr int   cap_every  = 48;
+    static constexpr int   cap_try_n  = 12;
+    static constexpr float cap_margin = 0.03f; // a trial maximum must be this much faster to stay
+    static constexpr float cap_ema    = 0.15f;
+
+    void cap_init(seq_state & st) const {
+        if (st.cap == 0) {
+            st.cap = std::max(1, n_max_model);
+            st.cap_tok.assign(n_max_model + 1, 0.0f);
+            st.cap_t.assign(n_max_model + 1, 0.0f);
+            st.cap_n.assign(n_max_model + 1, 0);
+        }
+    }
+
+    // a model step of seq st under its maximum made tok tokens in t us
+    void cap_learn(seq_state & st, float tok, float t) const {
+        cap_init(st);
+        const int c = st.cap;
+        st.cap_tok[c] = st.cap_n[c] > 0 ? st.cap_tok[c] + cap_ema*(tok - st.cap_tok[c]) : tok;
+        st.cap_t[c]   = st.cap_n[c] > 0 ? st.cap_t[c]   + cap_ema*(t   - st.cap_t[c])   : t;
+        st.cap_n[c]++;
+
+        auto rate = [&](int k) { return st.cap_t[k] > 0.0f ? st.cap_tok[k] / st.cap_t[k] : 0.0f; };
+        if (st.cap_left > 0) {
+            if (--st.cap_left == 0) {
+                const int home = st.cap_home;
+                if (rate(c) <= rate(home) * (1.0f + cap_margin)) {
+                    st.cap = home;
+                }
+                SPC_DBG("adaptive max: %d (%.1f t/s) vs %d (%.1f t/s) -> %d\n", c, 1e6f*rate(c), home, 1e6f*rate(home), st.cap);
+            }
+            return;
+        }
+        if (++st.cap_steps < cap_every) {
+            return;
+        }
+        st.cap_steps = 0;
+        int next = st.cap_up ? c + 1 : c - 1;
+        if (next < 1 || next > n_max_model) {
+            st.cap_up = !st.cap_up;
+            next = st.cap_up ? c + 1 : c - 1;
+        }
+        st.cap_up = !st.cap_up;
+        if (next < 1 || next > n_max_model) {
+            return;
+        }
+        st.cap_home = c;
+        st.cap      = next;
+        st.cap_left = cap_try_n;
+    }
 
     // the step in flight
     int64_t step_t0      = 0;
@@ -2444,6 +2608,28 @@ struct common_speculative_selector {
     static constexpr float ema     = 0.25f;
     static constexpr float n_prior = 2.0f;
     static constexpr float decay   = 0.9f; // per draft of the drafter: a few dozen drafts make the estimate
+    static constexpr float decay_c = 0.99f; // per model draft: the bins learn over a few hundred drafts
+    static constexpr int   explore_every = 16;
+
+    // count a token of a model draft at position i with draft probability p, accepted or not
+    static void calib_learn(seq_state & st, int i, float p, bool hit) {
+        const int b  = bucket(i);
+        const int pb = pbin(p);
+        st.c_hit[b][pb] += hit ? 1.0f : 0.0f;
+        st.c_try[b][pb] += 1.0f;
+    }
+
+    // the dropped token of the last draft, once the text shows what the target sampled at its position
+    static void drop_learn(seq_state & st, const llama_tokens & prompt, llama_token id_last) {
+        if (st.drop_i < 0) {
+            return;
+        }
+        const bool all_before = st.drop_i == 0 ? st.drop_nacc <= 0 : st.drop_nacc == st.drop_i;
+        if (all_before && prompt.size() == st.drop_prompt + st.drop_i + 1) {
+            calib_learn(st, st.drop_i, st.drop_p, id_last == st.drop_tok);
+        }
+        st.drop_i = -1;
+    }
 
     void init(size_t n_seq, const std::vector<std::unique_ptr<common_speculative_impl>> & impls) {
         seqs.assign(n_seq, {});
@@ -2459,7 +2645,31 @@ struct common_speculative_selector {
                 st.n_try[i].fill(n_prior);
                 st.acc[i].fill(a);
             }
+            // prior: the target accepts a token about as often as the drafter's probability of it
+            static const float p_mid[NP] = { 0.15f, 0.4f, 0.6f, 0.75f, 0.85f, 0.925f, 0.97f, 0.995f };
+            for (int b = 0; b < NB; ++b) {
+                for (int pb = 0; pb < NP; ++pb) {
+                    st.c_hit[b][pb] = p_mid[pb]*n_prior;
+                    st.c_try[b][pb] = n_prior;
+                }
+            }
         }
+    }
+
+    float calib(const seq_state & st, int i, float p) const {
+        const int b  = bucket(i);
+        const int pb = pbin(p);
+        return st.c_hit[b][pb] / st.c_try[b][pb];
+    }
+
+    // the time (us) that a restore adds to a step: its replay step makes one token, where the time t_tok makes one token
+    // in a step of the plan
+    float restore_cost(float p_restore, float t_tok) const {
+        if (p_restore <= 0.0f) {
+            return 0.0f;
+        }
+        const float t_rp = t_replay > 0.0f ? t_replay : verify_time(2);
+        return p_restore * std::max(0.0f, t_rp - t_tok);
     }
 
     static bool is_model(common_speculative_type type) {
@@ -2498,15 +2708,26 @@ struct common_speculative_selector {
     // the time (us) of a step that verifies n tokens, without the drafting: measured for n's bucket, else the nearest
     // measured bucket scaled by f_verify; 0 if nothing is measured yet
     float verify_time(int n) const {
-        const int b0 = tbucket(n);
-        for (int d = 0; d < NT; ++d) {
-            for (int b : { b0 - d, b0 + d }) {
-                if (b >= 0 && b < NT && t_norm[b] > 0.0f) {
-                    return t_norm[b] * f_verify(n);
+        // the nearest bucket with t_trust samples, else the nearest measured one
+        auto at = [&](int m) {
+            const int b0 = tbucket(m);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (int d = 0; d < NT; ++d) {
+                    for (int b : { b0 - d, b0 + d }) {
+                        if (b >= 0 && b < NT && t_norm[b] > 0.0f && (pass == 1 || t_cnt[b] >= t_trust)) {
+                            return t_norm[b] * f_verify(m);
+                        }
+                    }
                 }
             }
+            return 0.0f;
+        };
+        // a step with more tokens takes no less time
+        float t = at(n);
+        for (int m = std::max(1, n - 8); m < n; ++m) {
+            t = std::max(t, at(m));
         }
-        return 0.0f;
+        return t;
     }
 
     // the time (us) of a step whose sequences verify the given numbers of tokens, without the drafting. A recurrent or
@@ -3170,14 +3391,36 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .select      = */ nullptr,
     });
 
-    if (params.select) {
-        if (result->impls.size() < 2) {
+    const bool has_model = std::any_of(result->impls.begin(), result->impls.end(), [](const auto & impl) {
+        return common_speculative_type_is_model(impl->type);
+    });
+    if (params.select || (params.draft.adaptive && has_model)) {
+        if (result->impls.size() < 2 && !params.draft.adaptive) {
             SPC_WRN("%s", "--spec-select needs several speculative types, it is not used\n");
         } else {
             result->select = std::make_unique<common_speculative_selector>();
             result->select->init(n_seq, result->impls);
-            SPC_INF("%s", "--spec-select: each step takes the draft with the most expected tokens per time\n");
+            if (result->impls.size() > 1) {
+                SPC_INF("%s", "--spec-select: each step takes the draft with the most expected tokens per time\n");
+            }
         }
+    }
+    if (params.draft.adaptive && result->select) {
+        auto * sel = result->select.get();
+        sel->adaptive = has_model;
+        for (const auto & impl : result->impls) {
+            if (common_speculative_type_is_model(impl->type)) {
+                sel->n_max_model = std::max(sel->n_max_model, impl->n_max);
+            }
+        }
+        if (const llama_context * ctx_tgt = params.draft.ctx_tgt) {
+            const llama_model * model = llama_get_model(ctx_tgt);
+            if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+                sel->n_free = (int) llama_n_rs_seq(ctx_tgt);
+            }
+        }
+        SPC_INF("--spec-draft-adaptive: model drafts of up to %d tokens, the length per step (rollback without a restore: %s)\n",
+                sel->n_max_model, sel->n_free == INT_MAX ? "any" : std::to_string(sel->n_free).c_str());
     }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -3303,15 +3546,34 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
         return;
     }
 
+    // --spec-draft-adaptive: a model draft has the length and the accepted tokens of the recent ones
     auto k_model_of = [&](int s) {
         if (ii_model < 0) {
             return 0;
         }
-        const int k = spec->impls[ii_model]->n_max;
+        int k = spec->impls[ii_model]->n_max;
+        if (sel->adaptive && sel->seqs[s].k_model >= 0.0f) {
+            k = std::min(k, (int) std::lround(sel->seqs[s].k_model));
+        }
         return dparams[s].n_max > 0 ? std::min(k, dparams[s].n_max) : k;
     };
     auto e_model_of = [&](int s) {
+        if (ii_model >= 0 && sel->adaptive && sel->seqs[s].n_acc_model >= 0.0f) {
+            return sel->seqs[s].n_acc_model;
+        }
         return ii_model < 0 ? 0.0f : sel->expected(sel->seqs[s], ii_model, k_model_of(s));
+    };
+    // --spec-draft-adaptive: the restore a candidate's draft of k tokens is expected to cost (t: the step time, e: its
+    // expected accepted tokens)
+    auto restore_of = [&](const common_speculative_selector::seq_state & st, int ii, int k, float t, float e) {
+        if (!sel->adaptive || k <= sel->n_free || t <= 0.0f) {
+            return 0.0f;
+        }
+        float run = 1.0f;
+        for (int m = 0; m < k - sel->n_free; ++m) {
+            run *= st.acc[ii][common_speculative_selector::bucket(m)];
+        }
+        return sel->restore_cost(1.0f - run, t/(1.0f + e));
     };
 
     // the base: every drafting sequence on the model drafter (or without a draft)
@@ -3339,7 +3601,8 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
         for (int k = 1; k <= (int) st.cand.size(); ++k) {
             const float e = sel->expected(st, st.cand_impl, k);
             lens[i_s] = k + 1;
-            const float t = sel->step_time(lens);
+            float t = sel->step_time(lens);
+            t += restore_of(st, st.cand_impl, k, t, e);
             const float r = t > 0.0f ? (1.0f + e) / t : e;
             if (r > r_best) {
                 r_best = r;
@@ -3384,7 +3647,13 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
                     model_used |= ii_model >= 0;
                 }
             }
-            const float t_step = sel->step_time(lens) + (model_used ? sel->t_model : 0.0f);
+            float t_step = sel->step_time(lens) + (model_used ? sel->t_model : 0.0f);
+            for (int s : d_seqs) {
+                const int t = takes(s);
+                if (t > 0) {
+                    t_step += restore_of(sel->seqs[s], sel->seqs[s].cand_impl, k_c[t - 1], t_step, e_c[t - 1]);
+                }
+            }
             float obj = 0.0f;
             bool  fair = true;
             for (int s : d_seqs) {
@@ -3456,6 +3725,120 @@ static void common_speculative_select_choose(common_speculative * spec, int ii_m
     }
 }
 
+// --spec-draft-adaptive: the model drafter drafted token i of seq s with draft probability p. 0: drop it and stop, 1:
+// keep it and stop, 2: keep it and draft the next one. A token is kept when the tokens it is expected to add pay for
+// the time it adds to the step (its verification, and a restore when the target cannot roll it back); the next one is
+// drafted when it is expected to pay for its draft time, over the draft probabilities seen at its position
+static int common_speculative_select_keep(common_speculative * spec, llama_seq_id s, int i, float p, llama_token id) {
+    auto * sel = spec->select.get();
+    auto & st  = sel->seqs[s];
+    const auto & dparams = spec->dparams;
+
+    const int64_t now = ggml_time_us();
+    if (i == 0) {
+        st.p_draft.clear();
+        st.run.clear();
+        st.cyc_model = true;
+        sel->keep_i = 0;
+        sel->t_keep = now;
+    } else if (i != sel->keep_i) {
+        // the first call at a new position: one draft call of all drafting sequences since the last one
+        if (i == sel->keep_i + 1) {
+            const float t = (float) (now - sel->t_keep);
+            sel->t_depth = sel->t_depth > 0.0f ? sel->t_depth + common_speculative_selector::ema*(t - sel->t_depth) : t;
+        }
+        sel->keep_i = i;
+        sel->t_keep = now;
+    }
+
+    // the step time when s verifies n tokens and the other sequences of the step their drafts so far
+    auto t_verify = [&](int n) {
+        std::vector<int> lens;
+        for (int o : sel->step_seqs) {
+            lens.push_back(o == s ? n : (int) dparams[o].result->size() + 1);
+        }
+        return sel->step_time(lens);
+    };
+
+    sel->cap_init(st);
+
+    // a dropped token is compared with the text that follows (see drop_learn), so that its bin learns also while the
+    // tokens of its draft probability are not drafted
+    auto drop = [&]() {
+        st.drop_i      = i;
+        st.drop_p      = p;
+        st.drop_tok    = id;
+        st.drop_nacc   = -1;
+        st.drop_prompt = dparams[s].prompt ? dparams[s].prompt->size() : 0;
+        return 0;
+    };
+    if (st.explore_i == i) {
+        st.explore_i = -1;
+        return drop();
+    }
+
+    if (t_verify((int) st.run.size() + 1) <= 0.0f) {
+        // the step times are not measured yet: the whole draft
+        st.p_draft.push_back(p);
+        st.run.push_back((st.run.empty() ? 1.0f : st.run.back()) * sel->calib(st, i, p));
+        return i + 1 < st.cap ? 2 : 1;
+    }
+
+    // tokens and time of the step with the first k tokens of the draft (runs[j]: the chance that the first j + 1 are
+    // accepted), t_extra more draft time; the draft time so far is in every choice
+    const float t0 = (float) (now - sel->t_draft0);
+    auto rate = [&](const std::vector<float> & runs, int k, float t_extra) {
+        float e = 1.0f;
+        for (int j = 0; j < k; ++j) {
+            e += runs[j];
+        }
+        float t = t0 + t_extra + t_verify(k + 1);
+        if (k > sel->n_free) {
+            t += sel->restore_cost(1.0f - runs[k - sel->n_free - 1], t/e);
+        }
+        return e/t;
+    };
+
+    std::vector<float> runs = st.run;
+    const float r_drop = rate(runs, i, 0.0f);
+    runs.push_back((runs.empty() ? 1.0f : runs.back()) * sel->calib(st, i, p));
+    const float r_keep = rate(runs, i + 1, 0.0f);
+    if (spec_trace()) {
+        fprintf(spec_trace(), "K %d %d %.4f %.3f t0 %.0f v %.0f %.0f rd %.3f rk %.3f cap %d depth %.0f\n", s, i, p, runs.back(), t0, t_verify(i + 1), t_verify(i + 2),
+                1e6f*r_drop, 1e6f*r_keep, st.cap, sel->t_depth);
+    }
+    if (r_keep < r_drop) {
+        return drop();
+    }
+    st.p_draft.push_back(p);
+    st.run.push_back(runs.back());
+    if (i + 1 >= st.cap) {
+        return 1;
+    }
+    // now and then the next token is drafted to learn its acceptance, also when it does not pay
+    auto stop = [&]() {
+        if (++st.explore_n % common_speculative_selector::explore_every == 0) {
+            st.explore_i = i + 1;
+            return 2;
+        }
+        return 1;
+    };
+
+    // the next token, kept if it pays, at the draft probabilities seen at its position
+    const int b = common_speculative_selector::bucket(i + 1);
+    float v = 0.0f;
+    float w = 0.0f;
+    std::vector<float> runs2 = runs;
+    runs2.push_back(0.0f);
+    for (int pb = 0; pb < common_speculative_selector::NP; ++pb) {
+        const float f = st.c_try[b][pb];
+        runs2.back() = runs.back() * st.c_hit[b][pb] / st.c_try[b][pb];
+        v += f * std::max(rate(runs2, i + 2, sel->t_depth), rate(runs, i + 1, sel->t_depth));
+        w += f;
+    }
+    return v > w*r_keep ? 2 : stop();
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3481,6 +3864,9 @@ void common_speculative_draft(common_speculative * spec) {
 
     auto * sel = spec->select.get();
     const int64_t t_draft_start = ggml_time_us();
+    if (sel) {
+        sel->t_draft0 = t_draft_start;
+    }
     std::vector<int> d_seqs; // --spec-select: the sequences of this step
     if (sel) {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
@@ -3492,6 +3878,19 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.prompt) {
                 sel->resolve_shadow(st, *dp.prompt, dp.id_last);
             }
+            // --spec-draft-adaptive: the tokens and time of the last cycle of a model draft, under its maximum (a gap of
+            // more tokens or time is another request)
+            if (sel->adaptive && dp.prompt) {
+                common_speculative_selector::drop_learn(st, *dp.prompt, dp.id_last);
+                const int64_t d_n = (int64_t) dp.prompt->size() - (int64_t) st.cyc_n;
+                const int64_t d_t = t_draft_start - st.cyc_t;
+                if (st.cyc_model && st.cyc_t > 0 && d_n >= 1 && d_n <= 2*(sel->n_max_model + 1) && d_t < 2000000) {
+                    sel->cap_learn(st, (float) d_n, (float) d_t);
+                }
+                st.cyc_t     = t_draft_start;
+                st.cyc_n     = dp.prompt->size();
+                st.cyc_model = false;
+            }
             st.impl      = -1;
             st.k         = 0;
             st.cut       = false;
@@ -3502,6 +3901,7 @@ void common_speculative_draft(common_speculative * spec) {
             spec->impl_last[seq_id] = nullptr;
             d_seqs.push_back(seq_id);
         }
+        sel->step_seqs = d_seqs;
     }
     bool chosen = false;
 
@@ -3520,6 +3920,16 @@ void common_speculative_draft(common_speculative * spec) {
             }
         }
 
+        // --spec-draft-adaptive: the model drafter asks the selector about each token it drafts
+        const bool adaptive = sel && sel->adaptive && is_model;
+        if (adaptive) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    dparams[seq_id].keep = [spec, seq_id](int i, float p, llama_token id) { return common_speculative_select_keep(spec, seq_id, i, p, id); };
+                }
+            }
+        }
+
         {
             const int64_t t0 = ggml_time_us();
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3528,6 +3938,12 @@ void common_speculative_draft(common_speculative * spec) {
             if (sel && is_model) {
                 const float t = (float) (ggml_time_us() - t0);
                 sel->t_model = sel->t_model > 0.0f ? sel->t_model + common_speculative_selector::ema*(t - sel->t_model) : t;
+            }
+        }
+
+        if (adaptive) {
+            for (auto & dp : dparams) {
+                dp.keep = nullptr;
             }
         }
 
@@ -3641,6 +4057,38 @@ static void common_speculative_select_step(common_speculative * spec, llama_seq_
     if (st.impl >= 0) {
         common_speculative_selector::learn(st, st.impl, std::min(st.k, n_accepted + 1), n_accepted);
     }
+    if (sel->adaptive && st.impl >= 0 && common_speculative_selector::is_model(spec->impls[st.impl]->type)) {
+        const int n_seen = std::min({ st.k, n_accepted + 1, (int) st.p_draft.size() });
+        if (n_seen > 0) {
+            for (auto & row : st.c_hit) {
+                for (auto & x : row) {
+                    x *= common_speculative_selector::decay_c;
+                }
+            }
+            for (auto & row : st.c_try) {
+                for (auto & x : row) {
+                    x *= common_speculative_selector::decay_c;
+                }
+            }
+            for (int j = 0; j < n_seen; ++j) {
+                common_speculative_selector::calib_learn(st, j, st.p_draft[j], j < n_accepted);
+            }
+        }
+        const float e = common_speculative_selector::ema;
+        st.n_acc_model = st.n_acc_model >= 0.0f ? st.n_acc_model + e*(n_accepted - st.n_acc_model) : n_accepted;
+        st.k_model     = st.k_model     >= 0.0f ? st.k_model     + e*(st.k       - st.k_model)     : st.k;
+        st.p_draft.clear();
+        st.run.clear();
+    }
+    if (sel->adaptive && st.drop_i >= 0) {
+        st.drop_nacc = n_accepted;
+    }
+    if (sel->adaptive && st.k - n_accepted > sel->n_free) {
+        st.t_restore = ggml_time_us();
+    }
+    if (spec_trace() && !sel->step_open) {
+        fprintf(spec_trace(), "s %d %d %d %d %d\n", seq_id, st.impl >= 0 ? (int) spec->impls[st.impl]->type : -1, st.k, n_accepted, n_batch);
+    }
     st.cut_full = st.cut && n_accepted >= st.k;
 
     if (sel->step_open) {
@@ -3651,10 +4099,18 @@ static void common_speculative_select_step(common_speculative * spec, llama_seq_
         const bool learn = sel->step_equal && clean && n_batch == sel->step_n;
         SPC_DBG("step: n %d, equal %d, batch %d, clean %d, %.0f us (draft %lld us), seq %d accepted %d of %d\n", sel->step_n,
                 (int) sel->step_equal, n_batch, (int) clean, t, (long long) sel->step_t_draft, seq_id, n_accepted, st.k);
+        if (spec_trace()) {
+            fprintf(spec_trace(), "S %d %d %d %d %d %d %.0f %lld %d %d\n", seq_id, st.impl >= 0 ? (int) spec->impls[st.impl]->type : -1, st.k, n_accepted, n_batch, sel->step_n, t,
+                    (long long) sel->step_t_draft, (int) clean, (int) sel->step_equal);
+        }
         if (learn) {
-            const float x = t / common_speculative_selector::f_verify(sel->step_n);
-            float & v = sel->t_norm[common_speculative_selector::tbucket(sel->step_n)];
+            // a slow step (e.g. the first one of a new graph shape) moves the estimate at most to 1.5x the current one
+            const float t_pred = sel->verify_time(sel->step_n);
+            const float x = (t_pred > 0.0f ? std::min(t, 1.5f*t_pred) : t) / common_speculative_selector::f_verify(sel->step_n);
+            const int b = common_speculative_selector::tbucket(sel->step_n);
+            float & v = sel->t_norm[b];
             v = v > 0.0f ? v + common_speculative_selector::ema*(x - v) : x;
+            sel->t_cnt[b]++;
         }
     }
 }
@@ -3662,6 +4118,19 @@ static void common_speculative_select_step(common_speculative * spec, llama_seq_
 void common_speculative_verified(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_batch, bool clean) {
     if (spec != nullptr && spec->select) {
         common_speculative_select_step(spec, seq_id, n_accepted, n_batch, clean);
+    }
+}
+
+void common_speculative_replayed(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || !spec->select) {
+        return;
+    }
+    auto * sel = spec->select.get();
+    auto & st  = sel->seqs[seq_id];
+    if (st.t_restore > 0) {
+        const float t = (float) (ggml_time_us() - st.t_restore);
+        sel->t_replay = sel->t_replay > 0.0f ? sel->t_replay + common_speculative_selector::ema*(t - sel->t_replay) : t;
+        st.t_restore = 0;
     }
 }
 

@@ -333,6 +333,9 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // --spec-draft-adaptive: the length of each model draft per step, up to an adaptive maximum of at most n_max
+    bool adaptive = false;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
@@ -406,6 +409,10 @@ struct common_params_speculative {
     // see --spec-ckpt-snapshot
     bool ckpt_snapshot = false;
 
+    // draft tokens that a target with a recurrent state rolls back from per-token state rows, without a checkpoint,
+    // see --spec-rollback (-1: the draft n_max)
+    int32_t n_rollback = -1;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -419,7 +426,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        return n_rollback >= 0 ? std::min(n_rollback, draft.n_max) : draft.n_max;
     }
 };
 
@@ -525,6 +536,7 @@ struct common_params {
 
     bool flash_attn_native_quants = false; // read a quantized K/V cache in place instead of casting it to F16
     bool split_overlap            = false; // split mode tensor: overlap the AllReduce of a ubatch with the compute of the next
+    int32_t graph_cache           = 0;     // decode graphs kept per batch shape (0 = off)
     bool phase_aware_workspace    = false; // size the compute buffers for prompt or generation, share them with the MTP draft
     bool live_context_workspace   = false; // size the attention compute buffers by the used part of the KV cache
     bool kv_unified_gather        = false; // attention reads only the cells of the ubatch's sequences (unified KV)
