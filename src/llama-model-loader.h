@@ -68,6 +68,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_HOST            = 1 << 6; // in the buffer types of the input layer (host), e.g. a table read by a few rows
 
     int n_kv      = 0;
     int n_tensors = 0;
