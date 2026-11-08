@@ -2191,7 +2191,10 @@ void llama_context::set_logits_topk(int32_t k) {
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+    // a flip only rebuilds the graph, except with --compact-attn-mask: only causal graphs take the compact mask
+    if (cparams.causal_attn != value && cparams.compact_attn_mask) {
+        sched_need_reserve = true;
+    }
 
     cparams.causal_attn = value;
 }
