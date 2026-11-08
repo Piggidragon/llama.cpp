@@ -993,6 +993,27 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// tokens per sequence of a DFlash/DSpark block decode: n_max clamped to the trained block, LiliCorr always the whole block
+static int32_t common_speculative_dflash_block_tokens(const llama_model * model_dft, int32_t n_max, bool is_dspark) {
+    char buf[32] = {};
+
+    int32_t block_size = 16;
+    if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+        block_size = std::atoi(buf);
+    }
+    bool sample_from_anchor = true;
+    if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
+        sample_from_anchor = std::strcmp(buf, "true") == 0;
+    }
+    if (llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0) {
+        return block_size;
+    }
+
+    // DFlash: [id_last, <mask> * n_max], at most the block; anchor-first DSpark: n_max tokens, at most the block
+    const bool anchor_first = is_dspark && sample_from_anchor;
+    return anchor_first ? std::min(n_max, block_size) : std::min(n_max + 1, block_size);
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1023,6 +1044,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_tgt = 0;  // target model hidden size
 
     int32_t     block_size    = 0;
+    int32_t     n_block_seq   = 0; // tokens of a block decode per sequence, see common_speculative_dflash_block_tokens()
     llama_token mask_token_id = 0;
 
     bool    is_lilicorr    = false;
@@ -1131,6 +1153,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+        n_block_seq = common_speculative_dflash_block_tokens(model_dft, this->params.n_max, is_dspark);
 
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
@@ -1387,8 +1410,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = n_block_seq;
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -3124,6 +3146,11 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const auto has_type = [&](common_speculative_type type) {
+        return std::find(params.speculative.types.begin(), params.speculative.types.end(), type) != params.speculative.types.end();
+    };
+    const bool spec_dflash = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+    const bool spec_dspark = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -3161,6 +3188,17 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // the block decodes of a DFlash/DSpark draft: n_max clamped to its trained block, the context reserves for them
+        if (spec_dflash || spec_dspark) {
+            const int32_t n_max   = params.speculative.draft.n_max;
+            const int32_t per_seq = std::max(spec_dflash ? common_speculative_dflash_block_tokens(model_dft, n_max, false) : 0,
+                                             spec_dspark ? common_speculative_dflash_block_tokens(model_dft, n_max, true)  : 0);
+            cparams.n_outputs_max = params.n_parallel * std::max(1, per_seq);
+            if (params.speculative.draft.backend_sampling) {
+                cparams.n_outputs_max_per_seq = std::max(1, per_seq);
+            }
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -3183,11 +3221,7 @@ common_speculative_init_result::common_speculative_init_result(
     }
 
     // the MTP and DFlash draft contexts compute in the compute buffers of the target, one after the other
-    const bool spec_block = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-        [](common_speculative_type t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
-    if (pimpl->context && (spec_mtp || spec_block) && params.phase_aware_workspace) {
+    if (pimpl->context && (spec_mtp || spec_dflash || spec_dspark) && params.phase_aware_workspace) {
         const int32_t status = llama_attach_shared_workspace(pimpl->context.get(), ctx_tgt);
         if (status < 0) {
             LOG_ERR("%s: failed to share the compute buffers of the target and the draft context\n", __func__);
