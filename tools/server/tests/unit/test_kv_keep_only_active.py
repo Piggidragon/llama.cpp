@@ -44,6 +44,9 @@ LONG_PROMPT = (
 # idle slot cleared on launch should restore from cache-ram
 def test_clear_and_restore():
     global server
+    # without FlashAttention: a unified cache read through lists of K/V rows keeps the cells of an idle slot, see
+    # test_keep_with_kv_rows()
+    server.fa = "off"
     server.start()
     log = LogReader(server.log_path)
 
@@ -87,6 +90,40 @@ def test_clear_and_restore():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+def test_keep_with_kv_rows():
+    # with FlashAttention the attention reads only the cells of its own sequences: an idle slot keeps its cells (its
+    # state still goes to the prompt cache) until the cache needs the room, so its prompt comes back without a restore
+    global server
+    server.fa = "on"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "updating prompt cache" not in log.drain()
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < original_prompt_n
 
 
 def test_disabled_with_flag():

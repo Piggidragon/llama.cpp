@@ -209,14 +209,15 @@ static void flash_attn_sparse_lists(
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static __global__ void flash_attn_rows_lists(
-        const int32_t * rows, int32_t * indices, int32_t * counts, const int n_cols, const int rows_ne3, const int64_t rows_s3) {
+        const int32_t * rows, int32_t * indices, int32_t * counts, const int n_cols, const int n_rows_lists) {
     ggml_cuda_pdl_sync();
 
     const int group    = blockIdx.y;
     const int sequence = blockIdx.z;
     const int64_t list = int64_t(sequence)*gridDim.y + group;
 
-    const int32_t * src = rows + (sequence % rows_ne3)*rows_s3;
+    // one list for every mask sequence, or one per mask sequence (the slices of a unified KV cache)
+    const int32_t * src = rows + int64_t(sequence % n_rows_lists)*n_cols;
     int32_t       * dst = indices + list*n_cols;
     for (int c = blockIdx.x*blockDim.x + threadIdx.x; c < n_cols; c += gridDim.x*blockDim.x) {
         dst[c] = src[c];
@@ -241,7 +242,7 @@ void ggml_cuda_flash_attn_ext_rows_lists(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_rows_lists, launch_params,
-        (const int32_t *) rows->data, indices, counts, n_cols, int(rows->ne[3]), int64_t(rows->nb[3]/sizeof(int32_t)));
+        (const int32_t *) rows->data, indices, counts, n_cols, int(ggml_nrows(rows)));
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
@@ -1004,14 +1005,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // A list of K/V rows (ggml_flash_attn_ext_set_kv_rows()) is gathered by the MMA kernels only, at D = 128 and 256.
+    // A list of K/V rows (ggml_flash_attn_ext_rows()) is gathered by the MMA kernels only, at D = 128 and 256: one list
+    // for all mask sequences or one per mask sequence, over K/V that all of them share.
     if (dst->src[5] != nullptr) {
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
         const ggml_tensor * rows = dst->src[5];
         if (!turing_mma_available(cc) || (K->ne[0] != 128 && K->ne[0] != 256) || V->ne[0] != K->ne[0] ||
                 mask == nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(dst, 4) > 0 ||
-                rows->type != GGML_TYPE_I32 || rows->ne[0] % FATTN_KQ_STRIDE != 0 || mask->ne[0] != rows->ne[0]) {
+                rows->type != GGML_TYPE_I32 || rows->ne[0] % FATTN_KQ_STRIDE != 0 || mask->ne[0] != rows->ne[0] ||
+                !ggml_is_contiguous(rows) || (ggml_nrows(rows) != 1 && ggml_nrows(rows) != mask->ne[3]) || K->ne[3] != 1) {
             return BEST_FATTN_KERNEL_NONE;
         }
         int native_ncols1 = 0;

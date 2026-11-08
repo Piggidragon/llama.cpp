@@ -17,14 +17,6 @@ struct llama_context;
 // llama_kv_cache
 //
 
-// see llama_kv_cache::get_kv_rows()
-struct llama_kv_rows {
-    std::vector<int32_t>  rows;    // n_rows entries
-    std::vector<uint32_t> seg;     // the first row of each sequence of the ubatch (by seq_idx) and the end; empty: union
-    size_t                n_live  = 0;
-    bool                  ordered = true; // the cells of each segment are in the causal order
-};
-
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -106,6 +98,7 @@ public:
     //       likely through `struct llama_memory_params`
     llama_kv_cache(
             const llama_model & model,
+                         bool   no_alloc,
           const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
@@ -114,7 +107,6 @@ public:
                          bool   unified,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
-                     uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
                llama_memory_t   mem_other,
@@ -122,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // lightning indexer keys are rotated with the indexer RoPE parameters
+                       bool   is_indexer = false);
 
     ~llama_kv_cache() = default;
 
@@ -200,8 +194,8 @@ public:
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
-          slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+            slot_info_vec_t * sinfos_out,
+      const slot_info_vec_t * sinfos_in);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -215,9 +209,15 @@ public:
     // the largest get_n_kv() of the ubatches of a batch, before any of them is applied
     uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
-    // a bound on the cells the tokens of an applied ubatch can see in a stream: the cells of its sequences, padded
-    // like n_kv, at most n_kv: the length of the list of get_kv_rows()
-    uint32_t get_n_kv_union(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv) const;
+
+    // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+    // the ubatch splits into n_slices groups of tokens with one sequence each
+    // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+    // TODO: allow slices with coupled sequences
+    static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
+
+    // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -252,15 +252,15 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // --compact-attn-mask: whether every token of the applied ubatch sees a prefix of the first n_kv cells of its
@@ -271,33 +271,12 @@ public:
     // whether a ubatch can see a prefix at all (no ALiBi or SWA)
     bool can_causal_prefix() const;
 
-    // the two layouts are exclusive, so that every causal ubatch of a cache has the graph shape of the reserve graphs:
-    // --kv-unified-gather reads one stream of several sequences through a list (can_kv_rows()), --compact-attn-mask
-    // applies to the other caches (a stream per sequence, or one sequence)
-    bool can_kv_rows() const;
+    // the caches of one stream of several sequences read the cells through lists of K/V rows (get_n_kv_rows()),
+    // --compact-attn-mask applies to the other caches (a stream per sequence, or one sequence)
     bool can_compact() const;
-
-    // --kv-unified-gather, one stream: the attention reads the cells of the ubatch's sequences through a list of
-    // n_rows rows (get_n_kv_union()): the cells of each sequence in the causal order, one segment per sequence of the
-    // ubatch (seg[seq_idx], and the end), so that a token sees a range of the list; where the segments do not fit
-    // n_rows (several sequences share many cells) the union of the cells by index, seg empty. The rest of the list
-    // repeats cell 0, masked. Built once per ubatch (llama_kv_cache_context caches it).
-    void get_kv_rows(const llama_ubatch & ubatch, uint32_t n_rows, llama_kv_rows & out) const;
-
-    // whether every token sees one range of its segment: segments, in the causal order (M-RoPE ties included)
-    bool get_rows_prefix(const llama_kv_rows & kr) const;
-
-    // I32 [n_rows]
-    void set_input_kv_rows(ggml_tensor * dst, const llama_kv_rows & kr) const;
-
-    // the mask over the list: I32 [2, n_tokens] column ranges (get_rows_prefix()) or F16/F32 [n_rows, n_tokens]
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_kv_rows & kr) const;
 
     // I32 [2, n_tokens/n_stream, 1, n_stream]: the column range [0, n) of the cells token i sees
     void set_input_kq_bounds(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -324,6 +303,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -331,11 +313,10 @@ private:
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
-    // required padding
-    const uint32_t n_pad = 1;
-
     // SWA
     const uint32_t n_swa = 0;
+
+    const bool is_indexer = false;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
@@ -349,6 +330,11 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // keep constants separate from mutable KV buffers
+    llama_memory_bufs attn_rot_bufs;
+
+    void init_rotation(const char * name_tag);
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -356,7 +342,7 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    llama_memory_bufs ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -388,12 +374,9 @@ private:
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
-                    ggml_tensor * cur,
+                    ggml_tensor * k,
                     ggml_tensor * shift,
                     ggml_tensor * rot,
-                    ggml_tensor * factors,
-                          float   freq_base,
-                          float   freq_scale,
                        uint32_t   il) const;
 
     ggml_cgraph * build_graph_shift(
@@ -465,26 +448,13 @@ public:
     //
 
     uint32_t get_n_kv() const;
-
-    // see llama_kv_cache::get_n_kv_union()
-    uint32_t get_n_kv_union() const;
+    uint32_t get_n_kv_rows() const;
 
     // see llama_kv_cache::get_causal_prefix()
     bool get_causal_prefix() const;
 
-    // see llama_kv_cache::get_rows_prefix()
-    bool get_rows_prefix() const;
-    bool get_unified() const;
-
     // see llama_kv_cache::can_compact()
     bool can_compact() const;
-
-    // the rows of the list of get_kv_rows() (the cells of the ubatch's sequences, padded), 0 if the attention reads the
-    // first n_kv cells (llama_kv_cache::can_kv_rows() is false)
-    uint32_t get_n_kv_rows() const;
-
-    void set_input_kv_rows     (ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_kq_mask_rows(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -508,18 +478,15 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
@@ -557,25 +524,12 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv = 0;
 
-    // computed on first use after apply(), only --compact-attn-mask and --kv-unified-gather read them:
-    // the cells of the current ubatch's sequences, see llama_kv_cache::get_n_kv_union()
-    mutable uint32_t n_kv_union = 0;
+    // see llama_kv_cache::get_n_kv_rows
+    uint32_t n_kv_rows = 0;
 
-    // see llama_kv_cache::get_causal_prefix()
-    mutable bool causal_prefix = false;
-
-    // see llama_kv_cache::get_rows_prefix()
-    mutable bool rows_prefix = false;
-
-    mutable bool has_n_kv_union    = false;
+    // computed on first use after apply(), only --compact-attn-mask reads it, see llama_kv_cache::get_causal_prefix()
+    mutable bool causal_prefix     = false;
     mutable bool has_causal_prefix = false;
-    mutable bool has_rows_prefix   = false;
-
-    // the list of the current ubatch, built once for the graph and its inputs
-    mutable llama_kv_rows kv_rows;
-    mutable bool          has_kv_rows = false;
-
-    const llama_kv_rows & get_kv_rows() const;
 
     // the largest n_kv of the ubatches of a batch context, see get_attn_reserve_n_kv()
     uint32_t reserve_n_kv = 0;
