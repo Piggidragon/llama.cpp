@@ -433,7 +433,20 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // confidence head is optional
     const bool has_conf = model.dspark_conf_proj != nullptr;
 
+    // split mode tensor splits the logits over the vocab: the meta backend can neither add the mirrored bias to them nor
+    // take their argmax. The chain then runs on the CPU over the gathered logits, the bias and confidence stay on the devices
+    const bool vocab_on_cpu = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    auto on_cpu = [&](ggml_tensor * t) {
+        if (vocab_on_cpu) {
+            ggml_backend_sched_set_tensor_backend(g.sched, t, g.backend_cpu);
+        }
+        return t;
+    };
+
     ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
+    if (vocab_on_cpu) {
+        base = on_cpu(ggml_cont(ctx0, base));
+    }
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
@@ -467,7 +480,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        cat = on_cpu(ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0)));
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
@@ -490,9 +503,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
-        ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+        ggml_tensor * col    = on_cpu(ggml_add(ctx0, base_i, bias));
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        cat = cat ? on_cpu(ggml_concat(ctx0, cat, col, 1)) : col;
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -511,13 +524,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            prev = on_cpu(ggml_argmax(ctx0, col));
         }
     }
 
     // cat is position-major; restore ubatch block-major order
     ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
-    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
+    out = on_cpu(ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3))); // [n_vocab, block_drafts, n_blocks]
     out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
 
     if (has_conf) {
