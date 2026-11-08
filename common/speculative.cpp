@@ -1205,6 +1205,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
+        common_sampler_reset(smpls[seq_id].get());
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
