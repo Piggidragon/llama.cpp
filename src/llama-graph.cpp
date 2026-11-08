@@ -165,9 +165,8 @@ static llm_attn_mask build_attn_inp_attn_mask(
             ggml_set_name(attn_mask.cnv, "attn_kq_mask_ranges");
         } else {
             attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
-            // a non-causal context (DFlash drafts) has the dense mask in its reserve graphs as well
             if (dense_fallback) {
-                *dense_fallback = cparams.compact_attn_mask && cparams.causal_attn && mctx->can_compact();
+                *dense_fallback = cparams.compact_attn_mask && mctx->can_compact();
             }
         }
     } else {

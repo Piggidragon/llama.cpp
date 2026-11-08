@@ -476,6 +476,9 @@ private:
     // features; the reserve takes the larger of the two graphs instead of the logits of n_ubatch tokens (0 = off)
     uint32_t n_block_tokens = 0;
 
+    // causal_attn of the last reserve: it decides whether a graph with the dense mask is a fallback (--compact-attn-mask)
+    bool ws_causal = true;
+
     // calls in a row whose plan is smaller than the reservation, it shrinks after ws_shrink_after of them
     uint32_t       ws_shrink_votes = 0;
     const uint32_t ws_shrink_after = 64;

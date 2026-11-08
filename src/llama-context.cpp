@@ -1277,6 +1277,7 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     }
     ws.n_tokens = n_tokens;
     ws.n_kv     = plan.n_kv;
+    ws_causal   = cparams.causal_attn;
 
     const int64_t t_end_us = ggml_time_us();
 
@@ -2249,10 +2250,7 @@ void llama_context::set_logits_topk(int32_t k) {
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // a flip only rebuilds the graph, except with --compact-attn-mask: only causal graphs take the compact mask
-    if (cparams.causal_attn != value && cparams.compact_attn_mask) {
-        sched_need_reserve = true;
-    }
+    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
 
     cparams.causal_attn = value;
 }
@@ -2973,8 +2971,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // a mask fallback had the compute buffers planned for its shape: reserve the worst case before the next batch,
-        // else every larger ubatch after it is planned again
-        if (res && !sched_need_reserve) {
+        // else every larger ubatch after it is planned again. A non-causal graph after a non-causal reserve (DFlash
+        // drafts) has the dense mask of the reserve.
+        if (res && !sched_need_reserve && (cparams.causal_attn || ws_causal)) {
             for (const auto & inp : res->inputs) {
                 if (inp->mask_fallback()) {
                     sched_need_reserve = true;
