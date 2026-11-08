@@ -4,16 +4,18 @@ By default a context reserves its compute buffers once, for the worst case: a fu
 
 | Option | What it does |
 |---|---|
-| `--phase-aware-workspace` | Reserves only for the generation batches (`n_outputs_max` or one token per sequence) while there are no larger ones, and for `n_ubatch` when a prompt comes. An MTP draft context (`--spec-type draft-mtp`) computes in the compute buffers of its target context instead of its own. |
+| `--phase-aware-workspace` | Reserves only for the generation batches (`n_outputs_max` or one token per sequence) while there are no larger ones, and for `n_ubatch` when a prompt comes. An MTP, DFlash or DSpark draft context (`--spec-type draft-mtp`, `draft-dflash`, `draft-dspark`) computes in the compute buffers of its target context instead of its own. |
 | `--live-context-workspace` | Sizes the attention part for the used part of the KV cache instead of the whole cache. The steps are powers of two from 1/8 of the cache (at least 256 cells), so a growing context reserves again at most three times. |
 
 A smaller reservation takes effect only after 64 calls in a row that need less. Short turns between long ones, or the generation between two prompts, then do not allocate the buffers twice. A larger one takes effect at once. When no server slot is busy, the server also returns the memory of the CUDA memory pools (`llama_trim_transient_memory()`).
 
 The memory these options free is a saving for the time it is not needed, not a smaller worst case. A context that reaches its full size needs the full buffers again, so that memory must still be free then. If it is not, `llama_decode()` returns -2.
 
-## Sharing with the MTP draft context
+## Sharing with the draft context
 
 The target and the draft context compute one after the other: the draft needs the hidden states of the target. With `--phase-aware-workspace` the draft context therefore borrows the compute buffers of the target, and the shared buffers have the size of the larger of the two.
+
+An MTP draft processes the batches of the target and then drafts one token per decode. A DFlash or DSpark draft takes the target's batches as features, which it projects into its KV cache, and decodes tokens only in its blocks of up to `--spec-draft-n-max` + 1 tokens per slot. Its buffers are reserved for the larger of these two graphs instead of the logits of `n_ubatch` tokens, also without the option.
 
 - Before either context uses the buffers, it waits until the other has finished with them.
 - With `--split-overlap`, the draft borrows the buffers of lane 0. Lane 1 keeps its own buffers, because it computes while lane 0 does.

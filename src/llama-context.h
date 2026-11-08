@@ -314,8 +314,10 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // inject: a graph of target features (DFlash drafts), also taken for batches larger than n_block_tokens
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool inject = false);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -464,11 +466,15 @@ private:
     // phase-aware workspace: a batch of up to this many tokens reserves only for its size
     uint32_t ws_decode_tokens = 0;
 
+    // DFlash drafts: token batches are the block decodes of up to this many tokens, the other batches inject target
+    // features; the reserve takes the larger of the two graphs instead of the logits of n_ubatch tokens (0 = off)
+    uint32_t n_block_tokens = 0;
+
     // calls in a row whose plan is smaller than the reservation, it shrinks after ws_shrink_after of them
     uint32_t       ws_shrink_votes = 0;
     const uint32_t ws_shrink_after = 64;
 
-    // phase-aware workspace: an MTP context computes in the buffers of lane 0 of its target. The two must be used
+    // phase-aware workspace: a draft context (MTP, DFlash) computes in the buffers of lane 0 of its target. The two must be used
     // one after the other: each waits until the other has finished with the buffers (ws_in_flight)
     llama_context * ws_owner     = nullptr; // the context whose buffers this one uses
     llama_context * ws_borrower  = nullptr; // the context that uses the buffers of this one

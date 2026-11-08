@@ -3182,16 +3182,20 @@ common_speculative_init_result::common_speculative_init_result(
         pimpl->context.reset(ctx_dft);
     }
 
-    // the MTP context computes in the compute buffers of the target, one after the other
-    if (pimpl->context && spec_mtp && params.phase_aware_workspace) {
+    // the MTP and DFlash draft contexts compute in the compute buffers of the target, one after the other
+    const bool spec_block = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+    if (pimpl->context && (spec_mtp || spec_block) && params.phase_aware_workspace) {
         const int32_t status = llama_attach_shared_workspace(pimpl->context.get(), ctx_tgt);
         if (status < 0) {
-            LOG_ERR("%s: failed to share the compute buffers of the target and the MTP context\n", __func__);
+            LOG_ERR("%s: failed to share the compute buffers of the target and the draft context\n", __func__);
             pimpl->context.reset();
             return;
         }
         if (status == 0) {
-            LOG_INF("%s: the MTP context keeps its own compute buffers\n", __func__);
+            LOG_INF("%s: the draft context keeps its own compute buffers\n", __func__);
         }
     }
 }
