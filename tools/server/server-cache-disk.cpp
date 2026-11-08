@@ -116,7 +116,8 @@ struct disk_file {
 
 }
 
-static bool write_blob(disk_file & f, const std::vector<uint8_t> & buf, const std::atomic<bool> & cancel) {
+template <typename A>
+static bool write_blob(disk_file & f, const std::vector<uint8_t, A> & buf, const std::atomic<bool> & cancel) {
     f.write_val<uint64_t>(buf.size());
     for (size_t off = 0; off < buf.size() && f.ok; off += DISK_CHUNK) {
         if (cancel.load()) {
@@ -149,7 +150,8 @@ static bool read_blob(disk_file & f, common_bytes & buf, size_t file_size) {
     return f.ok;
 }
 
-static bool read_blob(disk_file & f, std::vector<uint8_t> & buf, size_t file_size) {
+template <typename A>
+static bool read_blob(disk_file & f, std::vector<uint8_t, A> & buf, size_t file_size) {
     const uint64_t size = f.read_val<uint64_t>();
     // check the size against the bytes left before allocating, the field may be corrupted
     if (!f.ok || size > file_size - f.n) {
@@ -245,7 +247,7 @@ server_prompt_cache_disk::file_lock::result server_prompt_cache_disk::file_lock:
 //
 
 std::string server_prompt_cache_disk::lock_path(const std::string & dir, uint64_t fingerprint) {
-    return fs_path_to_utf8(fs::u8path(dir) / fs::u8path("pc-" + hex64(fingerprint) + ".lock"));
+    return (fs::path(dir) / ("pc-" + hex64(fingerprint) + ".lock")).string();
 }
 
 std::unique_ptr<server_prompt_cache_disk> server_prompt_cache_disk::create(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd) {
@@ -307,7 +309,7 @@ std::list<server_prompt_cache_disk::entry>::iterator server_prompt_cache_disk::f
 }
 
 std::string server_prompt_cache_disk::block_path(const server_kv_key & key) const {
-    return fs_path_to_utf8(fs::u8path(dir) / fs::u8path(prefix + "k" + hex64(key.a) + hex64(key.b) + ".bin"));
+    return (fs::path(dir) / (prefix + "k" + hex64(key.a) + hex64(key.b) + ".bin")).string();
 }
 
 size_t server_prompt_cache_disk::size_on_disk() const {
@@ -516,8 +518,8 @@ void server_prompt_cache_disk::refresh_foreign() {
 
     try {
         for (const auto & de : fs::directory_iterator(fs::u8path(dir))) {
-            const std::string name = fs_path_to_utf8(de.path().filename());
-            const std::string path = fs_path_to_utf8(de.path());
+            const std::string name = de.path().filename().string();
+            const std::string path = de.path().string();
 
             if (name.rfind("pc-", 0) != 0 || name.size() <= prefix.size() || name[prefix.size() - 1] != '-' ||
                 !ends_with(name, ".bin") || !de.is_regular_file(ec)) {
@@ -626,8 +628,8 @@ void server_prompt_cache_disk::scan() {
 
     try {
         for (const auto & de : fs::directory_iterator(fs::u8path(dir))) {
-            const std::string name = fs_path_to_utf8(de.path().filename());
-            const std::string path = fs_path_to_utf8(de.path());
+            const std::string name = de.path().filename().string();
+            const std::string path = de.path().string();
 
             // pc-<16 hex digits of the fingerprint>-<kind and hash>
             if (name.rfind("pc-", 0) != 0 || name.size() <= prefix.size() || name[prefix.size() - 1] != '-' || !de.is_regular_file()) {
@@ -823,7 +825,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
 
     auto & e = entries.back();
     e.id       = id_next++;
-    e.path     = fs_path_to_utf8(fs::u8path(dir) / fs::u8path(name));
+    e.path     = (fs::path(dir) / name).string();
     e.fp       = fingerprint;
     e.tokens   = state.prompt.tokens.clone();
     e.ranged   = ranged;

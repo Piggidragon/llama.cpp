@@ -427,17 +427,18 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
     const int8_t * q8 = (const int8_t *) &q;
 
-#ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
+#ifdef FP16_AVAILABLE
         const half2 d = __half2half2(x[ib].d);
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
         }
-    } else
+#else
+        NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
+    } else if constexpr (std::is_same_v<T, float>) {
         const float d = x[ib].d;
 
 #pragma unroll
@@ -465,8 +466,8 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 
     const int8_t * q8 = (const int8_t *) &q;
 
-#ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
+#ifdef FP16_AVAILABLE
         const half2 dm = x[ib].dm;
         const half2 d  = __half2half2( __low2half(dm));
         const half2 m  = __half2half2(__high2half(dm));
@@ -475,9 +476,10 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]) + m;
         }
-    } else
+#else
+        NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
+    } else if constexpr (std::is_same_v<T, float>) {
         const float2 dm = __half22float2(x[ib].dm);
 
 #pragma unroll
@@ -517,17 +519,18 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
 
     const int8_t * q8 = (const int8_t *) &q;
 
-#ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
+#ifdef FP16_AVAILABLE
         const half2 d = __half2half2(x[ib].d);
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
         }
-    } else
+#else
+        NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
+    } else if constexpr (std::is_same_v<T, float>) {
         const float d = x[ib].d;
 
 #pragma unroll
@@ -565,8 +568,8 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 
     const int8_t * q8 = (const int8_t *) &q;
 
-#ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
+#ifdef FP16_AVAILABLE
         const half2 dm = x[ib].dm;
         const half2 d  = __half2half2( __low2half(dm));
         const half2 m  = __half2half2(__high2half(dm));
@@ -575,9 +578,10 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]) + m;
         }
-    } else
+#else
+        NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
+    } else if constexpr (std::is_same_v<T, float>) {
         const float2 dm = __half22float2(x[ib].dm);
 
 #pragma unroll
@@ -600,17 +604,18 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     int8_t qs[ne];
     ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
 
-#ifdef FP16_AVAILABLE
     if constexpr (std::is_same<T, half>::value) {
+#ifdef FP16_AVAILABLE
         const half2 d = __half2half2(x[ib].d);
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = d * make_half2(qs[l0 + 0], qs[l0 + 1]);
         }
-    } else
+#else
+        NO_DEVICE_CODE;
 #endif // FP16_AVAILABLE
-    if constexpr (std::is_same<T, float>::value) {
+    } else if constexpr (std::is_same<T, float>::value) {
         const float d = x[ib].d;
 
 #pragma unroll
@@ -731,7 +736,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t * chunk_counts, half * mask_dst,
         int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
-// the index lists of a list of K/V rows (ggml_flash_attn_ext_set_kv_rows()): the same for every group of queries of a
+// the index lists of a list of K/V rows (ggml_flash_attn_ext_rows()): the same for every group of queries of a
 // mask sequence, all n_cols entries live
 void ggml_cuda_flash_attn_ext_rows_lists(
         const ggml_tensor * rows, int32_t * indices, int32_t * counts, int32_t n_groups, int32_t n_seq, cudaStream_t stream);
@@ -1114,6 +1119,12 @@ void launch_fattn(
         }
     }
 
+    // the mask sequences of a list of K/V rows share K/V that has one sequence (the slices of a unified KV cache)
+    if (KQV->src[5] != nullptr && K->ne[3] == 1) {
+        nb13 = 0;
+        nb23 = 0;
+    }
+
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1122,7 +1133,7 @@ void launch_fattn(
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns. Only the
     // K/V rows of the list are gathered: the mask is compacted along the lists, which are padded to whole tiles, and the
     // kernel reads it like a dense mask (see flash_attn_ext_f16_iter()). A list of K/V rows from the graph
-    // (ggml_flash_attn_ext_set_kv_rows()) is that list already, for every tile, and its mask has its columns.
+    // (ggml_flash_attn_ext_rows()) is that list already, for every tile, and its mask has its columns.
     const ggml_tensor * rows = KQV->src[5];
     const bool sparse_compact_mask = use_sparse && rows == nullptr;
     GGML_ASSERT(rows == nullptr || use_sparse);

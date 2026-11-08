@@ -1518,6 +1518,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -2472,6 +2482,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             states.splice(states.end(), states, it_best);
 
             return true;
+        }
+
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+
+        // the whole cached prompt is a prefix of the new one
+        if (lcp_best == it_best->prompt.tokens.size()) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
         if (!prompt_cache_restore(*it_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
