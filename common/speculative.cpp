@@ -1005,6 +1005,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_params_sampling> smpls_cfg;
 
+    // the sampler of greedy drafting: its probabilities (temperature 1) decide the p_min cut
+    static common_sampler * sampler_greedy_init(const llama_model * model) {
+        common_params_sampling sparams;
+        sparams.no_perf  = false;
+        sparams.top_k    = 10;
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        return common_sampler_init(model, sparams);
+    }
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1121,11 +1130,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(model_dft, sparams));
+            s.reset(sampler_greedy_init(model_dft));
         }
 
         // offload draft sampling to the backend
@@ -1320,6 +1325,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (dp.result_q) {
                     spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
                 } else {
+                    // a greedy request after a probabilistic one: back to the sampler at temperature 1
+                    if ((size_t) seq_id < smpls_cfg.size() && !std::isnan(smpls_cfg[seq_id].temp)) {
+                        smpls[seq_id].reset(sampler_greedy_init(llama_get_model(ctx_dft)));
+                        smpls_cfg[seq_id].temp = NAN;
+                    }
                     common_sampler_reset(smpls[seq_id].get());
                 }
             }

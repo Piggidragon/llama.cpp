@@ -4417,6 +4417,10 @@ void llm_graph_context::build_sampling() const {
             for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
                 if (t != nullptr) {
                     ggml_set_output(t);
+                    // the allocator frees the base of a view output (e.g. the logits row of a chain that keeps the logits)
+                    if (t->view_src != nullptr) {
+                        ggml_set_output(t->view_src);
+                    }
                 }
             }
 
