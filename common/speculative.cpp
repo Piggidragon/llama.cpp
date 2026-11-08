@@ -1004,6 +1004,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    std::vector<common_params_sampling> smpls_cfg;
+
+    // the sampler of greedy drafting: its probabilities (temperature 1) decide the p_min cut
+    static common_sampler * sampler_greedy_init(const llama_model * model) {
+        common_params_sampling sparams;
+        sparams.no_perf  = false;
+        sparams.top_k    = 10;
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        return common_sampler_init(model, sparams);
+    }
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1129,11 +1140,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(model_dft, sparams));
+            s.reset(sampler_greedy_init(model_dft));
         }
 
         // offload draft sampling to the backend
@@ -1198,6 +1205,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
+        common_sampler_reset(smpls[seq_id].get());
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1357,7 +1365,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            common_sampler_reset(smpls[seq_id].get());
+            if (is_dflash2 || is_lilicorr) {
+                common_sampler_reset(smpls[seq_id].get());
+            } else {
+                // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+                if (!params.probabilistic) {
+                    dp.result_q = nullptr;
+                }
+                // result_q is set only when the caller verifies by rejection; a reset would reseed the chain
+                if (dp.result_q) {
+                    spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
+                } else {
+                    // a greedy request after a probabilistic one: back to the sampler at temperature 1
+                    if ((size_t) seq_id < smpls_cfg.size() && !std::isnan(smpls_cfg[seq_id].temp)) {
+                        smpls[seq_id].reset(sampler_greedy_init(llama_get_model(ctx_dft)));
+                        smpls_cfg[seq_id].temp = NAN;
+                    }
+                    common_sampler_reset(smpls[seq_id].get());
+                }
+            }
 
             const int32_t n = (int32_t) dp.pos0;
 
@@ -1479,6 +1505,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            // a probabilistic draft samples every block position from its own logits and hands the candidates to the
+            // verifier. The positions of a DFlash block do not depend on each other; the Markov head of DSpark
+            // conditions a position on the argmax of the one before it (built in the graph), not on the sampled token:
+            // q is still the distribution the token was drawn from, so the rejection stays exact
+            auto sample_at = [&](int32_t idx, int32_t pos, llama_token & id) {
+                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
+
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                            seq_id, k, pos, cur_p->data[k].id, cur_p->data[k].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
+
+                id = dp.result_q ? id_sampled : cur_p->data[0].id;
+                return cur_p;
+            };
+            auto push = [&](const llama_token_data_array * cur_p, llama_token id) {
+                common_sampler_accept(smpl, id, true);
+
+                result.push_back(id);
+                if (dp.result_q) {
+                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
+            };
+
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
@@ -1491,49 +1544,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
+                    llama_token id;
+                    const auto * cur_p = sample_at(idx, i, id);
+                    push(cur_p, id);
                 }
             } else {
-                // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                // read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id;
+                    const auto * cur_p = sample_at(beg + i, i - 1, id);
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;
                     }
 
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
+                    push(cur_p, id);
                 }
             }
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }

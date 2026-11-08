@@ -4525,6 +4525,19 @@ void llm_graph_context::build_sampling() const {
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
+            // the results of every chain are outputs, also of the ones without a row: the allocator reuses the
+            // plan of a graph with the same shapes, which must not depend on the rows of the ubatch (e.g. the
+            // draft blocks of two sequences in two ubatches of the same size)
+            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                if (t != nullptr) {
+                    ggml_set_output(t);
+                    // the allocator frees the base of a view output (e.g. the logits row of a chain that keeps the logits)
+                    if (t->view_src != nullptr) {
+                        ggml_set_output(t->view_src);
+                    }
+                }
+            }
+
             if (data.sampled != nullptr) {
                 if (active) {
                     res->t_sampled[row] = data.sampled;
