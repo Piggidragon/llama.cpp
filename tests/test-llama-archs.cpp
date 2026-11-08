@@ -1505,6 +1505,50 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+// the output of the last layer (layer input n_layer, read by DFlash drafts) must not depend on which rows output logits
+static bool check_final_layer_inp(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_layer = llama_model_n_layer(model);
+    const uint32_t n_embd  = llama_model_n_embd(model);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    std::vector<float> features_ref;
+    std::vector<float> logits_ref;
+    bool ok = true;
+
+    common_batch batch(lctx);
+    llama_set_embeddings_layer_inp(lctx, n_layer, true);
+    for (bool all_logits : {true, false}) {
+        llama_memory_clear(llama_get_memory(lctx), true);
+        batch.clear();
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            batch.add(tokens[i], i, 0, all_logits || i == tokens.size() - 1);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            ok = false;
+            break;
+        }
+
+        const float * features = llama_get_embeddings_layer_inp(lctx, n_layer);
+        const float * logits   = llama_get_logits_ith(lctx, -1);
+        if (features == nullptr || logits == nullptr) {
+            ok = false;
+            break;
+        }
+        std::vector<float> features_cur(features, features + tokens.size() * n_embd);
+        std::vector<float> logits_cur(logits, logits + n_vocab);
+        if (all_logits) {
+            features_ref = std::move(features_cur);
+            logits_ref   = std::move(logits_cur);
+        } else {
+            ok = nmse(features_ref, features_cur) < 1e-6 && nmse(logits_ref, logits_cur) < 1e-4;
+        }
+    }
+    llama_set_embeddings_layer_inp(lctx, n_layer, false);
+    llama_memory_clear(llama_get_memory(lctx), true);
+
+    return ok;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -1940,6 +1984,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (nmse_val > 1e-4) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+                        if (test_ok && arch == LLM_ARCH_SPARK2_5) {
+                            for (size_t n_tokens : {std::min<size_t>(6, tokens.size()), tokens.size()}) {
+                                const std::vector<llama_token> part(tokens.begin(), tokens.begin() + n_tokens);
+                                if (!check_final_layer_inp(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), part)) {
+                                    test_ok = false;
+                                    status_nmse = "\033[1;31mFAIL\033[0m (final layer input)";
+                                }
+                            }
                         }
 
                         // chunked decode matches a single batch only with causal attention over a memory
