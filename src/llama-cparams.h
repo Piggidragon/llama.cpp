@@ -43,8 +43,6 @@ struct llama_cparams {
     bool phase_aware_workspace;    // see llama_context_params::phase_aware_workspace
     bool live_context_workspace;   // see llama_context_params::live_context_workspace
     bool draft_vocab;              // see llama_context_params::draft_vocab (an MTP context of a model with a draft head)
-    bool kv_unified_gather;        // see llama_context_params::kv_unified_gather
-    bool auto_kv_rows;             // kv_unified_gather is still to be checked against the devices of the attention
     bool compact_attn_mask;        // see llama_context_params::compact_attn_mask
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
@@ -58,6 +56,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
@@ -66,8 +66,10 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

@@ -1518,6 +1518,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -1895,9 +1905,11 @@ bool server_prompt_cache::copy_state(const server_prompt & prompt, llama_context
             out.data.main.resize(size_tgt);
             out.data.drft.resize(size_dft);
 
-            llama_state_seq_get_data_ext(ctx_tgt, out.data.main.data(), size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            // the buffers are not initialized: a short copy must not become a cache entry
+            const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, out.data.main.data(), size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, out.data.drft.data(), size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+            if (n_tgt != size_tgt || n_dft != size_dft) {
+                throw std::runtime_error("failed to copy the state of the prompt");
             }
 
             return true;
@@ -2430,10 +2442,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             auto source = [this](const server_kv_key & key) { return find_block(key); };
 
             if (disk->fetch(id, state, source)) {
+                const bool full = lcp_disk == state.prompt.tokens.size();
+
                 if (!prompt_cache_restore(state, prompt, ctx_tgt, ctx_dft, id_slot)) {
                     disk->restore_failed(id, std::move(state), !kv_unified);
 
                     return false;
+                }
+
+                SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+                if (full) {
+                    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
                 }
 
                 return true;
@@ -2457,6 +2476,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+            if (lcp_best == it_best->prompt.tokens.size()) {
+                SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+            }
+
             common_prompt_checkpoint ckpt;
             ckpt.n_tokens = prompt.n_tokens();
             ckpt.id_task  = COMMON_CHECKPOINT_FROM_CACHE; // kept by create_checkpoint() instead of copied again
@@ -2474,8 +2498,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             return true;
         }
 
+        // the whole cached prompt is a prefix of the new one
+        const bool full = lcp_best == it_best->prompt.tokens.size();
+
         if (!prompt_cache_restore(*it_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
             return false;
+        }
+
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+        if (full) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
         states.erase(it_best);
