@@ -1241,6 +1241,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             default:
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
+        if (flags & TENSOR_HOST) {
+            buft_list = buft_list_input;
+        }
 
         ggml_backend_buffer_type_t buft = nullptr;
 

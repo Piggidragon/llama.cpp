@@ -682,6 +682,9 @@ static bool ggml_gallocr_publish_shared_requirements(ggml_gallocr_t galloc) {
     struct ggml_gallocr_shared_buffers * shared = galloc->shared_buffers;
     GGML_ASSERT(shared != NULL);
 
+    // a role keeps the largest of its graphs (e.g. the two kinds of a DFlash draft), a shrink starts again from the next one
+    const bool restart = shared->shrink_pending && !shared->shrink_seen[galloc->shared_role];
+
     for (int i = 0; i < galloc->n_buffers; ++i) {
         const int entry_id = galloc->shared_entry_ids[i];
         if (entry_id < 0) {
@@ -700,9 +703,11 @@ static bool ggml_gallocr_publish_shared_requirements(ggml_gallocr_t galloc) {
         }
 
         size_t * requirements = shared->entries[entry_id].requirements[galloc->shared_role];
-        memset(requirements, 0, GGML_VBUFFER_MAX_CHUNKS * sizeof(*requirements));
+        if (restart) {
+            memset(requirements, 0, GGML_VBUFFER_MAX_CHUNKS * sizeof(*requirements));
+        }
         for (int chunk = 0; chunk < galloc->buf_tallocs[i]->n_chunks; ++chunk) {
-            requirements[chunk] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], chunk);
+            requirements[chunk] = MAX(requirements[chunk], ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], chunk));
         }
     }
 

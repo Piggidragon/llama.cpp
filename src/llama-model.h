@@ -1050,6 +1050,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_HOST;
 
     explicit llama_model_base(const llama_model_params & params);
 

@@ -387,6 +387,11 @@ llama_context::llama_context(
     ws_decode_tokens = llama_model_has_encoder(&model) ? cparams.n_ubatch :
             params.n_outputs_max != 0 ? params.n_outputs_max : cparams.n_seq_max;
 
+    if (model.arch == LLM_ARCH_DFLASH && params.n_outputs_max != 0 && params.n_outputs_max < cparams.n_ubatch) {
+        n_block_tokens   = params.n_outputs_max;
+        ws_decode_tokens = n_block_tokens;
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -1093,7 +1098,7 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
         }
     }
     if (resizable && sched_created) {
-        // lane 0 of an MTP context computes in the buffers of lane 0 of its target
+        // lane 0 of a draft context computes in the buffers of lane 0 of its target
         bool shared = false;
         if (lane_active == 0 && ws_owner != nullptr) {
             GGML_ASSERT(ws_owner->lane_active == 0 && ws_owner->sched);
@@ -1167,6 +1172,34 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
         graph_has_logits = get_gf_res_reserve()->get_logits() != nullptr;
     }
 
+    // a DFlash draft: the other kinds of graph as well, the buffers only grow to the largest: the block decode, the
+    // injection of the target features, and their injection as host copies (another context's batch)
+    if (n_block_tokens > 0) {
+        auto reserve_other = [&](uint32_t n_other, reserve_input input) {
+            std::vector<size_t> sizes_other(backend_buf_exp_size.size(), 0);
+            auto * gf = graph_reserve(n_other, n_seqs, n_other, mctx.get(), model.no_alloc(),
+                    model.no_alloc() ? sizes_other.data() : nullptr, input);
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+            if (model.no_alloc()) {
+                for (size_t i = 0; i < sizes_other.size(); ++i) {
+                    backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_other[i]);
+                }
+            }
+            graph_has_logits = graph_has_logits || get_gf_res_reserve()->get_logits() != nullptr;
+        };
+
+        if (n_tokens > n_block_tokens) {
+            reserve_other(n_block_tokens, RESERVE_INPUT_AUTO);
+        } else {
+            reserve_other(n_tokens, RESERVE_INPUT_FEATURES);
+        }
+        if (supports_embd_row()) {
+            reserve_other(n_tokens, RESERVE_INPUT_HOST);
+        }
+    }
+
     // reserve with tg (token generation) graph to get the number of splits and nodes
     if (cparams.training) {
         // no tg graph for training
@@ -1199,7 +1232,9 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc() || resizable);
+                // a DFlash draft allocates it again: the plan of the last allocating reserve is the graph that its
+                // injections must match, else each one is planned again and reserves the buffers again
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc() || (resizable && n_block_tokens == 0));
         };
 
         if (!gf) {
@@ -1242,6 +1277,7 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
     }
     ws.n_tokens = n_tokens;
     ws.n_kv     = plan.n_kv;
+    ws_causal   = cparams.causal_attn;
 
     const int64_t t_end_us = ggml_time_us();
 
@@ -1305,7 +1341,10 @@ bool llama_context::shares_workspace_with(const llama_context & other) const {
 }
 
 int llama_context::attach_shared_workspace(llama_context & owner) {
-    if (this == &owner || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+    // drafts that compute after their target: MTP, and DFlash on the target's features
+    const bool is_draft = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+            (model.arch == LLM_ARCH_DFLASH && cparams.ctx_other == &owner);
+    if (this == &owner || !is_draft ||
             !cparams.phase_aware_workspace || !owner.cparams.phase_aware_workspace ||
             ws_owner != nullptr || ws_borrower != nullptr || owner.ws_owner != nullptr || owner.ws_borrower != nullptr ||
             !owner.sched || owner.lane_active != 0) {
@@ -2147,10 +2186,30 @@ void llama_context::layer_inp_dev_alloc() {
     };
     ctx_layer_inp_dev.reset(ggml_init(params));
 
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
+    layer_inp_dev_dev = model.dev_output();
+
+    // BF16 halves the buffer: the drafts are trained on the BF16 hidden states of their target
+    ggml_type type = GGML_TYPE_F32;
+    if (layer_inp_dev_dev != nullptr) {
+        ggml_init_params params_op = {
+            /*.mem_size   =*/ 6*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_op(ggml_init(params_op));
+        ggml_tensor * buf  = ggml_new_tensor_2d(ctx_op.get(), GGML_TYPE_BF16, model.hparams.n_embd, 2);
+        ggml_tensor * src  = ggml_new_tensor_2d(ctx_op.get(), GGML_TYPE_F32,  model.hparams.n_embd, 1);
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx_op.get(), GGML_TYPE_I64, 1);
+        ggml_tensor * ids  = ggml_new_tensor_1d(ctx_op.get(), GGML_TYPE_I32, 1);
+        if (ggml_backend_dev_supports_op(layer_inp_dev_dev, ggml_set_rows(ctx_op.get(), buf, src, rows)) &&
+                ggml_backend_dev_supports_op(layer_inp_dev_dev, ggml_get_rows(ctx_op.get(), buf, ids))) {
+            type = GGML_TYPE_BF16;
+        }
+    }
+
+    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), type, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
-    layer_inp_dev_dev = model.dev_output();
     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
 
     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
@@ -2912,8 +2971,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // a mask fallback had the compute buffers planned for its shape: reserve the worst case before the next batch,
-        // else every larger ubatch after it is planned again
-        if (res && !sched_need_reserve) {
+        // else every larger ubatch after it is planned again. A non-causal graph after a non-causal reserve (DFlash
+        // drafts) has the dense mask of the reserve.
+        if (res && !sched_need_reserve && (cparams.causal_attn || ws_causal)) {
             for (const auto & inp : res->inputs) {
                 if (inp->mask_fallback()) {
                     sched_need_reserve = true;
@@ -3586,7 +3646,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        reserve_input input) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3613,6 +3674,20 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+
+    // the graph only reads the shapes of the target features
+    std::vector<int32_t> inject_rows;
+    std::vector<float>   inject_embd;
+    if (input != RESERVE_INPUT_AUTO || (n_block_tokens > 0 && n_tokens > n_block_tokens)) {
+        ubatch.token = nullptr;
+        if (input != RESERVE_INPUT_HOST && supports_embd_row()) {
+            inject_rows.assign(n_tokens, 0);
+            ubatch.embd_row = inject_rows.data();
+        } else {
+            inject_embd.resize((size_t) n_tokens*model.hparams.n_embd_inp_enc());
+            ubatch.embd = inject_embd.data();
+        }
+    }
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
@@ -3700,8 +3775,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
     // the plan now has the sizes of this graph: a graph of another shape (e.g. a mask fallback, see
     // build_attn_inp_kq_mask_compact) would leave every later, larger graph to be planned again; the next decode
-    // reserves the worst case again
-    lctx->sched_need_reserve = true;
+    // reserves the worst case again. A DFlash draft alternates kinds of graph that its reserve all covers (the
+    // injections of another context's batches among them): their plans fit the buffers, a reserve would only cost time
+    if (lctx->n_block_tokens == 0) {
+        lctx->sched_need_reserve = true;
+    }
 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
@@ -5021,7 +5099,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += backend_buf_exp_size[i] * (lanes ? 2 : 1);
         }
     } else if (ws_owner == nullptr) {
-        // the buffers that an MTP context borrows are counted by its target
+        // the buffers that a draft context borrows are counted by its target
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);

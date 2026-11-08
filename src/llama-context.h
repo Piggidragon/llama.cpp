@@ -314,8 +314,16 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // the input of a reserve graph, see n_block_tokens
+    enum reserve_input {
+        RESERVE_INPUT_AUTO,     // tokens, the target features of a DFlash draft for batches larger than a block decode
+        RESERVE_INPUT_FEATURES, // the target features: rows of the target's feature buffer if the graph can read it
+        RESERVE_INPUT_HOST,     // the target features as host copies (the batches of another context, --concurrent-prefill)
+    };
+
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        reserve_input input = RESERVE_INPUT_AUTO);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -464,11 +472,18 @@ private:
     // phase-aware workspace: a batch of up to this many tokens reserves only for its size
     uint32_t ws_decode_tokens = 0;
 
+    // DFlash drafts: token batches are the block decodes of up to this many tokens, the other batches inject target
+    // features; the reserve takes the larger of the two graphs instead of the logits of n_ubatch tokens (0 = off)
+    uint32_t n_block_tokens = 0;
+
+    // causal_attn of the last reserve: it decides whether a graph with the dense mask is a fallback (--compact-attn-mask)
+    bool ws_causal = true;
+
     // calls in a row whose plan is smaller than the reservation, it shrinks after ws_shrink_after of them
     uint32_t       ws_shrink_votes = 0;
     const uint32_t ws_shrink_after = 64;
 
-    // phase-aware workspace: an MTP context computes in the buffers of lane 0 of its target. The two must be used
+    // phase-aware workspace: a draft context (MTP, DFlash) computes in the buffers of lane 0 of its target. The two must be used
     // one after the other: each waits until the other has finished with the buffers (ws_in_flight)
     llama_context * ws_owner     = nullptr; // the context whose buffers this one uses
     llama_context * ws_borrower  = nullptr; // the context that uses the buffers of this one

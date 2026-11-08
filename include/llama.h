@@ -452,8 +452,8 @@ extern "C" {
                                        // compute buffers, so a ubatch of half the size takes the same memory
         bool phase_aware_workspace;    // size the compute buffers for the current phase: a batch of up to
                                        // n_outputs_max (or n_seq_max) tokens reserves only for that many, a larger
-                                       // one for n_ubatch; an MTP context attached with llama_attach_shared_workspace
-                                       // computes in the buffers of its target
+                                       // one for n_ubatch; a draft context (MTP, DFlash) attached with
+                                       // llama_attach_shared_workspace computes in the buffers of its target
         bool live_context_workspace;   // size the attention part of the compute buffers by the used part of the KV
                                        // cache (power-of-two steps from 1/8 of it) instead of its full size
         bool draft_vocab;              // the output head of this context (e.g. the draft head of an MTP context)
