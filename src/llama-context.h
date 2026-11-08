@@ -314,10 +314,16 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
-    // inject: a graph of target features (DFlash drafts), also taken for batches larger than n_block_tokens
+    // the input of a reserve graph, see n_block_tokens
+    enum reserve_input {
+        RESERVE_INPUT_AUTO,     // tokens, the target features of a DFlash draft for batches larger than a block decode
+        RESERVE_INPUT_FEATURES, // the target features: rows of the target's feature buffer if the graph can read it
+        RESERVE_INPUT_HOST,     // the target features as host copies (the batches of another context, --concurrent-prefill)
+    };
+
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
-        bool inject = false);
+        reserve_input input = RESERVE_INPUT_AUTO);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 

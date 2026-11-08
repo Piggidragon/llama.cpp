@@ -1172,24 +1172,32 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
         graph_has_logits = get_gf_res_reserve()->get_logits() != nullptr;
     }
 
-    // a DFlash draft: the other kind of graph as well, the buffers only grow to the larger one
+    // a DFlash draft: the other kinds of graph as well, the buffers only grow to the largest: the block decode, the
+    // injection of the target features, and their injection as host copies (another context's batch)
     if (n_block_tokens > 0) {
-        const bool     inject  = n_tokens <= n_block_tokens;
-        const uint32_t n_other = std::min(n_tokens, n_block_tokens);
-
-        std::vector<size_t> sizes_other(backend_buf_exp_size.size(), 0);
-        auto * gf = graph_reserve(n_other, n_seqs, n_other, mctx.get(), model.no_alloc(),
-                model.no_alloc() ? sizes_other.data() : nullptr, inject);
-        if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
-        }
-        if (model.no_alloc()) {
-            for (size_t i = 0; i < sizes_other.size(); ++i) {
-                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_other[i]);
+        auto reserve_other = [&](uint32_t n_other, reserve_input input) {
+            std::vector<size_t> sizes_other(backend_buf_exp_size.size(), 0);
+            auto * gf = graph_reserve(n_other, n_seqs, n_other, mctx.get(), model.no_alloc(),
+                    model.no_alloc() ? sizes_other.data() : nullptr, input);
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
             }
-        }
+            if (model.no_alloc()) {
+                for (size_t i = 0; i < sizes_other.size(); ++i) {
+                    backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_other[i]);
+                }
+            }
+            graph_has_logits = graph_has_logits || get_gf_res_reserve()->get_logits() != nullptr;
+        };
 
-        graph_has_logits = graph_has_logits || get_gf_res_reserve()->get_logits() != nullptr;
+        if (n_tokens > n_block_tokens) {
+            reserve_other(n_block_tokens, RESERVE_INPUT_AUTO);
+        } else {
+            reserve_other(n_tokens, RESERVE_INPUT_FEATURES);
+        }
+        if (supports_embd_row()) {
+            reserve_other(n_tokens, RESERVE_INPUT_HOST);
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -1224,7 +1232,9 @@ void llama_context::sched_reserve_lane(const sched_plan & plan, bool force) {
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc() || resizable);
+                // a DFlash draft allocates it again: the plan of the last allocating reserve is the graph that its
+                // injections must match, else each one is planned again and reserves the buffers again
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc() || (resizable && n_block_tokens == 0));
         };
 
         if (!gf) {
@@ -3638,7 +3648,7 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
-        bool inject) {
+        reserve_input input) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3666,12 +3676,12 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    // the graph only reads the shapes: rows of the target's feature buffer if the graph can use it, else host features
+    // the graph only reads the shapes of the target features
     std::vector<int32_t> inject_rows;
     std::vector<float>   inject_embd;
-    if (inject || (n_block_tokens > 0 && n_tokens > n_block_tokens)) {
+    if (input != RESERVE_INPUT_AUTO || (n_block_tokens > 0 && n_tokens > n_block_tokens)) {
         ubatch.token = nullptr;
-        if (supports_embd_row()) {
+        if (input != RESERVE_INPUT_HOST && supports_embd_row()) {
             inject_rows.assign(n_tokens, 0);
             ubatch.embd_row = inject_rows.data();
         } else {
@@ -3766,8 +3776,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
     // the plan now has the sizes of this graph: a graph of another shape (e.g. a mask fallback, see
     // build_attn_inp_kq_mask_compact) would leave every later, larger graph to be planned again; the next decode
-    // reserves the worst case again
-    lctx->sched_need_reserve = true;
+    // reserves the worst case again. A DFlash draft alternates kinds of graph that its reserve all covers (the
+    // injections of another context's batches among them): their plans fit the buffers, a reserve would only cost time
+    if (lctx->n_block_tokens == 0) {
+        lctx->sched_need_reserve = true;
+    }
 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),

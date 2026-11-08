@@ -15,7 +15,7 @@ The memory these options free is a saving for the time it is not needed, not a s
 
 The target and the draft context compute one after the other: the draft needs the hidden states of the target. With `--phase-aware-workspace` the draft context therefore borrows the compute buffers of the target, and the shared buffers have the size of the larger of the two.
 
-An MTP draft processes the batches of the target and then drafts one token per decode. A DFlash or DSpark draft takes the target's batches as features, which it projects into its KV cache, and decodes tokens only in its blocks of up to `--spec-draft-n-max` + 1 tokens per slot. Its buffers are reserved for the larger of these two graphs instead of the logits of `n_ubatch` tokens, also without the option.
+An MTP draft processes the batches of the target and then drafts one token per decode. A DFlash or DSpark draft takes the target's batches as features, which it projects into its KV cache, and decodes tokens only in its blocks: `--spec-draft-n-max` + 1 tokens per slot (anchor-first DSpark: `--spec-draft-n-max`), at most its trained block (LiliCorr: always the block). Its buffers are reserved for the largest of its graphs, the block decode, the injection of the target's features and that of host copies of them (the batches of the concurrent-prefill context), instead of the logits of `n_ubatch` tokens, also without the option.
 
 - Before either context uses the buffers, it waits until the other has finished with them.
 - With `--split-overlap`, the draft borrows the buffers of lane 0. Lane 1 keeps its own buffers, because it computes while lane 0 does.
