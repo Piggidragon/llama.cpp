@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1691,6 +1692,70 @@ static void test_multi_output_limit(const test_params & params) {
     printf("backend multi-output limit test PASSED\n");
 }
 
+// ubatches of the same size that hold the outputs of one sequence each, alternating (e.g. the draft blocks of two
+// slots with a non-unified KV cache): the graphs have the same shapes, while the chains with rows move between the
+// sequences, so the allocation that the scheduler reuses must keep the results of every chain
+static void test_multi_output_alternating_sequences(const test_params & params) {
+    const int32_t k        = 4;
+    const int32_t n_tokens = 4;
+
+    llama_sampler_ptr chain_0(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_ptr chain_1(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain_0.get(), llama_sampler_init_top_k(k));
+    llama_sampler_chain_add(chain_1.get(), llama_sampler_init_top_k(k));
+    std::vector<llama_sampler_seq_config> configs = {
+        { 0, chain_0.get() },
+        { 1, chain_1.get() },
+    };
+    test_context test_ctx(params, configs, 2, n_tokens, 0, n_tokens);
+
+    std::vector<llama_sampler_seq_config> reference_configs;
+    test_context reference_ctx(params, reference_configs, 2, n_tokens);
+
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    for (int round = 0; round < 2; ++round) {
+        for (llama_seq_id seq_id : { 0, 1 }) {
+            auto make_batch = [&](llama_context * ctx) {
+                common_batch batch(ctx);
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    batch.add((llama_vocab_bos(vocab) + 7 * i + round) % n_vocab, round * n_tokens + i, seq_id, true);
+                }
+                return batch;
+            };
+            common_batch batch = make_batch(test_ctx.ctx.get());
+            GGML_ASSERT(llama_process(test_ctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+            common_batch batch_ref = make_batch(reference_ctx.ctx.get());
+            GGML_ASSERT(llama_process(reference_ctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_ref.get()) == 0);
+
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const llama_token * candidates = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), i);
+                const uint32_t n_candidates = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), i);
+                const float * logits_ref = llama_get_logits_ith(reference_ctx.ctx.get(), i);
+                GGML_ASSERT(candidates != nullptr && logits_ref != nullptr);
+                GGML_ASSERT(n_candidates == (uint32_t) k);
+
+                std::vector<llama_token> top(n_vocab);
+                std::iota(top.begin(), top.end(), 0);
+                std::partial_sort(top.begin(), top.begin() + k, top.end(),
+                        [&](llama_token a, llama_token b) { return logits_ref[a] > logits_ref[b]; });
+                top.resize(k);
+
+                std::vector<llama_token> got(candidates, candidates + k);
+                std::sort(got.begin(), got.end());
+                std::sort(top.begin(), top.end());
+                if (got != top) {
+                    fprintf(stderr, "round %d, seq %d, row %d: the backend top-%d differs from the reference\n", round, seq_id, i, k);
+                    GGML_ABORT("backend candidates of a later ubatch were overwritten");
+                }
+            }
+        }
+    }
+
+    printf("backend multi-output alternating sequences test PASSED\n");
+}
+
 static void test_multi_output_multi_sequence_dist(const test_params & params) {
     const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
@@ -2088,6 +2153,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_set_sampler",            test_set_sampler,            true },
     // multiple outputs per sequence
     { "test_multi_output_limit",                  test_multi_output_limit,               true },
+    { "test_multi_output_alternating_sequences",  test_multi_output_alternating_sequences, true },
     { "test_multi_output_multi_sequence_dist",    test_multi_output_multi_sequence_dist, true },
     { "test_multi_output_dist_transaction",       test_multi_output_dist_transaction,    true },
     { "test_multi_output_sampling_chain",         test_multi_output_sampling_chain,      true },
