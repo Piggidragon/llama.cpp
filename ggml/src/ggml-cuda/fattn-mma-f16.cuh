@@ -1542,7 +1542,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
-#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+#elif defined(AMD_WMMA_256B_AVAILABLE)
     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_MFMA_AVAILABLE)
     T_C_VKQ VKQ_C[                                     DV/T_C_VKQ::J];
@@ -2101,7 +2101,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-// The quantized-native shapes that gather the K/V rows of a list of rows (ggml_flash_attn_ext_set_kv_rows()).
+// The quantized-native shapes that gather the K/V rows of a list of rows (ggml_flash_attn_ext_rows()).
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_quant_may_gather(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     GGML_UNUSED_VARS(ncols1, ncols2);
@@ -2111,7 +2111,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_quant_may
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     // every shape at D = 128 and 256 (tiles of at least 8 columns, like the dense ones): a list of K/V rows
-    // (ggml_flash_attn_ext_set_kv_rows()) takes whatever shape the batch gets
+    // (ggml_flash_attn_ext_rows()) takes whatever shape the batch gets
     return (DKQ == DV && (DKQ == 128 || DKQ == 256) && ncols1*ncols2 >= 8) ||
            (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
@@ -2443,7 +2443,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         // The native route takes no sparse K/V set (n_kv_max, see ggml_cuda_fattn_native_supported()), but it gathers
-        // the rows of a list of K/V rows (ggml_flash_attn_ext_set_kv_rows()).
+        // the rows of a list of K/V rows (ggml_flash_attn_ext_rows()).
         if constexpr (is_quant_kv && ggml_cuda_flash_attn_ext_mma_quant_may_gather(DKQ, DV, ncols1, ncols2)) {
             use_sparse = ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2);
         }
