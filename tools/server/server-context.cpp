@@ -3360,6 +3360,9 @@ private:
 
                     const int id_task = task.id;
 
+                    // TTS and realtime slots decode by themselves, without making room in a full cache (try_clear_idle_slots())
+                    const bool own_decode = task.type == SERVER_TASK_TYPE_TTS || task.type == SERVER_TASK_TYPE_REALTIME;
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3408,9 +3411,9 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                // with --kv-unified-gather the cells of an idle slot cost the attention of the
+                                // when the attention reads lists of K/V rows the cells of an idle slot cost the
                                 // others nothing: they stay until the cache needs the room, see try_clear_idle_slots()
-                                if (params_base.kv_unified && !llama_get_kv_unified_gather(ctx_tgt)) {
+                                if (params_base.kv_unified && (own_decode || !llama_get_kv_unified_gather(ctx_tgt))) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -4227,8 +4230,16 @@ private:
             if (!slot.is_processing() || !slot.rt) {
                 return;
             }
-            // a realtime decode of ctx_tgt is not in the batch that bg_wait_target() checks: not while ctx_bg computes
-            bg_wait();
+            // an idle session runs nothing; a realtime decode of ctx_tgt is not in the batch that bg_wait_target()
+            // checks: not while ctx_bg computes
+            if (!slot.rt->is_idle()) {
+                bg_wait();
+
+                // --logits-topk: the k of the last batch did not count this session's sampler
+                if (params_base.logits_topk) {
+                    llama_set_logits_topk(ctx_tgt, 0);
+                }
+            }
             if (!slot.rt->update()) {
                 send_error(slot, slot.rt->error, slot.rt->error_type);
                 slot.release();

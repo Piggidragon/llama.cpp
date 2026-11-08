@@ -1006,7 +1006,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // A list of K/V rows (ggml_flash_attn_ext_rows()) is gathered by the MMA kernels only, at D = 128 and 256: one list
-    // for all mask sequences or one per mask sequence, over K/V of each sequence or shared by all of them.
+    // for all mask sequences or one per mask sequence, over K/V that all of them share.
     if (dst->src[5] != nullptr) {
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -1014,8 +1014,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
         if (!turing_mma_available(cc) || (K->ne[0] != 128 && K->ne[0] != 256) || V->ne[0] != K->ne[0] ||
                 mask == nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(dst, 4) > 0 ||
                 rows->type != GGML_TYPE_I32 || rows->ne[0] % FATTN_KQ_STRIDE != 0 || mask->ne[0] != rows->ne[0] ||
-                !ggml_is_contiguous(rows) || (ggml_nrows(rows) != 1 && ggml_nrows(rows) != mask->ne[3]) ||
-                (K->ne[3] != 1 && K->ne[3] != mask->ne[3])) {
+                !ggml_is_contiguous(rows) || (ggml_nrows(rows) != 1 && ggml_nrows(rows) != mask->ne[3]) || K->ne[3] != 1) {
             return BEST_FATTN_KERNEL_NONE;
         }
         int native_ncols1 = 0;

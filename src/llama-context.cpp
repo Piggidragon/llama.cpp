@@ -417,7 +417,8 @@ llama_context::llama_context(
 
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
+            // the T5 decoder adds a KQ bias to its self-attention, which FlashAttention over rows cannot take
+            cparams.auto_fkvr = cparams.kv_unified && model.arch != LLM_ARCH_T5;
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;

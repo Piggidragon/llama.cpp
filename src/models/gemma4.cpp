@@ -216,8 +216,11 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             //       is construted during set_input to contain just the pruned output cells
             //       this can be used to enable pruning with more than 1 sequence, both with unified and split KV cache
             //       ref: https://github.com/ggml-org/llama.cpp/pull/31356#discussion_r4455286628
-            inp_attn_prune.self_attn_mask.raw     = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask.raw,     inp_out_ids);
-            inp_attn_prune.self_attn_mask_swa.raw = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask_swa.raw, inp_out_ids);
+            // get(): with --compact-attn-mask the mask is the one built from the ranges (cnv)
+            inp_attn_prune.self_attn_mask.raw     = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask.get(),     inp_out_ids);
+            inp_attn_prune.self_attn_mask_swa.raw = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask_swa.get(), inp_out_ids);
+            inp_attn_prune.self_attn_mask.cnv     = nullptr;
+            inp_attn_prune.self_attn_mask_swa.cnv = nullptr;
 
             inp_attn_prune.self_attn_mask.raw     = ggml_cast(ctx0, inp_attn_prune.self_attn_mask.raw,     GGML_TYPE_F16);
             inp_attn_prune.self_attn_mask_swa.raw = ggml_cast(ctx0, inp_attn_prune.self_attn_mask_swa.raw, GGML_TYPE_F16);
