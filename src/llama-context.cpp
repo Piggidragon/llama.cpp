@@ -2175,10 +2175,30 @@ void llama_context::layer_inp_dev_alloc() {
     };
     ctx_layer_inp_dev.reset(ggml_init(params));
 
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
+    layer_inp_dev_dev = model.dev_output();
+
+    // BF16 halves the buffer: the drafts are trained on the BF16 hidden states of their target
+    ggml_type type = GGML_TYPE_F32;
+    if (layer_inp_dev_dev != nullptr) {
+        ggml_init_params params_op = {
+            /*.mem_size   =*/ 6*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_op(ggml_init(params_op));
+        ggml_tensor * buf  = ggml_new_tensor_2d(ctx_op.get(), GGML_TYPE_BF16, model.hparams.n_embd, 2);
+        ggml_tensor * src  = ggml_new_tensor_2d(ctx_op.get(), GGML_TYPE_F32,  model.hparams.n_embd, 1);
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx_op.get(), GGML_TYPE_I64, 1);
+        ggml_tensor * ids  = ggml_new_tensor_1d(ctx_op.get(), GGML_TYPE_I32, 1);
+        if (ggml_backend_dev_supports_op(layer_inp_dev_dev, ggml_set_rows(ctx_op.get(), buf, src, rows)) &&
+                ggml_backend_dev_supports_op(layer_inp_dev_dev, ggml_get_rows(ctx_op.get(), buf, ids))) {
+            type = GGML_TYPE_BF16;
+        }
+    }
+
+    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), type, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
-    layer_inp_dev_dev = model.dev_output();
     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
 
     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
